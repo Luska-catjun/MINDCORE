@@ -15,7 +15,6 @@ APP_DIR = Path(__file__).resolve().parents[1]
 # overrides use the same code path.
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", APP_DIR.parent))
 PROMPTS_DIR = APP_DIR / "prompts"
-DIANA_IDENTITY_PROMPT_PATH = PROMPTS_DIR / "diana_identity.txt"
 GENERIC_IDENTITY_PROMPT_PATH = RESOURCE_ROOT / "app" / "prompts" / "identity_template.txt"
 MEMORY_EXTRACTION_PROMPT_PATH = PROMPTS_DIR / "memory_extraction.txt"
 
@@ -32,11 +31,6 @@ def _load_prompt(path: Path, label: str) -> str:
         raise PromptLoadError(f"{label} prompt file is empty: {path}")
 
     return prompt
-
-
-@lru_cache(maxsize=1)
-def load_diana_identity_prompt() -> str:
-    return _load_prompt(DIANA_IDENTITY_PROMPT_PATH, "Diana identity")
 
 
 def load_persona_identity_prompt(settings: Settings) -> str:

@@ -31,4 +31,3 @@ class ChatStageDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(any("CHAT_STAGE_START" in line and "stage=goals_needs" in line for line in captured.output))
         self.assertTrue(any("CHAT_STAGE_END" in line and "stage=goals_needs" in line for line in captured.output))
-

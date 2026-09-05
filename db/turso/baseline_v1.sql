@@ -162,4 +162,3 @@ CREATE INDEX idx_goals_active ON diana_goals (status, priority DESC);
 CREATE INDEX idx_response_intentions_conversation ON diana_response_intentions (conversation_id, created_at DESC);
 -- OBJECT index idx_wm_conversation_active
 CREATE INDEX idx_wm_conversation_active ON diana_working_memory_items (conversation_id, status, salience DESC);
-

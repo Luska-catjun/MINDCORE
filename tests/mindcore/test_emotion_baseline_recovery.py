@@ -94,4 +94,3 @@ class EmotionBaselineRecoveryTests(unittest.TestCase):
         attention = build_attention_snapshot(user_text="점심 먹었어.", internal_state=state)
         self.assertFalse(any(item.source_type == "emotion" for item in attention.items))
         self.assertEqual(primary_emotion(state["emotion_vector"]), ("neutral", 0.0))
-

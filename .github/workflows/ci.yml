@@ -1,0 +1,75 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      MINDCORE_UPDATER_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            desktop/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r desktop/requirements.txt
+      - name: Run Python checks
+        run: |
+          python -m unittest discover -v
+          python -m compileall -q app desktop
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Run frontend checks
+        working-directory: frontend
+        run: |
+          npm test -- --run
+          npm run lint
+          npm run build
+      - name: Build Windows sidecar
+        working-directory: frontend
+        run: npm run desktop:sidecar:build
+      - name: Run Rust checks
+        working-directory: frontend/src-tauri
+        run: |
+          cargo test
+          cargo check --target x86_64-pc-windows-msvc
+      - name: Build unsigned Windows NSIS artifact
+        working-directory: frontend
+        run: npm run tauri:build:windows
+      - name: Verify Windows sidecar and installer
+        shell: pwsh
+        run: |
+          $sidecar = "frontend/src-tauri/binaries/mindcore-backend-x86_64-pc-windows-msvc.exe"
+          $installer = Get-ChildItem "frontend/src-tauri/target/release/bundle/nsis" -Filter *.exe -Recurse | Select-Object -First 1
+          if (!(Test-Path $sidecar)) { throw "Windows sidecar is missing" }
+          if ($null -eq $installer -or $installer.Length -le 0) { throw "NSIS installer is missing or empty" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mindcore-windows-unsigned
+          path: |
+            frontend/src-tauri/target/release/bundle/nsis/**
+          if-no-files-found: error

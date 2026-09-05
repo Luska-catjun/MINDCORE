@@ -1,0 +1,138 @@
+name: Windows Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      build_only:
+        description: Build an unsigned validation artifact without creating a GitHub Release.
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            desktop/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r desktop/requirements.txt
+          cd frontend
+          npm ci
+      - name: Validate source version for a tag release
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path frontend/src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne "${{ github.ref_name }}") { throw "Tag and Cargo.toml version do not match" }
+          "MINDCORE_VERSION=$version" >> $env:GITHUB_ENV
+          "RELEASE_TAG=${{ github.ref_name }}" >> $env:GITHUB_ENV
+      - name: Reject manual release publishing
+        if: github.event_name == 'workflow_dispatch' && inputs.build_only != true
+        shell: pwsh
+        run: throw "Manual dispatch is build-only. Publish only from a matching v* tag."
+      - name: Run release checks
+        run: |
+          python -m unittest discover -v
+          python -m compileall -q app desktop
+          cd frontend
+          npm test -- --run
+          npm run lint
+          npm run build
+          npm run desktop:sidecar:build
+          cd src-tauri
+          cargo test
+          cargo check --target x86_64-pc-windows-msvc
+      - name: Build unsigned dry-run artifact
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: frontend
+        env:
+          MINDCORE_UPDATER_DISABLED: "1"
+        run: npm run tauri:build:windows
+      - name: Validate release signing configuration
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          MINDCORE_UPDATER_PUBKEY: ${{ vars.MINDCORE_UPDATER_PUBKEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:MINDCORE_UPDATER_PUBKEY)) { throw "MINDCORE_UPDATER_PUBKEY repository variable is required" }
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) { throw "TAURI_SIGNING_PRIVATE_KEY secret is required" }
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) { throw "TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is required" }
+      - name: Build signed Windows NSIS release
+        if: github.event_name == 'push'
+        working-directory: frontend
+        env:
+          MINDCORE_UPDATE_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest.json
+          MINDCORE_UPDATER_PUBKEY: ${{ vars.MINDCORE_UPDATER_PUBKEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri:build:windows
+      - name: Create release metadata
+        shell: pwsh
+        run: |
+          $bundle = "frontend/src-tauri/target/release/bundle/nsis"
+          $installer = Get-ChildItem $bundle -Filter *.exe -Recurse | Select-Object -First 1
+          if ($null -eq $installer -or $installer.Length -le 0) { throw "NSIS installer is missing or empty" }
+          if ("${{ github.event_name }}" -eq "push") {
+            $signature = Get-Item "$($installer.FullName).sig" -ErrorAction Stop
+            if ($signature.Length -le 0) { throw "Updater signature is empty" }
+            $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash *$($installer.Name)" | Set-Content "$bundle/SHA256SUMS.txt" -NoNewline
+            $manifest = @{
+              version = $env:MINDCORE_VERSION
+              notes = "MindCore $env:MINDCORE_VERSION"
+              pub_date = (Get-Date).ToUniversalTime().ToString("o")
+              platforms = @{
+                "windows-x86_64" = @{
+                  signature = (Get-Content $signature.FullName -Raw).Trim()
+                  url = "https://github.com/${{ github.repository }}/releases/download/$env:RELEASE_TAG/$($installer.Name)"
+                }
+              }
+            }
+            $manifest | ConvertTo-Json -Depth 5 | Set-Content "$bundle/latest.json" -NoNewline
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mindcore-windows-${{ github.event_name == 'push' && 'release' || 'build-only' }}
+          path: frontend/src-tauri/target/release/bundle/nsis/**
+          if-no-files-found: error
+      - name: Publish GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $bundle = "frontend/src-tauri/target/release/bundle/nsis"
+          $installer = Get-ChildItem $bundle -Filter *.exe -Recurse | Select-Object -First 1
+          if ($null -eq $installer) { throw "NSIS installer is missing" }
+          $assets = @(
+            $installer.FullName,
+            "$($installer.FullName).sig",
+            "$bundle/SHA256SUMS.txt",
+            "$bundle/latest.json"
+          )
+          gh release create $env:RELEASE_TAG $assets --title "MindCore $env:MINDCORE_VERSION" --generate-notes
