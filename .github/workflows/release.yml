@@ -10,6 +10,11 @@ on:
         required: true
         default: true
         type: boolean
+      signed_build_only:
+        description: Validate production updater signing without creating a tag or GitHub Release.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -50,7 +55,7 @@ jobs:
           "MINDCORE_VERSION=$version" >> $env:GITHUB_ENV
           "RELEASE_TAG=${{ github.ref_name }}" >> $env:GITHUB_ENV
       - name: Reject manual release publishing
-        if: github.event_name == 'workflow_dispatch' && inputs.build_only != true
+        if: github.event_name == 'workflow_dispatch' && inputs.build_only != true && inputs.signed_build_only != true
         shell: pwsh
         run: throw "Manual dispatch is build-only. Publish only from a matching v* tag."
       - name: Run release checks
@@ -66,13 +71,13 @@ jobs:
           cargo test
           cargo check --target x86_64-pc-windows-msvc
       - name: Build unsigned dry-run artifact
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.signed_build_only != true
         working-directory: frontend
         env:
           MINDCORE_UPDATER_DISABLED: "1"
         run: npm run tauri:build:windows
       - name: Validate release signing configuration
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.signed_build_only == true)
         shell: pwsh
         env:
           MINDCORE_UPDATER_PUBKEY: ${{ vars.MINDCORE_UPDATER_PUBKEY }}
@@ -82,8 +87,8 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:MINDCORE_UPDATER_PUBKEY)) { throw "MINDCORE_UPDATER_PUBKEY repository variable is required" }
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) { throw "TAURI_SIGNING_PRIVATE_KEY secret is required" }
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) { throw "TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is required" }
-      - name: Build signed Windows NSIS release
-        if: github.event_name == 'push'
+      - name: Build signed Windows NSIS artifact
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.signed_build_only == true)
         working-directory: frontend
         env:
           MINDCORE_UPDATE_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest.json
@@ -91,6 +96,15 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri:build:windows
+      - name: Validate signed build-only artifact
+        if: github.event_name == 'workflow_dispatch' && inputs.signed_build_only == true
+        shell: pwsh
+        run: |
+          $bundle = "frontend/src-tauri/target/release/bundle/nsis"
+          $installer = Get-Item "$bundle/MindCore_0.1.0_x64-setup.exe" -ErrorAction Stop
+          $signature = Get-Item "$($installer.FullName).sig" -ErrorAction Stop
+          if ($installer.Length -le 0) { throw "NSIS installer is empty" }
+          if ($signature.Length -le 0) { throw "Updater signature is empty" }
       - name: Create release metadata
         shell: pwsh
         run: |
@@ -117,7 +131,7 @@ jobs:
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: mindcore-windows-${{ github.event_name == 'push' && 'release' || 'build-only' }}
+          name: mindcore-windows-${{ github.event_name == 'push' && 'release' || inputs.signed_build_only && 'signed-build-only' || 'unsigned-build-only' }}
           path: frontend/src-tauri/target/release/bundle/nsis/**
           if-no-files-found: error
       - name: Publish GitHub Release
