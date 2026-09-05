@@ -1,0 +1,39 @@
+{
+  "name": "diana-frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "test": "vitest run",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "desktop:sidecar:build": "node ../desktop/run-sidecar-build.mjs",
+    "tauri:dev": "npm run desktop:sidecar:build && node ../desktop/write-updater-config.mjs && tauri dev --config src-tauri/tauri.updater.conf.json",
+    "tauri:build": "npm run desktop:sidecar:build && node ../desktop/write-updater-config.mjs && tauri build --config src-tauri/tauri.updater.conf.json",
+    "tauri:build:windows": "npm run desktop:sidecar:build && node ../desktop/write-updater-config.mjs && tauri build --bundles nsis --config src-tauri/tauri.updater.conf.json"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.11.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.6",
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.4",
+    "jsdom": "^30.0.1",
+    "oxlint": "^1.75.0",
+    "typescript": "~6.0.2",
+    "vite": "^8.2.0",
+    "vitest": "^4.1.11"
+  }
+}

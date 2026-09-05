@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: diana-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.4
+      - key: APP_ENV
+        value: production
+      - key: AUTH_COOKIE_SAMESITE
+        value: none
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: LLM_FALLBACK_PROVIDER
+        value: groq
+
+  - type: web
+    name: diana-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: VITE_BUILD_REVISION="${RENDER_GIT_COMMIT:-unknown}" npm ci && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: NODE_VERSION
+        value: 22.22.3

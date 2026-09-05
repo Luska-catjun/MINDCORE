@@ -1,0 +1,8 @@
+asyncpg==0.29.0
+libsql==0.1.11
+fastapi==0.115.6
+groq
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+tzdata==2026.3
+uvicorn[standard]==0.34.0

@@ -1,0 +1,153 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+
+import { SetupWizard } from "./SetupWizard";
+
+const databaseUrl = () => screen.getByPlaceholderText("Turso Database URL");
+const databaseToken = () => screen.getByPlaceholderText("Turso Auth Token");
+const continueButton = () => screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement;
+const expectContinueDisabled = () => expect(continueButton().disabled).toBe(true);
+const expectContinueEnabled = () => expect(continueButton().disabled).toBe(false);
+
+describe("SetupWizard validation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    invoke.mockImplementation((name: string) =>
+      name === "generic_identity_template" ? Promise.resolve("IDENTITY") : Promise.resolve("Connected"),
+    );
+  });
+
+  async function enterDatabase() {
+    render(<SetupWizard onComplete={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Get Started" }));
+  }
+
+  async function validateDatabase() {
+    fireEvent.change(databaseUrl(), { target: { value: "libsql://db" } });
+    fireEvent.change(databaseToken(), { target: { value: "token-a" } });
+    await userEvent.click(screen.getByRole("button", { name: "Test Connection" }));
+    await waitFor(expectContinueEnabled);
+  }
+
+  it("blocks untested and failed database Next, then invalidates on edit", async () => {
+    await enterDatabase();
+    expectContinueDisabled();
+    invoke.mockRejectedValueOnce(new Error("no"));
+    await userEvent.click(screen.getByRole("button", { name: "Test Connection" }));
+    await waitFor(expectContinueDisabled);
+    await validateDatabase();
+    fireEvent.change(databaseUrl(), { target: { value: "libsql://changed" } });
+    expectContinueDisabled();
+  });
+
+  it("preserves database values through LLM Back navigation", async () => {
+    await enterDatabase();
+    await validateDatabase();
+    await userEvent.click(continueButton());
+    expect(screen.getByRole("heading", { name: "Language Model" })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect((databaseUrl() as HTMLInputElement).value).toBe("libsql://db");
+    expect((databaseToken() as HTMLInputElement).value).toBe("token-a");
+    expectContinueEnabled();
+  });
+
+  it("requires current LLM validation and invalidates provider/key changes", async () => {
+    await enterDatabase();
+    await validateDatabase();
+    await userEvent.click(continueButton());
+    expectContinueDisabled();
+
+    invoke.mockRejectedValueOnce(new Error("no"));
+    await userEvent.click(screen.getByRole("button", { name: "Test Connection" }));
+    await waitFor(expectContinueDisabled);
+    fireEvent.change(screen.getByPlaceholderText("Gemini API Key"), { target: { value: "key-a" } });
+    await userEvent.click(screen.getByRole("button", { name: "Test Connection" }));
+    await waitFor(expectContinueEnabled);
+    fireEvent.change(screen.getByPlaceholderText("Gemini API Key"), { target: { value: "key-b" } });
+    expectContinueDisabled();
+    fireEvent.click(screen.getByLabelText("Groq"));
+    expectContinueDisabled();
+  });
+
+  it("preserves LLM and persona state across every Back transition", async () => {
+    await enterDatabase();
+    await validateDatabase();
+    await userEvent.click(continueButton());
+    fireEvent.change(screen.getByPlaceholderText("Gemini API Key"), { target: { value: "key-a" } });
+    await userEvent.click(screen.getByRole("button", { name: "Test Connection" }));
+    await waitFor(expectContinueEnabled);
+    await userEvent.click(continueButton());
+    await screen.findByRole("heading", { name: "Persona Setup" });
+    fireEvent.change(screen.getByPlaceholderText("Persona name"), { target: { value: "Diana" } });
+    await waitFor(expectContinueEnabled);
+    await userEvent.click(continueButton());
+    await screen.findByRole("heading", { name: "Review / Initialize" });
+
+    await userEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect((screen.getByPlaceholderText("Persona name") as HTMLInputElement).value).toBe("Diana");
+    await userEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect((screen.getByPlaceholderText("Gemini API Key") as HTMLInputElement).value).toBe("key-a");
+    await userEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect((databaseUrl() as HTMLInputElement).value).toBe("libsql://db");
+    await userEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByRole("heading", { name: "Welcome to MindCore" })).toBeTruthy();
+  });
+
+  it("requires a valid persona name before Review", async () => {
+    await enterDatabase();
+    await validateDatabase();
+    await userEvent.click(continueButton());
+    fireEvent.change(screen.getByPlaceholderText("Gemini API Key"), { target: { value: "key-a" } });
+    await userEvent.click(screen.getByRole("button", { name: "Test Connection" }));
+    await waitFor(expectContinueEnabled);
+    await userEvent.click(continueButton());
+    await screen.findByRole("heading", { name: "Persona Setup" });
+    expectContinueDisabled();
+    fireEvent.change(screen.getByPlaceholderText("Persona name"), { target: { value: "새 페르소나" } });
+    await waitFor(expectContinueEnabled);
+    fireEvent.change(screen.getByPlaceholderText("Persona name"), { target: { value: "bad\u0000name" } });
+    expectContinueDisabled();
+  });
+
+  it("ignores a stale database validation result", async () => {
+    let resolve!: () => void;
+    invoke.mockImplementationOnce(() => new Promise<void>((done) => { resolve = done; }));
+    await enterDatabase();
+    fireEvent.change(databaseUrl(), { target: { value: "libsql://a" } });
+    fireEvent.change(databaseToken(), { target: { value: "token-a" } });
+    await userEvent.click(screen.getByRole("button", { name: "Test Connection" }));
+    fireEvent.change(databaseUrl(), { target: { value: "libsql://b" } });
+    resolve();
+    await waitFor(expectContinueDisabled);
+    fireEvent.change(databaseUrl(), { target: { value: "libsql://a" } });
+    expectContinueDisabled();
+  });
+
+  it("lets reconfigure retain configured secrets without returning plaintext", async () => {
+    invoke.mockImplementation((name: string) => {
+      if (name === "get_config_metadata") {
+        return Promise.resolve({
+          database_url: "libsql://existing",
+          llm_provider: "gemini",
+          persona_display_name: "Diana",
+          turso_token_configured: true,
+          gemini_key_configured: true,
+          groq_key_configured: false,
+        });
+      }
+      return Promise.resolve("Connected");
+    });
+    render(<SetupWizard onComplete={vi.fn()} reconfigure />);
+    await userEvent.click(screen.getByRole("button", { name: "Edit configuration" }));
+    await waitFor(() => expect((databaseUrl() as HTMLInputElement).value).toBe("libsql://existing"));
+    expect((screen.getByPlaceholderText("Configured — leave blank to keep") as HTMLInputElement).value).toBe("");
+    expectContinueEnabled();
+    await userEvent.click(continueButton());
+    expect((screen.getByPlaceholderText("Configured — leave blank to keep") as HTMLInputElement).value).toBe("");
+    expectContinueEnabled();
+  });
+});

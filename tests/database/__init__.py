@@ -1,0 +1,1 @@
+"""Database lifecycle invariant tests."""

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="MindCore">
+  <rect width="512" height="512" rx="112" fill="#182033"/>
+  <circle cx="256" cy="256" r="150" fill="none" stroke="#93c5fd" stroke-width="28"/>
+  <circle cx="256" cy="256" r="68" fill="#93c5fd"/>
+  <path d="M256 82v72M256 358v72M82 256h72M358 256h72" stroke="#93c5fd" stroke-width="24" stroke-linecap="round"/>
+</svg>
