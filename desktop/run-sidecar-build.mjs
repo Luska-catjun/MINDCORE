@@ -8,7 +8,10 @@ const windows = process.platform === "win32";
 const candidates = windows
   ? [join(root, ".venv", "Scripts", "python.exe"), "python"]
   : [join(root, ".venv", "bin", "python"), "python3", "python"];
-const python = candidates.find((candidate) => !candidate.includes("/") || existsSync(candidate));
+// Do not infer a path from its separator: Windows absolute paths use `\\`,
+// so checking for `/` selected a missing local virtualenv interpreter on CI.
+// Prefer a real project virtualenv when present, then let PATH resolve Python.
+const python = candidates.find(existsSync) ?? candidates.at(-1);
 const result = spawnSync(python, [join(root, "desktop", "build_sidecar.py")], {
   cwd: root,
   stdio: "inherit",
