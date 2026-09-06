@@ -40,12 +40,13 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r desktop/requirements.txt
-          cd frontend
-          npm ci
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt -r desktop/requirements.txt
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
       - name: Validate source version for a tag release
         if: github.event_name == 'push'
         shell: pwsh
@@ -58,18 +59,28 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.build_only != true && inputs.signed_build_only != true
         shell: pwsh
         run: throw "Manual dispatch is build-only. Publish only from a matching v* tag."
-      - name: Run release checks
-        run: |
-          python -m unittest discover -v
-          python -m compileall -q app desktop
-          cd frontend
-          npm test -- --run
-          npm run lint
-          npm run build
-          npm run desktop:sidecar:build
-          cd src-tauri
-          cargo test
-          cargo check --target x86_64-pc-windows-msvc
+      - name: Run Python tests
+        run: python -m unittest discover -v
+      - name: Compile Python sources
+        run: python -m compileall -q app desktop
+      - name: Run frontend tests
+        working-directory: frontend
+        run: npm test -- --run
+      - name: Lint frontend
+        working-directory: frontend
+        run: npm run lint
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+      - name: Build Windows sidecar
+        working-directory: frontend
+        run: npm run desktop:sidecar:build
+      - name: Run Rust tests
+        working-directory: frontend/src-tauri
+        run: cargo test
+      - name: Check Rust for Windows
+        working-directory: frontend/src-tauri
+        run: cargo check --target x86_64-pc-windows-msvc
       - name: Build unsigned dry-run artifact
         if: github.event_name == 'workflow_dispatch' && inputs.signed_build_only != true
         working-directory: frontend
