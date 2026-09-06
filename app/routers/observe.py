@@ -266,18 +266,18 @@ async def observe_decisions(
 
 
 @router.patch("/narratives/{item_id}")
-async def correct_observed_narrative(item_id: UUID, body: CorrectionText, pool: asyncpg.Pool = Depends(get_pool)) -> dict[str, Any]:
+async def correct_observed_narrative(item_id: UUID, body: CorrectionText, request: Request, pool: asyncpg.Pool = Depends(get_pool)) -> dict[str, Any]:
     try:
-        await observation_corrections.update_narrative(pool, item_id, body.value)
+        await observation_corrections.update_narrative(pool, item_id, body.value, request.app.state.cognitive_snapshot_scope)
     except Exception as exc:
         raise _correction_error(exc) from exc
     return {"id": str(item_id), "corrected": True}
 
 
 @router.delete("/narratives/{item_id}")
-async def delete_observed_narrative(item_id: UUID, pool: asyncpg.Pool = Depends(get_pool)) -> dict[str, Any]:
+async def delete_observed_narrative(item_id: UUID, request: Request, pool: asyncpg.Pool = Depends(get_pool)) -> dict[str, Any]:
     try:
-        await observation_corrections.delete_narrative(pool, item_id)
+        await observation_corrections.delete_narrative(pool, item_id, request.app.state.cognitive_snapshot_scope)
     except Exception as exc:
         raise _correction_error(exc) from exc
     return {"id": str(item_id), "deleted": True}
@@ -321,18 +321,18 @@ async def observe_narratives(
 
 
 @router.patch("/self-model/{item_id}")
-async def correct_observed_self_model(item_id: UUID, body: CorrectionText, pool: asyncpg.Pool = Depends(get_pool)) -> dict[str, Any]:
+async def correct_observed_self_model(item_id: UUID, body: CorrectionText, request: Request, pool: asyncpg.Pool = Depends(get_pool)) -> dict[str, Any]:
     try:
-        await observation_corrections.update_self_model(pool, item_id, body.value)
+        await observation_corrections.update_self_model(pool, item_id, body.value, request.app.state.cognitive_snapshot_scope)
     except Exception as exc:
         raise _correction_error(exc) from exc
     return {"id": str(item_id), "corrected": True}
 
 
 @router.delete("/self-model/{item_id}")
-async def delete_observed_self_model(item_id: UUID, pool: asyncpg.Pool = Depends(get_pool)) -> dict[str, Any]:
+async def delete_observed_self_model(item_id: UUID, request: Request, pool: asyncpg.Pool = Depends(get_pool)) -> dict[str, Any]:
     try:
-        await observation_corrections.delete_self_model(pool, item_id)
+        await observation_corrections.delete_self_model(pool, item_id, request.app.state.cognitive_snapshot_scope)
     except Exception as exc:
         raise _correction_error(exc) from exc
     return {"id": str(item_id), "deleted": True}

@@ -13,6 +13,7 @@ from app.routers.auth import require_auth_settings, request_is_authenticated
 from app.services.prompt_loader import load_persona_identity_prompt
 from app.services.mindcore.narrative import hydrate_narrative_snapshot
 from app.services.mindcore.self_model import hydrate_self_model_snapshot
+from app.services.mindcore.snapshot_scope import CognitiveSnapshotScope
 
 
 def configure_diana_logging() -> None:
@@ -61,12 +62,13 @@ def build_lifespan(
     app.state.diana_identity_prompt = load_persona_identity_prompt(settings)
     pool = db_pool_factory(settings) if db_pool_factory else create_pool(settings)
     app.state.db_pool = await pool if hasattr(pool, "__await__") else pool
+    app.state.cognitive_snapshot_scope = CognitiveSnapshotScope()
     # One startup hydration keeps Narrative activation off the foreground chat
     # path.  Isolated ASGI fixtures without a database acquire seam simply use
     # the empty, safe snapshot.
     if hasattr(app.state.db_pool, "acquire"):
-        await hydrate_narrative_snapshot(app.state.db_pool)
-        await hydrate_self_model_snapshot(app.state.db_pool)
+        await hydrate_narrative_snapshot(app.state.db_pool, app.state.cognitive_snapshot_scope)
+        await hydrate_self_model_snapshot(app.state.db_pool, app.state.cognitive_snapshot_scope)
     try:
         yield
     finally:
@@ -78,13 +80,13 @@ def build_lifespan(
 def create_app(*, settings_override: Settings | None = None, db_pool_factory: Callable[[Settings], object] | None = None) -> FastAPI:
     configure_diana_logging()
     settings = settings_override or get_settings()
-    app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=build_lifespan(settings_override, db_pool_factory))
+    app = FastAPI(title=settings.app_name, version="0.1.1", lifespan=build_lifespan(settings_override, db_pool_factory))
 
     app.include_router(health.router)
     app.include_router(auth.router)
     @app.middleware("http")
     async def private_access(request: Request, call_next):
-        if request.method == "OPTIONS" or request.url.path in {"/health", "/_desktop/shutdown"} or request.url.path.startswith("/auth/"):
+        if request.method == "OPTIONS" or request.url.path in {"/health", "/_desktop/ready", "/_desktop/shutdown"} or request.url.path.startswith("/auth/"):
             return await call_next(request)
         settings = request.app.state.settings
         try:

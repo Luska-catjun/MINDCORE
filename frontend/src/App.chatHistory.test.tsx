@@ -29,6 +29,16 @@ vi.mock("./components/WorkspacePanel", () => ({
 
 import App from "./App";
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 const conversation = (id = "conversation-x"): ConversationRead => ({
   id,
   title: "Diana",
@@ -58,6 +68,7 @@ describe("Chat history across Observation views", () => {
 
   beforeEach(() => {
     window.localStorage.clear();
+    window.__DIANA_CHAT_DEBUG__ = undefined;
     vi.clearAllMocks();
     durableMessages = [message("a", "A"), message("b", "B", "conversation-x", "diana")];
     apiMock.health.mockResolvedValue({ status: "ok" });
@@ -109,6 +120,103 @@ describe("Chat history across Observation views", () => {
     await screen.findByText("C");
     expect(screen.getByText("Diana reply")).toBeTruthy();
     expect(durableMessages.map((item) => item.content)).toEqual(["A", "B", "C", "Diana reply"]);
+  });
+
+  it("merges a pending response after remount replaced its optimistic anchor", async () => {
+    const remountFetch = deferred<MessageRead[]>();
+    const send = deferred<ChatResponse>();
+    const durableUser = message("c", "C");
+    const durableAssistant = message("d", "D", "conversation-x", "diana");
+    apiMock.listMessages
+      .mockResolvedValueOnce(durableMessages)
+      .mockImplementationOnce(() => remountFetch.promise);
+    apiMock.sendChatMessage.mockImplementationOnce(() => send.promise);
+    await renderReadyApp();
+
+    fireEvent.change(screen.getByPlaceholderText("메시지를 입력하세요..."), { target: { value: "C" } });
+    await userEvent.click(screen.getByRole("button", { name: "전송" }));
+    expect(screen.getByText("C")).toBeTruthy();
+
+    await userEvent.click(screen.getByRole("button", { name: "Memory" }));
+    await userEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await waitFor(() => expect(apiMock.listMessages).toHaveBeenCalledTimes(2));
+    expect(screen.getByText(/가 생각 중\.\.\.$/)).toBeTruthy();
+    expect((screen.getByRole("button", { name: "전송 중..." }) as HTMLButtonElement).disabled).toBe(true);
+    remountFetch.resolve([...durableMessages, durableUser]);
+    await screen.findByText("C");
+
+    send.resolve({ user_message: durableUser, diana_message: durableAssistant });
+    await screen.findByText("D");
+    expect(screen.getAllByText("C")).toHaveLength(1);
+    expect(screen.getAllByText("D")).toHaveLength(1);
+  });
+
+  it.each([
+    ["A,B", (base: MessageRead[], _user: MessageRead, _assistant: MessageRead) => base],
+    ["A,B,C,D", (base: MessageRead[], user: MessageRead, assistant: MessageRead) => [...base, user, assistant]],
+  ])("reconciles when remount GET returns %s before POST", async (_case, remountRows) => {
+    const remountFetch = deferred<MessageRead[]>();
+    const send = deferred<ChatResponse>();
+    const durableUser = message("c", "C");
+    const durableAssistant = message("d", "D", "conversation-x", "diana");
+    apiMock.listMessages
+      .mockResolvedValueOnce(durableMessages)
+      .mockImplementationOnce(() => remountFetch.promise);
+    apiMock.sendChatMessage.mockImplementationOnce(() => send.promise);
+    await renderReadyApp();
+
+    fireEvent.change(screen.getByPlaceholderText("메시지를 입력하세요..."), { target: { value: "C" } });
+    await userEvent.click(screen.getByRole("button", { name: "전송" }));
+    await userEvent.click(screen.getByRole("button", { name: "Memory" }));
+    await userEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await waitFor(() => expect(apiMock.listMessages).toHaveBeenCalledTimes(2));
+
+    remountFetch.resolve(remountRows(durableMessages, durableUser, durableAssistant));
+    await waitFor(() => expect(window.__DIANA_CHAT_DEBUG__?.lastFetch?.status).toBe("applied"));
+    send.resolve({ user_message: durableUser, diana_message: durableAssistant });
+
+    await screen.findByText("D");
+    expect(screen.getAllByText("C")).toHaveLength(1);
+    expect(screen.getAllByText("D")).toHaveLength(1);
+  });
+
+  it("does not duplicate durable rows when POST resolves before remount GET", async () => {
+    const send = deferred<ChatResponse>();
+    const durableUser = message("c", "C");
+    const durableAssistant = message("d", "D", "conversation-x", "diana");
+    apiMock.sendChatMessage.mockImplementationOnce(() => send.promise);
+    await renderReadyApp();
+
+    fireEvent.change(screen.getByPlaceholderText("메시지를 입력하세요..."), { target: { value: "C" } });
+    await userEvent.click(screen.getByRole("button", { name: "전송" }));
+    await userEvent.click(screen.getByRole("button", { name: "Memory" }));
+    durableMessages = [...durableMessages, durableUser, durableAssistant];
+    send.resolve({ user_message: durableUser, diana_message: durableAssistant });
+    await waitFor(() => expect(window.__DIANA_CHAT_DEBUG__?.cache?.map((item) => item.id)).toEqual(["a", "b", "c", "d"]));
+
+    await userEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await screen.findByText("D");
+    expect(screen.getAllByText("C")).toHaveLength(1);
+    expect(screen.getAllByText("D")).toHaveLength(1);
+  });
+
+  it("discards a late POST response after logout resets the auth session", async () => {
+    const send = deferred<ChatResponse>();
+    apiMock.sendChatMessage.mockImplementationOnce(() => send.promise);
+    await renderReadyApp();
+
+    fireEvent.change(screen.getByPlaceholderText("메시지를 입력하세요..."), { target: { value: "C" } });
+    await userEvent.click(screen.getByRole("button", { name: "전송" }));
+    await userEvent.click(screen.getByRole("button", { name: "Log out" }));
+    await screen.findByRole("button", { name: "Sign in" });
+
+    send.resolve({
+      user_message: message("c", "C"),
+      diana_message: message("d", "D", "conversation-x", "diana"),
+    });
+    await waitFor(() => expect(window.__DIANA_CHAT_DEBUG__?.lastEvent).toBe("stale_send_discarded"));
+    expect(screen.queryByText("C")).toBeNull();
+    expect(screen.queryByText("D")).toBeNull();
   });
 
   it("re-fetches the same selected conversation after a real Chat unmount/remount", async () => {

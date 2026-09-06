@@ -34,6 +34,10 @@ class Pool:
         self.acquire_count += 1
         yield self.connection
 
+    def close(self) -> None:
+        connection, self.connection = self.connection, None
+        connection._connection.close()
+
 
 async def initialize(pool, conversation_id) -> None:
     async with pool.acquire() as connection:
@@ -194,11 +198,11 @@ class DecisionLifecycleGoalProgressTests(unittest.IsolatedAsyncioTestCase):
             decision = await record_decision(first, candidate=DecisionCandidate("explicit_choice", "업다운", .9, options=("스무고개", "업다운")), episode_id=None, conversation_id=conversation_id, user_text="스무고개, 업다운 게임 중 골라봐")
             await apply_grounded_decision_execution(first, conversation_id=conversation_id, user_text="업다운 게임 시작했어")
             await apply_grounded_goal_progress_from_event(first, conversation_id=conversation_id, user_text="업다운 게임 시작했어", source_id="restart-start")
-            first.connection._connection.close()
+            first.close()
             restarted = Pool(database)
             async with restarted.acquire() as connection:
                 decision_status = await connection.fetchval("select status from decision_log where id=$1", decision["id"])
                 progress = await connection.fetchval("select progress from diana_goals where goal_key='curiosity:updown_learning'")
             self.assertEqual(decision_status, "executed")
             self.assertAlmostEqual(float(progress), .75)
-            restarted.connection._connection.close()
+            restarted.close()

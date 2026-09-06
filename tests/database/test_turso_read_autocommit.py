@@ -5,6 +5,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 
 import libsql
@@ -21,7 +22,9 @@ class CountingRawConnection:
         self.commit_calls = 0
         self.rollback_calls = 0
         self.close_calls = 0
+        self.cursor_close_calls = 0
         self.fail_next_commit = False
+        self.fail_next_rollback = False
 
     @property
     def in_transaction(self):
@@ -29,7 +32,7 @@ class CountingRawConnection:
 
     def execute(self, *args, **kwargs):
         self.execute_calls += 1
-        return self.raw.execute(*args, **kwargs)
+        return TrackingCursor(self.raw.execute(*args, **kwargs), self)
 
     def commit(self):
         self.commit_calls += 1
@@ -40,11 +43,36 @@ class CountingRawConnection:
 
     def rollback(self):
         self.rollback_calls += 1
+        if self.fail_next_rollback:
+            self.fail_next_rollback = False
+            raise RuntimeError("injected rollback failure")
         return self.raw.rollback()
 
     def close(self):
         self.close_calls += 1
-        return self.raw.close()
+        # libSQL can retain a Windows file handle while the closed native
+        # connection object is still referenced.  Drop that reference before
+        # TemporaryDirectory attempts to remove a file-backed fixture.
+        raw, self.raw = self.raw, None
+        return raw.close()
+
+
+class TrackingCursor:
+    """Expose the native cursor API while making ownership release observable."""
+
+    def __init__(self, cursor, owner: CountingRawConnection) -> None:
+        self._cursor = cursor
+        self._owner = owner
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+    def close(self):
+        cursor, self._cursor = self._cursor, None
+        if cursor is not None:
+            self._owner.cursor_close_calls += 1
+            return cursor.close()
+        return None
 
 
 class LocalPool:
@@ -55,6 +83,28 @@ class LocalPool:
     @asynccontextmanager
     async def acquire(self):
         yield self.connection
+
+
+class BlockingRawConnection(CountingRawConnection):
+    """Hold one INSERT so cancellation can race the adapter's worker thread."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_next_insert = False
+        self.insert_started = threading.Event()
+        self.release_insert = threading.Event()
+        self.insert_finished = threading.Event()
+
+    def execute(self, statement, *args, **kwargs):
+        if self.block_next_insert and statement.casefold().lstrip().startswith("insert"):
+            self.block_next_insert = False
+            self.insert_started.set()
+            self.release_insert.wait(timeout=2)
+            try:
+                return super().execute(statement, *args, **kwargs)
+            finally:
+                self.insert_finished.set()
+        return super().execute(statement, *args, **kwargs)
 
 
 async def _run_plan(
@@ -125,8 +175,8 @@ class TursoReadAutocommitTests(unittest.IsolatedAsyncioTestCase):
         self.pool.raw.fail_next_commit = True
         with self.assertRaisesRegex(RuntimeError, "injected commit failure"):
             await self.pool.connection.execute("insert into values_table values($1)", 2)
-        self.assertTrue(self.pool.raw.in_transaction)
-        self.pool.raw.rollback()
+        self.assertFalse(self.pool.raw.in_transaction)
+        self.assertEqual(self.pool.raw.rollback_calls, 1)
         self.assertEqual(await self.pool.connection.fetchval("select count(*) from values_table"), 1)
 
     async def test_read_then_write_is_durable_after_fresh_connection(self) -> None:
@@ -142,6 +192,35 @@ class TursoReadAutocommitTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await connection.fetchval("select value from probe"), 7)
             await first.close()
             await second.close()
+
+    async def test_file_backed_pool_releases_native_owners_before_cleanup(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "native-owner.db"
+            pool = TursoPool(str(database), "isolated-test-token")
+            async with pool.acquire() as connection:
+                await connection.execute("create table probe(value integer)")
+                await connection.execute("insert into probe values($1)", 7)
+                self.assertEqual(await connection.fetchval("select value from probe"), 7)
+                async with connection.transaction():
+                    await connection.execute("insert into probe values($1)", 8)
+            await pool.close()
+
+            # Windows refuses this unlink while either a native Cursor or
+            # Connection still owns the database handle. No sleep, retry, or
+            # garbage collection is permitted at this lifecycle boundary.
+            database.unlink()
+            self.assertFalse(database.exists())
+
+    async def test_adapter_closes_every_native_cursor_after_consumption(self) -> None:
+        raw = CountingRawConnection()
+        connection = TursoConnection(raw)
+        await connection.execute("create table probe(value integer)")
+        await connection.execute("insert into probe values($1)", 1)
+        self.assertEqual(await connection.fetchval("select value from probe"), 1)
+        async with connection.transaction():
+            await connection.execute("insert into probe values($1)", 2)
+        self.assertEqual(raw.cursor_close_calls, raw.execute_calls)
+        raw.close()
 
     async def test_explicit_transaction_commits_once_and_failure_rolls_back(self) -> None:
         async with self.pool.connection.transaction():
@@ -226,7 +305,7 @@ class TursoReadAutocommitTests(unittest.IsolatedAsyncioTestCase):
             standalone_writes=3,
             transaction_statement_counts=[1, 3, 1, 1, 3],
         )
-        self.assertEqual(ordinary_statements, 21)
+        self.assertEqual(ordinary_statements, 26)  # 21 application statements + 5 BEGIN
         self.assertEqual(ordinary_commits, 8)
         self.assertEqual(ordinary_commits + 9, 17)  # prior read-autocommit total
         ordinary_raw.close()
@@ -239,7 +318,126 @@ class TursoReadAutocommitTests(unittest.IsolatedAsyncioTestCase):
             standalone_writes=8,
             transaction_statement_counts=[1, 6, 2, 2, 2, 2, 1, 3, 4, 5, 4, 7],
         )
-        self.assertEqual(rich_statements, 61)
+        self.assertEqual(rich_statements, 73)  # 61 application statements + 12 BEGIN
         self.assertEqual(rich_commits, 20)
         self.assertEqual(rich_commits + 14, 34)  # prior read-autocommit total
         rich_raw.close()
+
+    async def test_transaction_is_active_immediately_on_entry(self) -> None:
+        self.assertFalse(self.pool.raw.in_transaction)
+        async with self.pool.connection.transaction():
+            self.assertTrue(self.pool.raw.in_transaction)
+            self.assertEqual(await self.pool.connection.fetchval("select count(*) from values_table"), 0)
+            self.assertTrue(self.pool.raw.in_transaction)
+        self.assertFalse(self.pool.raw.in_transaction)
+        self.assertEqual(self.pool.raw.commit_calls, 1)
+
+    async def test_outer_failure_rolls_back_its_write(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "outer failure"):
+            async with self.pool.connection.transaction():
+                await self.pool.connection.execute("insert into values_table values($1)", 1)
+                raise RuntimeError("outer failure")
+
+        self.assertEqual(await self.pool.connection.fetchval("select count(*) from values_table"), 0)
+        self.assertFalse(self.pool.raw.in_transaction)
+
+    async def test_nested_success_is_rolled_back_by_outer_failure(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "outer failure"):
+            async with self.pool.connection.transaction():
+                await self.pool.connection.execute("insert into values_table values($1)", 1)
+                async with self.pool.connection.transaction():
+                    await self.pool.connection.execute("insert into values_table values($1)", 2)
+                self.assertEqual(self.pool.raw.commit_calls, 0)
+                raise RuntimeError("outer failure")
+
+        self.assertEqual(await self.pool.connection.fetch("select value from values_table order by value"), [])
+        self.assertFalse(self.pool.raw.in_transaction)
+
+    async def test_caught_inner_failure_rolls_back_only_inner_savepoint(self) -> None:
+        async with self.pool.connection.transaction():
+            await self.pool.connection.execute("insert into values_table values($1)", 1)
+            with self.assertRaisesRegex(RuntimeError, "inner failure"):
+                async with self.pool.connection.transaction():
+                    await self.pool.connection.execute("insert into values_table values($1)", 2)
+                    raise RuntimeError("inner failure")
+            await self.pool.connection.execute("insert into values_table values($1)", 3)
+
+        rows = await self.pool.connection.fetch("select value from values_table order by value")
+        self.assertEqual([row["value"] for row in rows], [1, 3])
+        self.assertFalse(self.pool.raw.in_transaction)
+
+    async def test_transaction_commit_failure_rolls_back_and_preserves_commit_error(self) -> None:
+        self.pool.raw.fail_next_commit = True
+        with self.assertRaisesRegex(RuntimeError, "injected commit failure"):
+            async with self.pool.connection.transaction():
+                await self.pool.connection.execute("insert into values_table values($1)", 1)
+
+        self.assertEqual(self.pool.raw.rollback_calls, 1)
+        self.assertFalse(self.pool.raw.in_transaction)
+        self.assertEqual(await self.pool.connection.fetchval("select count(*) from values_table"), 0)
+
+    async def test_rollback_failure_does_not_replace_application_error(self) -> None:
+        self.pool.raw.fail_next_rollback = True
+        with self.assertRaisesRegex(ValueError, "application failure") as raised:
+            async with self.pool.connection.transaction():
+                await self.pool.connection.execute("insert into values_table values($1)", 1)
+                raise ValueError("application failure")
+
+        self.assertTrue(any("rollback" in note for note in getattr(raised.exception, "__notes__", [])))
+        with self.assertRaisesRegex(RuntimeError, "unusable transaction state"):
+            await self.pool.connection.fetchval("select count(*) from values_table")
+        # Test cleanup only: the injected rollback failure leaves the local
+        # driver dirty, so explicitly restore it before the fixture is reused.
+        self.pool.raw.rollback()
+
+    async def test_body_cancellation_waits_for_worker_then_rolls_back(self) -> None:
+        raw = BlockingRawConnection()
+        connection = TursoConnection(raw)
+        await connection.execute("create table probe(value integer)")
+        raw.commit_calls = raw.rollback_calls = 0
+        raw.block_next_insert = True
+
+        async def write_in_transaction() -> None:
+            async with connection.transaction():
+                await connection.execute("insert into probe values($1)", 1)
+
+        task = asyncio.create_task(write_in_transaction())
+        self.assertTrue(await asyncio.to_thread(raw.insert_started.wait, 1))
+        task.cancel()
+        raw.release_insert.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(await asyncio.to_thread(raw.insert_finished.wait, 1))
+
+        self.assertEqual(raw.rollback_calls, 1)
+        self.assertFalse(raw.in_transaction)
+        self.assertEqual(await connection.fetchval("select count(*) from probe"), 0)
+        raw.close()
+
+    async def test_dml_returning_is_drained_inside_explicit_transaction(self) -> None:
+        async with self.pool.connection.transaction():
+            inserted = await self.pool.connection.fetchval(
+                "insert into values_table values($1) returning value", 7
+            )
+            self.assertEqual(inserted, 7)
+            self.assertTrue(self.pool.raw.in_transaction)
+            self.assertEqual(self.pool.raw.commit_calls, 0)
+
+        self.assertEqual(self.pool.raw.commit_calls, 1)
+        self.assertEqual(await self.pool.connection.fetchval("select value from values_table"), 7)
+
+    async def test_transaction_write_visibility_changes_only_after_commit(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = str(Path(directory) / "visibility.db")
+            writer_raw = CountingRawConnection(database)
+            observer_raw = CountingRawConnection(database)
+            writer = TursoConnection(writer_raw)
+            observer = TursoConnection(observer_raw)
+            await writer.execute("create table probe(value integer)")
+
+            async with writer.transaction():
+                await writer.execute("insert into probe values($1)", 9)
+                self.assertEqual(await observer.fetchval("select count(*) from probe"), 0)
+            self.assertEqual(await observer.fetchval("select count(*) from probe"), 1)
+            writer_raw.close()
+            observer_raw.close()

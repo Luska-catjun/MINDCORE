@@ -1,11 +1,14 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, isDesktopRuntime, setAuthFailureHandler, storeDesktopSession } from "./api/client";
 import {
   type ChatHistoryCache,
   type LocalMessage,
+  type PendingChatSend,
+  reconcileChatResponse,
   replaceDurableChatHistory,
   updateChatHistory,
 } from "./chatHistory";
+import type { ChatResponse } from "./types/api";
 import { Sidebar, type WorkspaceView } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
 import { WorkspacePanel } from "./components/WorkspacePanel";
@@ -31,6 +34,8 @@ function App() {
   // its per-conversation history above that view boundary so returning to Chat
   // never looks like durable messages were deleted.
   const [chatHistory, setChatHistory] = useState<ChatHistoryCache>({});
+  const [pendingSends, setPendingSends] = useState<Record<string, PendingChatSend>>({});
+  const sessionGenerationRef = useRef(0);
   const [conversationLoading, setConversationLoading] = useState(true);
   const [activeView, setActiveView] = useState<WorkspaceView>("chat");
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -45,9 +50,11 @@ function App() {
   const [reconfiguring, setReconfiguring] = useState(false);
 
   const clearSessionState = useCallback(() => {
+    sessionGenerationRef.current += 1;
     setAuthStatus("unauthenticated");
     setMainConversationId(null);
     setChatHistory({});
+    setPendingSends({});
     setSidebarOpen(false);
   }, []);
 
@@ -88,6 +95,16 @@ function App() {
     const checkHealth = async () => {
       setBackendStatus("checking");
       setStartupProgress(18);
+      if (isDesktopRuntime()) {
+        try {
+          // Native start is idempotent for a healthy managed child and creates
+          // a new generation after a crash or completed stop.
+          await invoke("start_mindcore_backend");
+        } catch {
+          if (!cancelled) setBackendStatus("error");
+          return;
+        }
+      }
       // The packaged sidecar normally starts in well under a second. Polling
       // avoids an authentication/API storm while it is still coming up.
       const deadline = Date.now() + (isDesktopRuntime() ? 30_000 : 0);
@@ -158,6 +175,13 @@ function App() {
     }
   };
 
+  const retryDesktopBackend = useCallback(() => {
+    setBackendStatus("checking");
+    setAuthStatus("checking");
+    setDesktopSessionError(false);
+    setStartupAttempt((value) => value + 1);
+  }, []);
+
   const handleViewChange = (view: WorkspaceView) => {
     setActiveView(view);
   };
@@ -193,6 +217,80 @@ function App() {
     [],
   );
 
+  const settlePendingSend = useCallback((send: PendingChatSend) => {
+    setPendingSends((current) => {
+      if (current[send.conversationId]?.tempId !== send.tempId) return current;
+      const next = { ...current };
+      delete next[send.conversationId];
+      return next;
+    });
+  }, []);
+
+  const handleSendStarted = useCallback(
+    (conversationId: string, optimistic: LocalMessage): PendingChatSend => {
+      const send = {
+        conversationId,
+        tempId: optimistic.id,
+        sessionGeneration: sessionGenerationRef.current,
+      };
+      setPendingSends((current) => ({ ...current, [conversationId]: send }));
+      handleMessagesChange(conversationId, (previous) => [...previous, optimistic], "optimistic_user_added");
+      return send;
+    },
+    [handleMessagesChange],
+  );
+
+  const handleSendSucceeded = useCallback(
+    (send: PendingChatSend, reply: ChatResponse): boolean => {
+      if (send.sessionGeneration !== sessionGenerationRef.current) {
+        chatDebug("stale_send_discarded", { conversationId: send.conversationId });
+        return false;
+      }
+      if (
+        reply.user_message.conversation_id !== send.conversationId
+        || reply.diana_message.conversation_id !== send.conversationId
+      ) {
+        chatDebug("cross_conversation_send_discarded", { conversationId: send.conversationId });
+        settlePendingSend(send);
+        return false;
+      }
+      handleMessagesChange(
+        send.conversationId,
+        (previous) => reconcileChatResponse(
+          previous,
+          send.conversationId,
+          send.tempId,
+          [reply.user_message, reply.diana_message],
+        ),
+        "durable_user_assistant_merged",
+      );
+      settlePendingSend(send);
+      return true;
+    },
+    [handleMessagesChange, settlePendingSend],
+  );
+
+  const handleSendFailed = useCallback(
+    (send: PendingChatSend): boolean => {
+      if (send.sessionGeneration !== sessionGenerationRef.current) {
+        chatDebug("stale_send_discarded", { conversationId: send.conversationId });
+        return false;
+      }
+      handleMessagesChange(
+        send.conversationId,
+        (previous) => previous.map((message) => (
+          message.id === send.tempId
+            ? { ...message, _pending: false, _failed: true }
+            : message
+        )),
+        "send_failed",
+      );
+      settlePendingSend(send);
+      return true;
+    },
+    [handleMessagesChange, settlePendingSend],
+  );
+
   const currentHistory = mainConversationId ? chatHistory[mainConversationId] : undefined;
 
   useEffect(() => {
@@ -215,11 +313,11 @@ function App() {
   }
 
   if (isDesktopRuntime() && backendStatus === "error") {
-    return <main className="login-screen"><div className="login-form"><div className="login-title">MINDCORE</div><p>MindCore could not start.</p><button className="login-button" type="button" onClick={() => setStartupAttempt((value) => value + 1)}>Retry</button><button className="login-button" type="button" onClick={() => void invoke("open_configuration_folder")}>Open Configuration</button><p className="workspace-muted">Check the desktop backend diagnostics in the app log.</p></div></main>;
+    return <main className="login-screen"><div className="login-form"><div className="login-title">MINDCORE</div><p>MindCore could not start.</p><button className="login-button" type="button" onClick={retryDesktopBackend}>Retry</button><button className="login-button" type="button" onClick={() => void invoke("open_configuration_folder")}>Open Configuration</button><p className="workspace-muted">Check the desktop backend diagnostics in the app log.</p></div></main>;
   }
 
   if (isDesktopRuntime() && (desktopSessionError || authStatus === "unauthenticated")) {
-    return <main className="login-screen"><div className="login-form"><div className="login-title">MINDCORE</div><p>MindCore could not start the local session.</p><button className="login-button" type="button" onClick={() => setStartupAttempt((value) => value + 1)}>Restart MindCore</button></div></main>;
+    return <main className="login-screen"><div className="login-form"><div className="login-title">MINDCORE</div><p>MindCore could not start the local session.</p><button className="login-button" type="button" onClick={retryDesktopBackend}>Restart MindCore</button></div></main>;
   }
 
   if (authStatus !== "authenticated") {
@@ -256,8 +354,11 @@ function App() {
             onStateUpdated={() => undefined}
             messages={currentHistory?.messages ?? []}
             historyRevision={currentHistory?.revision ?? 0}
-            onMessagesChange={handleMessagesChange}
+            sending={Boolean(mainConversationId && pendingSends[mainConversationId])}
             onDurableMessagesLoaded={handleDurableMessagesLoaded}
+            onSendStarted={handleSendStarted}
+            onSendSucceeded={handleSendSucceeded}
+            onSendFailed={handleSendFailed}
           />
         ) : (
           <WorkspacePanel

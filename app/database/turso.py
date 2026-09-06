@@ -28,6 +28,26 @@ _PARAMETER = re.compile(r"\$(\d+)")
 _TABLE_REFERENCE = re.compile(r"\b(?:from|join)\s+[\"`]?([a-zA-Z_][a-zA-Z0-9_]*)", re.IGNORECASE)
 
 
+async def _run_blocking(function: Any, *args: Any) -> Any:
+    """Let a driver call finish before propagating task cancellation.
+
+    ``asyncio.to_thread`` does not stop its worker when the awaiting task is
+    cancelled. Waiting for the worker here prevents rollback or connection
+    close from racing an operation that is still using the raw connection.
+    """
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancellation:
+        try:
+            await task
+        except BaseException as operation_error:
+            cancellation.add_note(
+                f"The cancelled database operation also failed with {type(operation_error).__name__}."
+            )
+        raise
+
+
 def _bind(statement: str, args: tuple[Any, ...]) -> tuple[str, tuple[Any, ...]]:
     """Convert PostgreSQL $n placeholders while preserving quoted SQL text."""
     output: list[str] = []; bound: list[Any] = []; index = 0; quoted = False
@@ -85,6 +105,8 @@ class TursoConnection:
     def __init__(self, connection: libsql.Connection) -> None:
         self._connection = connection
         self._transaction_depth = 0
+        self._savepoint_counter = 0
+        self._transaction_broken = False
         self._defer_auto_commit = False
         self._deferred_execution: tuple[float, bool, float] | None = None
 
@@ -98,9 +120,35 @@ class TursoConnection:
         """
         sql, bound = _bind(statement, args)
         execute_started = perf_counter()
-        cursor = await asyncio.to_thread(self._connection.execute, sql, bound)
+        if self._transaction_broken:
+            raise RuntimeError("Turso connection has an unusable transaction state.")
+        cursor = await _run_blocking(self._connection.execute, sql, bound)
         execute_ms = (perf_counter() - execute_started) * 1000
         return cursor, execute_ms, self._transaction_depth == 0 and self._connection.in_transaction
+
+    async def _close_cursor(self, cursor: Any, original: BaseException | None = None) -> None:
+        """Release the native statement owner at the adapter boundary.
+
+        libSQL cursors own native resources independently of the connection.
+        In particular, retaining a completed cursor can keep a file-backed
+        database open on Windows even after ``Connection.close()``.  Every
+        cursor created by this adapter is therefore closed as soon as its
+        result has been consumed.
+        """
+        close = getattr(cursor, "close", None)
+        if close is None:
+            return
+        try:
+            await _run_blocking(close)
+        except BaseException as cleanup:
+            if original is None:
+                raise
+            self._record_cleanup_failure(original, cleanup, "cursor close")
+
+    async def _execute_control(self, statement: str) -> None:
+        """Execute and immediately release a transaction-control cursor."""
+        cursor = await _run_blocking(self._connection.execute, statement)
+        await self._close_cursor(cursor)
 
     async def _commit_and_log(
         self,
@@ -113,7 +161,11 @@ class TursoConnection:
         commit_ms = 0.0
         if should_commit:
             commit_started = perf_counter()
-            await asyncio.to_thread(self._connection.commit)
+            try:
+                await _run_blocking(self._connection.commit)
+            except BaseException as error:
+                await self._rollback_preserving(error, operation="standalone commit rollback")
+                raise
             commit_ms = (perf_counter() - commit_started) * 1000
         logger.debug(
             "DB_LATENCY operation=%s execute_ms=%.2f commit_ms=%.2f "
@@ -130,10 +182,15 @@ class TursoConnection:
             # commit and restores regular execution immediately afterwards.
             self._deferred_execution = (execute_ms, should_commit, started)
             return cursor
-        await self._commit_and_log(
-            operation="execute", execute_ms=execute_ms,
-            should_commit=should_commit, started=started,
-        )
+        try:
+            await self._commit_and_log(
+                operation="execute", execute_ms=execute_ms,
+                should_commit=should_commit, started=started,
+            )
+        except BaseException as error:
+            await self._close_cursor(cursor, error)
+            raise
+        await self._close_cursor(cursor)
         return cursor
 
     async def fetch(self, statement: str, *args: Any) -> list[dict[str, Any]]:
@@ -146,20 +203,26 @@ class TursoConnection:
             cursor = await self.execute(statement, *args)
         finally:
             self._defer_auto_commit = False
-        names = [item[0] for item in cursor.description or []]
-        source_tables = _source_tables(statement)
-        rows = cursor.fetchall()
-        # DML with RETURNING keeps its statement active until its result rows
-        # are consumed.  Commit after materialization, while pure reads keep
-        # ``should_commit`` false and therefore issue no commit at all.
-        deferred = self._deferred_execution
-        self._deferred_execution = None
-        if deferred is not None:
-            execute_ms, should_commit, started = deferred
-            await self._commit_and_log(
-                operation="fetch", execute_ms=execute_ms,
-                should_commit=should_commit, started=started,
-            )
+        try:
+            names = [item[0] for item in cursor.description or []]
+            source_tables = _source_tables(statement)
+            rows = cursor.fetchall()
+            # DML with RETURNING keeps its statement active until its result
+            # rows are consumed. Commit after materialization, while pure
+            # reads keep ``should_commit`` false.
+            deferred = self._deferred_execution
+            self._deferred_execution = None
+            if deferred is not None:
+                execute_ms, should_commit, started = deferred
+                await self._commit_and_log(
+                    operation="fetch", execute_ms=execute_ms,
+                    should_commit=should_commit, started=started,
+                )
+        except BaseException as error:
+            self._deferred_execution = None
+            await self._close_cursor(cursor, error)
+            raise
+        await self._close_cursor(cursor)
         return [dict(zip(names, (_read_value(name, value, source_tables=source_tables) for name, value in zip(names, row)))) for row in rows]
 
     async def fetchrow(self, statement: str, *args: Any) -> dict[str, Any] | None:
@@ -170,26 +233,106 @@ class TursoConnection:
         row = await self.fetchrow(statement, *args)
         return next(iter(row.values())) if row else None
 
+    @staticmethod
+    def _record_cleanup_failure(original: BaseException, cleanup: BaseException, operation: str) -> None:
+        original.add_note(f"{operation} failed with {type(cleanup).__name__}.")
+        logger.error(
+            "DB_TRANSACTION_CLEANUP_FAILED operation=%s original_error_type=%s cleanup_error_type=%s",
+            operation, type(original).__name__, type(cleanup).__name__,
+        )
+
+    async def _rollback_preserving(self, original: BaseException, *, operation: str) -> bool:
+        rollback_started = perf_counter()
+        try:
+            await _run_blocking(self._connection.rollback)
+        except BaseException as cleanup:
+            self._transaction_broken = True
+            self._record_cleanup_failure(original, cleanup, operation)
+            return False
+        logger.debug(
+            "DB_LATENCY operation=rollback rollback_ms=%.2f transaction_depth=%s",
+            (perf_counter() - rollback_started) * 1000, self._transaction_depth,
+        )
+        return True
+
+    async def _rollback_savepoint_preserving(self, name: str, original: BaseException) -> None:
+        try:
+            await self._execute_control(f"ROLLBACK TO SAVEPOINT {name}")
+        except BaseException as cleanup:
+            self._transaction_broken = True
+            self._record_cleanup_failure(original, cleanup, "savepoint rollback")
+            return
+        try:
+            await self._execute_control(f"RELEASE SAVEPOINT {name}")
+        except BaseException as cleanup:
+            self._transaction_broken = True
+            self._record_cleanup_failure(original, cleanup, "savepoint release after rollback")
+
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[None]:
+        """Provide explicit outer transactions and nested SAVEPOINT scopes.
+
+        The outer context executes BEGIN on entry and owns the raw
+        commit/rollback. Nested contexts never commit the connection: they use
+        unique SAVEPOINT names, release on success, and roll back only their
+        own work on failure. Body cancellation is treated as a failure after
+        any in-flight worker finishes, so rollback cannot race that worker.
+        Cleanup failures are attached to, but never replace, the first error.
+        Reads outside this context retain standalone autocommit behavior.
+        """
+        if self._transaction_broken:
+            raise RuntimeError("Turso connection has an unusable transaction state.")
+        outermost = self._transaction_depth == 0
+        savepoint: str | None = None
+        if outermost:
+            try:
+                await self._execute_control("BEGIN")
+            except BaseException as error:
+                if self._connection.in_transaction:
+                    await self._rollback_preserving(error, operation="transaction entry rollback")
+                raise
+            self._transaction_broken = False
+        else:
+            self._savepoint_counter += 1
+            savepoint = f"mindcore_sp_{self._savepoint_counter}"
+            try:
+                await self._execute_control(f"SAVEPOINT {savepoint}")
+            except BaseException as error:
+                await self._rollback_savepoint_preserving(savepoint, error)
+                raise
         self._transaction_depth += 1
         try:
             yield
-        except Exception:
-            rollback_started = perf_counter()
-            await asyncio.to_thread(self._connection.rollback)
-            logger.debug(
-                "DB_LATENCY operation=rollback rollback_ms=%.2f transaction_depth=%s",
-                (perf_counter() - rollback_started) * 1000, self._transaction_depth,
-            )
+        except BaseException as error:
+            if outermost:
+                await self._rollback_preserving(error, operation="transaction rollback")
+            else:
+                assert savepoint is not None
+                await self._rollback_savepoint_preserving(savepoint, error)
             raise
         else:
-            commit_started = perf_counter()
-            await asyncio.to_thread(self._connection.commit)
-            logger.debug(
-                "DB_LATENCY operation=transaction_commit commit_ms=%.2f transaction_depth=%s",
-                (perf_counter() - commit_started) * 1000, self._transaction_depth,
-            )
+            if outermost:
+                if self._transaction_broken:
+                    error = RuntimeError("Turso transaction cannot commit after a cleanup failure.")
+                    await self._rollback_preserving(error, operation="broken transaction rollback")
+                    raise error
+                commit_started = perf_counter()
+                try:
+                    await _run_blocking(self._connection.commit)
+                except BaseException as error:
+                    await self._rollback_preserving(error, operation="transaction commit rollback")
+                    raise
+                logger.debug(
+                    "DB_LATENCY operation=transaction_commit commit_ms=%.2f transaction_depth=%s",
+                    (perf_counter() - commit_started) * 1000, self._transaction_depth,
+                )
+            else:
+                assert savepoint is not None
+                try:
+                    await self._execute_control(f"RELEASE SAVEPOINT {savepoint}")
+                except BaseException as error:
+                    await self._rollback_savepoint_preserving(savepoint, error)
+                    raise
         finally:
             self._transaction_depth -= 1
 

@@ -68,24 +68,24 @@ async def delete_observed_persona_preference(connection: Any, *, preference_id: 
     return True
 
 
-async def update_observed_self_model(connection: Any, *, item_id: UUID, summary: str, updated_at: str) -> bool:
+async def update_observed_self_model(connection: Any, *, item_id: UUID, summary: str, updated_at: str) -> dict[str, Any] | None:
     row = await connection.fetchrow(
-        "update diana_self_model set summary=$1, updated_at=$2 where id=$3 returning id",
+        "update diana_self_model set summary=$1, updated_at=$2 where id=$3 returning *",
         summary, updated_at, item_id,
     )
-    return row is not None
+    return dict(row) if row is not None else None
 
 
 async def delete_observed_self_model(connection: Any, *, item_id: UUID) -> bool:
     return await connection.fetchrow("delete from diana_self_model where id=$1 returning id", item_id) is not None
 
 
-async def update_observed_narrative(connection: Any, *, item_id: UUID, summary: str, updated_at: str) -> bool:
+async def update_observed_narrative(connection: Any, *, item_id: UUID, summary: str, updated_at: str) -> dict[str, Any] | None:
     row = await connection.fetchrow(
-        "update diana_narratives set summary=$1, updated_at=$2 where id=$3 returning id",
+        "update diana_narratives set summary=$1, updated_at=$2 where id=$3 returning *",
         summary, updated_at, item_id,
     )
-    return row is not None
+    return dict(row) if row is not None else None
 
 
 async def delete_observed_narrative(connection: Any, *, item_id: UUID) -> bool:

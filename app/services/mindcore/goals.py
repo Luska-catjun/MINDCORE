@@ -33,6 +33,10 @@ _TARGET_PREFIX = re.compile(r"^(?:다음에는?|나중에는?|언젠가|앞으�
 _TARGET_SUFFIX = re.compile(r"(?:이야기|동화)?(?:도|을|를|은|는|이|가|에|의)?\s*(?:더|한번|한 번)?\s*$")
 logger = logging.getLogger("diana.goals")
 
+
+class _NeedWriteConflict(RuntimeError):
+    """The durable Need changed after this transaction read its mutation base."""
+
 @dataclass
 class Need:
     key: str; value: float; baseline: float; updated_at: datetime; last_triggered_at: datetime | None = None
@@ -60,6 +64,17 @@ class SelfExpressionGoalSignal:
 def _now() -> datetime: return datetime.now(timezone.utc)
 def _clamp(value: float) -> float: return max(0., min(1., value))
 
+
+def _decayed_need_value(row: dict[str, Any], *, now: datetime) -> float:
+    """Return the effective value of one authoritative durable Need row."""
+    updated_at = row["updated_at"]
+    elapsed = max(0., (now - updated_at).total_seconds() / 3600)
+    baseline = float(row["baseline"])
+    value = baseline + (float(row["value"]) - baseline) * .5 ** (
+        elapsed / HALF_LIVES[str(row["need_key"])]
+    )
+    return _clamp(value)
+
 async def _get_need_snapshot_with_conn(c: Any, *, now: datetime | None = None) -> dict[str, Need]:
     """Read the lazily decayed Need snapshot using an already acquired connection."""
     current = now or _now()
@@ -82,9 +97,8 @@ async def _get_need_snapshot_with_conn(c: Any, *, now: datetime | None = None) -
                 loaded[key] = row
     result = {}
     for row in loaded.values():
-        elapsed = max(0., (current-row['updated_at']).total_seconds()/3600)
-        value = float(row['baseline']) + (float(row['value'])-float(row['baseline'])) * .5 ** (elapsed/HALF_LIVES[str(row['need_key'])])
-        result[str(row['need_key'])] = Need(str(row['need_key']), _clamp(value), float(row['baseline']), current, row['last_triggered_at'])
+        value = _decayed_need_value(row, now=current)
+        result[str(row['need_key'])] = Need(str(row['need_key']), value, float(row['baseline']), current, row['last_triggered_at'])
     return result
 
 async def get_need_snapshot(pool: asyncpg.Pool, *, now: datetime | None = None) -> dict[str, Need]:
@@ -98,18 +112,49 @@ async def _apply_with_conn(c: Any, needs: dict[str, Need], key: str, delta: floa
     for attempt in range(NEED_EVENT_MAX_ATTEMPTS):
         try:
             async with c.transaction():
-                after = _clamp(need.value + delta); now = _now()
+                # The INSERT remains the idempotence authority and is also the
+                # transaction's first write.  On SQLite/libSQL this obtains the
+                # single-writer reservation before we read the mutation base.
+                # A competing writer fails with BUSY/locked and retries from a
+                # new transaction, so it cannot reuse a stale caller snapshot.
+                now = max(_now(), need.updated_at)
+                provisional_after = _clamp(need.value + delta)
                 event = await c.fetchrow("""insert into diana_need_events(id,need_key,delta,before_value,after_value,reason,source_type,source_id,conversation_id,fingerprint,created_at)
                     values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                     on conflict(fingerprint) do nothing
-                    returning id""", uuid4(), key, delta, need.value, after, reason, source_type, source_id, conversation_id, fingerprint, now)
+                    returning id""", uuid4(), key, delta, need.value, provisional_after, reason, source_type, source_id, conversation_id, fingerprint, now)
                 if event is None:
                     return
-                await c.execute("update diana_needs set value=$1,updated_at=$2,last_triggered_at=$2 where need_key=$3", after, now, key)
+                current = await c.fetchrow(
+                    "select need_key,value,baseline,updated_at,last_triggered_at from diana_needs where need_key=$1",
+                    key,
+                )
+                if current is None:
+                    raise RuntimeError(f"Missing canonical Need row for {key}.")
+                # Preserve the established lazy-decay boundary represented by
+                # the caller snapshot.  If another event committed after that
+                # snapshot, its newer durable timestamp wins and is never
+                # decayed backwards or overwritten by the stale timestamp.
+                calculation_time = max(need.updated_at, current["updated_at"])
+                now = max(now, calculation_time)
+                before = _decayed_need_value(current, now=calculation_time)
+                after = _clamp(before + delta)
+                updated = await c.fetchrow(
+                    """update diana_needs set value=$1,updated_at=$2,last_triggered_at=$2
+                       where need_key=$3 and value=$4 and baseline=$5 and updated_at=$6
+                       returning need_key""",
+                    after, now, key, current["value"], current["baseline"], current["updated_at"],
+                )
+                if updated is None:
+                    raise _NeedWriteConflict("Need state changed during signal application.")
+                await c.execute(
+                    "update diana_need_events set before_value=$1,after_value=$2 where id=$3",
+                    before, after, event["id"],
+                )
             need.value, need.updated_at, need.last_triggered_at = after, now, now
             return
-        except ValueError as exc:
-            retryable = "database is locked" in str(exc).casefold()
+        except (_NeedWriteConflict, ValueError) as exc:
+            retryable = isinstance(exc, _NeedWriteConflict) or "database is locked" in str(exc).casefold()
             if not retryable or attempt + 1 == NEED_EVENT_MAX_ATTEMPTS:
                 raise
             await asyncio.sleep(0.01 * (attempt + 1))

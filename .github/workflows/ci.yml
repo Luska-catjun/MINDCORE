@@ -32,31 +32,35 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
       - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r desktop/requirements.txt
-      - name: Run Python checks
-        run: |
-          python -m unittest discover -v
-          python -m compileall -q app desktop
+        run: python -m pip install -r requirements.txt -r desktop/requirements.txt
+      - name: Run Python tests
+        run: python -m unittest discover -v
+      - name: Compile Python sources
+        run: python -m compileall -q app desktop
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
-      - name: Run frontend checks
+      - name: Run frontend tests
         working-directory: frontend
-        run: |
-          npm test -- --run
-          npm run lint
-          npm run build
+        run: npm test -- --run
+      - name: Lint frontend
+        working-directory: frontend
+        run: npm run lint
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
       - name: Build Windows sidecar
         working-directory: frontend
         run: npm run desktop:sidecar:build
-      - name: Run Rust checks
+      - name: Run Rust tests
         working-directory: frontend/src-tauri
-        run: |
-          cargo test
-          cargo check --target x86_64-pc-windows-msvc
+        run: cargo test
+      - name: Check Rust for Windows
+        working-directory: frontend/src-tauri
+        run: cargo check --target x86_64-pc-windows-msvc
       - name: Build unsigned Windows NSIS artifact
         working-directory: frontend
         run: npm run tauri:build:windows

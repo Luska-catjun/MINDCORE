@@ -27,6 +27,9 @@ class Pool:
  async def acquire(self):
   self.acquire_count += 1
   yield self.c
+ def close(self):
+  connection,self.c=self.c,None
+  connection._connection.close()
 
 class GoalsNeedsTests(unittest.IsolatedAsyncioTestCase):
  async def asyncSetUp(self):
@@ -70,11 +73,11 @@ class GoalsNeedsTests(unittest.IsolatedAsyncioTestCase):
   with TemporaryDirectory() as directory:
    database=str(Path(directory)/'needs.db'); first=Pool(database); cid=uuid4()
    await self._initialize(first,cid); await get_need_snapshot(first)
-   first.c._connection.close()
+   first.close()
    restarted=Pool(database)
    snapshot=await get_need_snapshot(restarted)
    self.assertEqual(set(snapshot),set(BASELINES))
-   restarted.c._connection.close()
+   restarted.close()
  async def test_help_goal_and_no_llm_context_state(self):
   wm=WorkingMemoryState(self.cid,[WorkingMemoryItem('x','Unknown topic',.9)])
   result=await update_goals(self.p,self.cid,'도와줘 working_memory',uuid4(),working_memory=wm,epistemic_unknown=True); needs,goals=result.needs,result.created_goals

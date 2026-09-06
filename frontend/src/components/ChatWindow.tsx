@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../api/client";
-import type { LocalMessage } from "../chatHistory";
+import type { LocalMessage, PendingChatSend } from "../chatHistory";
+import type { ChatResponse } from "../types/api";
 import { chatDebug } from "../chatDebug";
 import { MessageBubble } from "./MessageBubble";
 import { MessageInput } from "./MessageInput";
@@ -16,8 +17,11 @@ interface ChatWindowProps {
   onStateUpdated: () => void;
   messages: LocalMessage[];
   historyRevision: number;
-  onMessagesChange: (conversationId: string, updater: (messages: LocalMessage[]) => LocalMessage[], event?: string) => void;
+  sending: boolean;
   onDurableMessagesLoaded: (conversationId: string, messages: LocalMessage[], expectedRevision: number) => void;
+  onSendStarted: (conversationId: string, optimistic: LocalMessage) => PendingChatSend;
+  onSendSucceeded: (send: PendingChatSend, reply: ChatResponse) => boolean;
+  onSendFailed: (send: PendingChatSend) => boolean;
 }
 
 export function ChatWindow({
@@ -28,14 +32,18 @@ export function ChatWindow({
   onStateUpdated,
   messages,
   historyRevision,
-  onMessagesChange,
+  sending,
   onDurableMessagesLoaded,
+  onSendStarted,
+  onSendSucceeded,
+  onSendFailed,
 }: ChatWindowProps) {
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
-  const [sending, setSending] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const sendingRef = useRef(sending);
+  sendingRef.current = sending;
   const historyRef = useRef({ historyRevision, onDurableMessagesLoaded });
   historyRef.current = { historyRevision, onDurableMessagesLoaded };
 
@@ -86,8 +94,8 @@ export function ChatWindow({
   }, [conversationId, historyRevision, messages]);
 
   const handleSend = async (content: string) => {
-    if (!conversationId || sending) return;
-    setSending(true);
+    if (!conversationId || sendingRef.current) return;
+    sendingRef.current = true;
     setSendError(null);
     chatDebug("before_send", { conversationId, messages, revision: historyRevision });
 
@@ -105,7 +113,7 @@ export function ChatWindow({
       created_at: new Date().toISOString(),
       _pending: true,
     };
-    onMessagesChange(conversationId, (previous) => [...previous, optimistic], "optimistic_user_added");
+    const pendingSend = onSendStarted(conversationId, optimistic);
 
     try {
       const reply = await api.sendChatMessage({
@@ -114,21 +122,13 @@ export function ChatWindow({
         content,
         source_device: sourceDevice,
       });
-      onMessagesChange(
-        conversationId,
-        (previous) => previous.flatMap((m) => (m.id === tempId ? [reply.user_message, reply.diana_message] : [m])),
-        "durable_user_assistant_merged",
-      );
-      onStateUpdated();
+      if (onSendSucceeded(pendingSend, reply)) onStateUpdated();
     } catch (error) {
-      onMessagesChange(conversationId, (previous) =>
-        previous.map((m) =>
-          m.id === tempId ? { ...m, _pending: false, _failed: true } : m
-        )
-      );
-      setSendError(error instanceof ApiError ? error.message : "메시지를 전송하지 못했습니다.");
+      if (onSendFailed(pendingSend)) {
+        setSendError(error instanceof ApiError ? error.message : "메시지를 전송하지 못했습니다.");
+      }
     } finally {
-      setSending(false);
+      sendingRef.current = false;
     }
   };
 

@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4
 import unittest
+from unittest.mock import patch
 
 import libsql
 
 from app.database.turso import TursoConnection, TursoPool
 from app.services.mindcore.goals import (
     BASELINES,
+    Need,
     _apply,
     _form_goals,
     get_need_snapshot,
@@ -49,6 +51,8 @@ class RecordingConnection(TursoConnection):
         normalized = statement.lstrip().casefold()
         if normalized.startswith("insert into diana_need_events"):
             self.operations.append("event_insert")
+        elif normalized.startswith("update diana_need_events"):
+            self.operations.append("event_update")
         elif normalized.startswith("update diana_needs"):
             self.operations.append("need_update")
         elif normalized.startswith("select"):
@@ -56,6 +60,33 @@ class RecordingConnection(TursoConnection):
         else:
             self.operations.append("other")
         return await super().execute(statement, *args)
+
+
+class AlwaysLockedNeedConnection(TursoConnection):
+    def __init__(self, connection) -> None:
+        super().__init__(connection)
+        self.event_attempts = 0
+
+    async def fetchrow(self, statement, *args):
+        if statement.lstrip().casefold().startswith("insert into diana_need_events"):
+            self.event_attempts += 1
+            raise ValueError("database is locked")
+        return await super().fetchrow(statement, *args)
+
+
+class ConflictOnceNeedConnection(TursoConnection):
+    def __init__(self, connection) -> None:
+        super().__init__(connection)
+        self.conflict_next_update = False
+        self.update_attempts = 0
+
+    async def fetchrow(self, statement, *args):
+        if statement.lstrip().casefold().startswith("update diana_needs"):
+            self.update_attempts += 1
+            if self.conflict_next_update:
+                self.conflict_next_update = False
+                return None
+        return await super().fetchrow(statement, *args)
 
 
 async def initialize(pool, conversation_id: UUID) -> None:
@@ -135,6 +166,62 @@ class NeedSignalIntegrityTests(unittest.IsolatedAsyncioTestCase):
             "curiosity:message:source-b:signal",
         })
 
+    async def test_distinct_stale_snapshots_chain_from_authoritative_need(self) -> None:
+        fixed = datetime(2026, 9, 6, 12, 0, tzinfo=timezone.utc)
+        with patch("app.services.mindcore.goals._now", return_value=fixed):
+            left = await get_need_snapshot(self.pool, now=fixed)
+            right = await get_need_snapshot(self.pool, now=fixed)
+
+            await _apply(
+                self.pool, left, "curiosity", 0.03, "stale_signal", "message", "source-a", self.conversation_id
+            )
+            await _apply(
+                self.pool, right, "curiosity", 0.03, "stale_signal", "message", "source-b", self.conversation_id
+            )
+
+        self.assertAlmostEqual(await self._need_value("curiosity"), 0.51)
+        rows = await self._event_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            sorted((round(float(row["before_value"]), 6), round(float(row["after_value"]), 6)) for row in rows),
+            [(0.45, 0.48), (0.48, 0.51)],
+        )
+
+    async def test_three_distinct_stale_snapshots_all_apply_once(self) -> None:
+        fixed = datetime(2026, 9, 6, 12, 0, tzinfo=timezone.utc)
+        with patch("app.services.mindcore.goals._now", return_value=fixed):
+            snapshots = [await get_need_snapshot(self.pool, now=fixed) for _ in range(3)]
+            for index, snapshot in enumerate(snapshots):
+                await _apply(
+                    self.pool, snapshot, "curiosity", 0.03, "triple", "message",
+                    f"source-{index}", self.conversation_id,
+                )
+
+        self.assertAlmostEqual(await self._need_value("curiosity"), 0.54)
+        rows = await self._event_rows()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            sorted((round(float(row["before_value"]), 6), round(float(row["after_value"]), 6)) for row in rows),
+            [(0.45, 0.48), (0.48, 0.51), (0.51, 0.54)],
+        )
+
+    async def test_cross_conversation_distinct_concurrent_signals_are_not_lost(self) -> None:
+        other_conversation_id = uuid4()
+        async with self.pool.acquire() as connection:
+            await connection.execute("insert into conversations values($1)", other_conversation_id)
+        await get_need_snapshot(self.pool)
+        left, right = await asyncio.gather(get_need_snapshot(self.pool), get_need_snapshot(self.pool))
+
+        await asyncio.gather(
+            _apply(self.pool, left, "curiosity", 0.03, "cross_conversation", "message", "left", self.conversation_id),
+            _apply(self.pool, right, "curiosity", 0.03, "cross_conversation", "message", "right", other_conversation_id),
+        )
+
+        fresh_pool = TursoPool(self.database, "isolated-test-token")
+        self.assertAlmostEqual((await get_need_snapshot(fresh_pool))["curiosity"].value, 0.51, places=6)
+        async with fresh_pool.acquire() as connection:
+            self.assertEqual(await connection.fetchval("select count(*) from diana_need_events"), 2)
+
     async def test_multiple_same_turn_signals_preserve_each_need_and_event(self) -> None:
         needs = await get_need_snapshot(self.pool)
         signals = (
@@ -204,6 +291,46 @@ class NeedSignalIntegrityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await connection.fetchval("select count(*) from diana_need_events"), 0)
         raw.close()
 
+    async def test_write_conflict_retry_is_bounded(self) -> None:
+        raw = libsql.connect(":memory:")
+        connection = AlwaysLockedNeedConnection(raw)
+        needs = {
+            "curiosity": self._need_for_retry(),
+        }
+
+        with self.assertRaisesRegex(ValueError, "database is locked"):
+            await _apply(
+                SingleConnectionPool(connection), needs, "curiosity", 0.03,
+                "retry_exhausted", "message", "retry", self.conversation_id,
+            )
+
+        self.assertEqual(connection.event_attempts, 3)
+        self.assertFalse(raw.in_transaction)
+        raw.close()
+
+    async def test_detected_stale_write_rolls_back_event_and_retries(self) -> None:
+        raw = libsql.connect(":memory:")
+        connection = ConflictOnceNeedConnection(raw)
+        pool = SingleConnectionPool(connection)
+        conversation_id = uuid4()
+        await initialize(pool, conversation_id)
+        needs = await get_need_snapshot(pool)
+        connection.conflict_next_update = True
+
+        await _apply(
+            pool, needs, "curiosity", 0.03, "cas_retry", "message", "cas", conversation_id
+        )
+
+        self.assertEqual(connection.update_attempts, 2)
+        self.assertAlmostEqual(float(await connection.fetchval("select value from diana_needs where need_key='curiosity'")), .48)
+        self.assertEqual(await connection.fetchval("select count(*) from diana_need_events"), 1)
+        raw.close()
+
+    @staticmethod
+    def _need_for_retry():
+        fixed = datetime(2026, 9, 6, 12, 0, tzinfo=timezone.utc)
+        return Need("curiosity", 0.45, 0.45, fixed)
+
     async def test_insert_first_statement_counts_for_new_and_duplicate_signals(self) -> None:
         raw = libsql.connect(":memory:")
         connection = RecordingConnection(raw)
@@ -215,7 +342,7 @@ class NeedSignalIntegrityTests(unittest.IsolatedAsyncioTestCase):
         args = ("curiosity", 0.20, "statement_count", "message", "same-source", conversation_id)
 
         await _apply(pool, needs, *args)
-        self.assertEqual(connection.operations, ["event_insert", "need_update"])
+        self.assertEqual(connection.operations, ["event_insert", "select", "need_update", "event_update"])
 
         connection.operations.clear()
         await _apply(pool, needs, *args)
@@ -223,11 +350,13 @@ class NeedSignalIntegrityTests(unittest.IsolatedAsyncioTestCase):
         raw.close()
 
     async def test_restart_reads_durable_need_and_event_without_process_cache(self) -> None:
-        needs = await get_need_snapshot(self.pool)
-        await _apply(self.pool, needs, "curiosity", 0.20, "restart", "message", "restart-source", self.conversation_id)
+        fixed = datetime.now(timezone.utc)
+        with patch("app.services.mindcore.goals._now", return_value=fixed):
+            needs = await get_need_snapshot(self.pool, now=fixed)
+            await _apply(self.pool, needs, "curiosity", 0.20, "restart", "message", "restart-source", self.conversation_id)
 
-        fresh_pool = TursoPool(self.database, "isolated-test-token")
-        reloaded = await get_need_snapshot(fresh_pool)
+            fresh_pool = TursoPool(self.database, "isolated-test-token")
+            reloaded = await get_need_snapshot(fresh_pool, now=fixed)
         self.assertAlmostEqual(reloaded["curiosity"].value, 0.65)
         async with fresh_pool.acquire() as connection:
             self.assertEqual(await connection.fetchval("select count(*) from diana_need_events"), 1)

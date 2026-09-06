@@ -10,6 +10,12 @@ export interface ChatHistoryEntry {
 
 export type ChatHistoryCache = Record<string, ChatHistoryEntry>;
 
+export interface PendingChatSend {
+  conversationId: string;
+  tempId: string;
+  sessionGeneration: number;
+}
+
 export function updateChatHistory(
   cache: ChatHistoryCache,
   conversationId: string,
@@ -42,4 +48,41 @@ export function replaceDurableChatHistory(
     ...cache,
     [conversationId]: { ...current, messages },
   };
+}
+
+/**
+ * Reconcile the authoritative POST response independently of the optimistic
+ * message's lifetime. A remount fetch may already have replaced the temporary
+ * row with either or both durable rows, so durable ids are the dedupe authority.
+ */
+export function reconcileChatResponse(
+  messages: LocalMessage[],
+  conversationId: string,
+  tempId: string,
+  durableMessages: LocalMessage[],
+): LocalMessage[] {
+  const validDurableMessages = durableMessages.filter(
+    (message) => message.conversation_id === conversationId,
+  );
+  if (validDurableMessages.length !== durableMessages.length) return messages;
+
+  const durableIds = new Set(validDurableMessages.map((message) => message.id));
+  const firstReplacementIndex = messages.findIndex(
+    (message) => message.id === tempId || durableIds.has(message.id),
+  );
+  const retained = messages.filter(
+    (message) => message.id !== tempId && !durableIds.has(message.id),
+  );
+  const insertionIndex = firstReplacementIndex < 0
+    ? retained.length
+    : messages
+      .slice(0, firstReplacementIndex)
+      .filter((message) => message.id !== tempId && !durableIds.has(message.id))
+      .length;
+
+  return [
+    ...retained.slice(0, insertionIndex),
+    ...validDurableMessages,
+    ...retained.slice(insertionIndex),
+  ];
 }

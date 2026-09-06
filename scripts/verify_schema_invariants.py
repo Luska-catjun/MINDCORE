@@ -8,6 +8,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.config import get_settings
 from app.database.connection import close_pool, create_pool
+from app.database.schema_contract import SchemaState, classify_turso_schema
+
+
+async def verify(connection) -> None:
+    report = await classify_turso_schema(connection)
+    print(f"SCHEMA_STATE={report.state.value}")
+    print(f"SCHEMA_VERSION={report.version or 'none'}")
+    print(f"MISSING_TABLES={list(report.missing_tables)}")
+    print(f"MISSING_COLUMNS={list(report.missing_columns)}")
+    print(f"MISSING_CONSTRAINTS={list(report.missing_constraints)}")
+    print(f"SCHEMA_INVARIANT_ERRORS={list(report.invariant_errors)}")
+    if report.state != SchemaState.CURRENT:
+        raise SystemExit(1)
+    print("SCHEMA_INVARIANTS_OK")
 
 
 async def main() -> None:
@@ -16,31 +30,7 @@ async def main() -> None:
         raise RuntimeError("Database is not configured")
     try:
         async with pool.acquire() as connection:
-            tables = await connection.fetch("select name from sqlite_master where type='table' and name not like 'sqlite_%'")
-            invalid: list[str] = []
-            for table in tables:
-                name = table["name"]
-                columns = {item["name"]: item["notnull"] for item in await connection.fetch(f'pragma table_info("{name}")')}
-                for fk in await connection.fetch(f'pragma foreign_key_list("{name}")'):
-                    if fk["on_delete"].upper() == "SET NULL" and columns[fk["from"]]:
-                        invalid.append(f"{name}.{fk['from']}")
-            temporary = [item["name"] for item in tables if item["name"].endswith("__cascade") or item["name"].endswith("_new") or item["name"].endswith("_old")]
-            fk_check = await connection.fetch("pragma foreign_key_check")
-            decision_columns = {
-                item["name"] for item in await connection.fetch("pragma table_info(decision_log)")
-            }
-            required_decision_columns = {
-                "conversation_id", "decision_domain", "status", "updated_at", "resolved_at",
-            }
-            missing_decision_columns = sorted(required_decision_columns - decision_columns)
-            print("SCHEMA_VERSION_TRACKING_MISSING")
-            print(f"SET_NULL_NOT_NULL={invalid}")
-            print(f"TEMP_TABLES={temporary}")
-            print(f"FOREIGN_KEY_CHECK={fk_check}")
-            print(f"DECISION_LIFECYCLE_COLUMNS_MISSING={missing_decision_columns}")
-            if invalid or temporary or fk_check or missing_decision_columns:
-                raise SystemExit(1)
-            print("SCHEMA_INVARIANTS_OK")
+            await verify(connection)
     finally:
         await close_pool(pool)
 

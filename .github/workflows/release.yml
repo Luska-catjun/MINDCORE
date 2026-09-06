@@ -3,6 +3,10 @@ name: Windows Release
 on:
   push:
     tags: ["v*"]
+  schedule:
+    # 2026-09-09 18:00 Asia/Seoul. The eligibility guard makes this weekly
+    # cron a one-time release trigger.
+    - cron: "0 9 * * 3"
   workflow_dispatch:
     inputs:
       build_only:
@@ -20,7 +24,53 @@ permissions:
   contents: write
 
 jobs:
+  scheduled_release_guard:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      eligible: ${{ steps.eligibility.outputs.eligible }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check one-time release eligibility
+        id: eligibility
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: "0.1.1"
+          RELEASE_TAG: "v0.1.1"
+          RELEASE_STARTS_AT: "2026-09-09T09:00:00Z"
+          RELEASE_EXPIRES_AT: "2026-09-10T00:00:00Z"
+        run: |
+          set -euo pipefail
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          eligibility="$(python3 scripts/release_guard.py schedule \
+            --now "$now" \
+            --starts-at "$RELEASE_STARTS_AT" \
+            --expires-at "$RELEASE_EXPIRES_AT" \
+            --version "$RELEASE_VERSION")"
+          echo "$eligibility" >> "$GITHUB_OUTPUT"
+          if [[ "$eligibility" != "eligible=true" ]]; then
+            exit 0
+          fi
+          remote_tag="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG")"
+          if [[ -n "$remote_tag" ]]; then
+            echo "Scheduled release tag already exists" >&2
+            exit 1
+          fi
+          existing_release="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq ".[] | select(.tagName == \"$RELEASE_TAG\") | .tagName")"
+          if [[ -n "$existing_release" ]]; then
+            echo "Scheduled GitHub Release already exists" >&2
+            exit 1
+          fi
+
   release:
+    needs: scheduled_release_guard
+    if: ${{ always() && (github.event_name != 'schedule' || (needs.scheduled_release_guard.result == 'success' && needs.scheduled_release_guard.outputs.eligible == 'true')) }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,36 +90,50 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r desktop/requirements.txt
-          cd frontend
-          npm ci
-      - name: Validate source version for a tag release
-        if: github.event_name == 'push'
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt -r desktop/requirements.txt
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Resolve and validate source version
         shell: pwsh
         run: |
           $version = (Select-String -Path frontend/src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          if ("v$version" -ne "${{ github.ref_name }}") { throw "Tag and Cargo.toml version do not match" }
+          python scripts/release_guard.py version --expected $version
+          if ($LASTEXITCODE -ne 0) { throw "Release version metadata validation failed" }
+          if ("${{ github.event_name }}" -eq "push" -and "v$version" -ne "${{ github.ref_name }}") { throw "Tag and source version do not match" }
+          if ("${{ github.event_name }}" -eq "schedule" -and $version -ne "0.1.1") { throw "Scheduled release version must be 0.1.1" }
           "MINDCORE_VERSION=$version" >> $env:GITHUB_ENV
-          "RELEASE_TAG=${{ github.ref_name }}" >> $env:GITHUB_ENV
+          if ("${{ github.event_name }}" -eq "push") { "RELEASE_TAG=${{ github.ref_name }}" >> $env:GITHUB_ENV }
+          if ("${{ github.event_name }}" -eq "schedule") { "RELEASE_TAG=v0.1.1" >> $env:GITHUB_ENV }
       - name: Reject manual release publishing
         if: github.event_name == 'workflow_dispatch' && inputs.build_only != true && inputs.signed_build_only != true
         shell: pwsh
         run: throw "Manual dispatch is build-only. Publish only from a matching v* tag."
-      - name: Run release checks
-        run: |
-          python -m unittest discover -v
-          python -m compileall -q app desktop
-          cd frontend
-          npm test -- --run
-          npm run lint
-          npm run build
-          npm run desktop:sidecar:build
-          cd src-tauri
-          cargo test
-          cargo check --target x86_64-pc-windows-msvc
+      - name: Run Python tests
+        run: python -m unittest discover -v
+      - name: Compile Python sources
+        run: python -m compileall -q app desktop
+      - name: Run frontend tests
+        working-directory: frontend
+        run: npm test -- --run
+      - name: Lint frontend
+        working-directory: frontend
+        run: npm run lint
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+      - name: Build Windows sidecar
+        working-directory: frontend
+        run: npm run desktop:sidecar:build
+      - name: Run Rust tests
+        working-directory: frontend/src-tauri
+        run: cargo test
+      - name: Check Rust for Windows
+        working-directory: frontend/src-tauri
+        run: cargo check --target x86_64-pc-windows-msvc
       - name: Build unsigned dry-run artifact
         if: github.event_name == 'workflow_dispatch' && inputs.signed_build_only != true
         working-directory: frontend
@@ -77,7 +141,7 @@ jobs:
           MINDCORE_UPDATER_DISABLED: "1"
         run: npm run tauri:build:windows
       - name: Validate release signing configuration
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.signed_build_only == true)
+        if: github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.signed_build_only == true)
         shell: pwsh
         env:
           MINDCORE_UPDATER_PUBKEY: ${{ vars.MINDCORE_UPDATER_PUBKEY }}
@@ -88,7 +152,7 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) { throw "TAURI_SIGNING_PRIVATE_KEY secret is required" }
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) { throw "TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is required" }
       - name: Build signed Windows NSIS artifact
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.signed_build_only == true)
+        if: github.event_name == 'push' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.signed_build_only == true)
         working-directory: frontend
         env:
           MINDCORE_UPDATE_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest.json
@@ -101,7 +165,7 @@ jobs:
         shell: pwsh
         run: |
           $bundle = "frontend/src-tauri/target/release/bundle/nsis"
-          $installer = Get-Item "$bundle/MindCore_0.1.0_x64-setup.exe" -ErrorAction Stop
+          $installer = Get-Item "$bundle/MindCore_$($env:MINDCORE_VERSION)_x64-setup.exe" -ErrorAction Stop
           $signature = Get-Item "$($installer.FullName).sig" -ErrorAction Stop
           if ($installer.Length -le 0) { throw "NSIS installer is empty" }
           if ($signature.Length -le 0) { throw "Updater signature is empty" }
@@ -111,7 +175,7 @@ jobs:
           $bundle = "frontend/src-tauri/target/release/bundle/nsis"
           $installer = Get-ChildItem $bundle -Filter *.exe -Recurse | Select-Object -First 1
           if ($null -eq $installer -or $installer.Length -le 0) { throw "NSIS installer is missing or empty" }
-          if ("${{ github.event_name }}" -eq "push") {
+          if ("${{ github.event_name }}" -eq "push" -or "${{ github.event_name }}" -eq "schedule") {
             $signature = Get-Item "$($installer.FullName).sig" -ErrorAction Stop
             if ($signature.Length -le 0) { throw "Updater signature is empty" }
             $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -131,11 +195,31 @@ jobs:
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: mindcore-windows-${{ github.event_name == 'push' && 'release' || inputs.signed_build_only && 'signed-build-only' || 'unsigned-build-only' }}
+          name: mindcore-windows-${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'release' || inputs.signed_build_only && 'signed-build-only' || 'unsigned-build-only' }}
           path: frontend/src-tauri/target/release/bundle/nsis/**
           if-no-files-found: error
+      - name: Create scheduled release tag
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $remoteTag = git ls-remote --tags origin "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw "Could not verify scheduled release tag state" }
+          if (-not [string]::IsNullOrWhiteSpace($remoteTag)) { throw "Scheduled release tag already exists" }
+          $existingRelease = gh release list --repo $env:GITHUB_REPOSITORY --limit 100 --json tagName --jq ".[] | select(.tagName == `"$env:RELEASE_TAG`") | .tagName"
+          if ($LASTEXITCODE -ne 0) { throw "Could not verify scheduled GitHub Release state" }
+          if (-not [string]::IsNullOrWhiteSpace($existingRelease)) { throw "Scheduled GitHub Release already exists" }
+          git config user.name "github-actions[bot]"
+          if ($LASTEXITCODE -ne 0) { throw "Could not configure release tag author" }
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ($LASTEXITCODE -ne 0) { throw "Could not configure release tag email" }
+          git tag -a $env:RELEASE_TAG $env:GITHUB_SHA -m "MindCore $env:MINDCORE_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "Could not create scheduled release tag" }
+          git push origin "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw "Could not push scheduled release tag" }
       - name: Publish GitHub Release
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh

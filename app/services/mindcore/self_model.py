@@ -15,12 +15,12 @@ import asyncpg
 
 from app.database.normalization import normalize_json_object
 from app.services.runtime_diagnostics import record_self_model_update
+from app.services.mindcore.snapshot_scope import CognitiveSnapshotScope, resolve_snapshot_scope
 
 logger = __import__("logging").getLogger("diana.self_model")
 
 _NARRATIVE_CATEGORIES = {"activity_pattern", "choice_pattern", "interest_pattern", "routine_pattern"}
 _CHOICE_TYPES = {"explicit_choice", "soft_choice", "explicit_accept"}
-_runtime_snapshot: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -69,13 +69,12 @@ def _status(*, support_count: int, conversation_count: int, confidence: float) -
     return "candidate"
 
 
-def get_self_model_snapshot() -> tuple[dict[str, Any], ...]:
+def get_self_model_snapshot(scope: CognitiveSnapshotScope | None = None) -> tuple[dict[str, Any], ...]:
     """Bounded durable-derived snapshot; foreground turns never query for it."""
-    return _runtime_snapshot
+    return resolve_snapshot_scope(scope).self_model.read()
 
 
-def _replace_runtime_snapshot(rows: list[dict[str, Any]]) -> None:
-    global _runtime_snapshot
+def _snapshot_rows(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
     # claim_key is the durable canonical identity. Keep one row per key even
     # when callers provide legacy/repeated rows.
     canonical: dict[str, dict[str, Any]] = {}
@@ -85,11 +84,37 @@ def _replace_runtime_snapshot(rows: list[dict[str, Any]]) -> None:
         if current is None or (float(row.get("confidence") or 0), str(row.get("updated_at") or "")) > (float(current.get("confidence") or 0), str(current.get("updated_at") or "")):
             canonical[key] = dict(row)
     ordered = sorted(canonical.values(), key=lambda row: (-float(row.get("confidence") or 0), str(row.get("id") or "")))
-    _runtime_snapshot = tuple(ordered[:48])
+    return tuple(ordered[:48])
 
 
-async def hydrate_self_model_snapshot(pool: asyncpg.Pool) -> tuple[dict[str, Any], ...]:
+def apply_self_model_correction(
+    scope: CognitiveSnapshotScope | None,
+    *,
+    item_id: UUID,
+    updated_row: dict[str, Any] | None,
+) -> tuple[dict[str, Any], ...]:
+    """Apply one committed manual correction to its runtime scope."""
+    cell = resolve_snapshot_scope(scope).self_model
+
+    def corrected(current: tuple[dict[str, Any], ...]) -> tuple[dict[str, Any], ...]:
+        rows = {str(row.get("id")): dict(row) for row in current}
+        key = str(item_id)
+        if updated_row is None:
+            rows.pop(key, None)
+        else:
+            rows[key] = {**rows.get(key, {}), **dict(updated_row)}
+        return _snapshot_rows(list(rows.values()))
+
+    return cell.apply_correction(corrected)
+
+
+async def hydrate_self_model_snapshot(
+    pool: asyncpg.Pool,
+    scope: CognitiveSnapshotScope | None = None,
+) -> tuple[dict[str, Any], ...]:
     """Startup hydration with an empty-snapshot failure fallback."""
+    cell = resolve_snapshot_scope(scope).self_model
+    expected_epoch = cell.begin_refresh()
     try:
         async with pool.acquire() as connection:
             rows = await connection.fetch(
@@ -101,9 +126,9 @@ async def hydrate_self_model_snapshot(pool: asyncpg.Pool) -> tuple[dict[str, Any
             )
     except Exception as exc:
         logger.warning("Self model snapshot hydration skipped error_type=%s error=%s", type(exc).__name__, str(exc))
-        return _runtime_snapshot
-    _replace_runtime_snapshot([dict(row) for row in rows])
-    return _runtime_snapshot
+        return cell.read()
+    cell.publish_replace(expected_epoch, _snapshot_rows([dict(row) for row in rows]))
+    return cell.read()
 
 
 async def _signals_for_episode(connection: Any, episode: dict[str, Any]) -> list[SelfModelSignal]:
@@ -159,9 +184,16 @@ async def _signals_for_episode(connection: Any, episode: dict[str, Any]) -> list
     return signals
 
 
-async def update_self_model_shadow(pool: asyncpg.Pool, *, episode_id: UUID) -> list[dict[str, Any]]:
+async def update_self_model_shadow(
+    pool: asyncpg.Pool,
+    *,
+    episode_id: UUID,
+    snapshot_scope: CognitiveSnapshotScope | None = None,
+) -> list[dict[str, Any]]:
     """Update shadow beliefs from one grounded episode; no LLM calls occur."""
     started = perf_counter()
+    cell = resolve_snapshot_scope(snapshot_scope).self_model
+    expected_epoch = cell.begin_refresh()
     timestamp = datetime.now(timezone.utc)
     async with pool.acquire() as connection:
         episode = await connection.fetchrow(
@@ -210,9 +242,12 @@ async def update_self_model_shadow(pool: asyncpg.Pool, *, episode_id: UUID) -> l
                 results.append(dict(updated))
     record_self_model_update(episode_id=str(episode_id), accepted=bool(results), claim_count=len(results), latency_ms=(perf_counter() - started) * 1000)
     if results:
-        existing = {str(row.get("id")): row for row in _runtime_snapshot}
-        existing.update({str(row["id"]): row for row in results})
-        _replace_runtime_snapshot(list(existing.values()))
+        def merge(current: tuple[dict[str, Any], ...]) -> tuple[dict[str, Any], ...]:
+            existing = {str(row.get("id")): row for row in current}
+            existing.update({str(row["id"]): row for row in results})
+            return _snapshot_rows(list(existing.values()))
+
+        cell.publish_update(expected_epoch, merge)
     return results
 
 

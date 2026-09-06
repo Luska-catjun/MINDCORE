@@ -9,16 +9,20 @@ import os
 from pathlib import Path
 import secrets
 import sys
+import tempfile
 import threading
 import time
 import uvicorn
-from fastapi import Response
+from fastapi import FastAPI, HTTPException, Request, Response, status
 
+from app.database.schema_contract import SchemaState, classify_turso_schema
 from app.main import create_app
 
 
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
-CORE_TABLES = {"conversations", "messages", "episodes", "diana_state", "diana_working_memory_items"}
+DESKTOP_SHUTDOWN_CAPABILITY_ENV = "MINDCORE_DESKTOP_SHUTDOWN_CAPABILITY"
+DESKTOP_SHUTDOWN_CAPABILITY_HEADER = "X-MindCore-Desktop-Shutdown"
+DESKTOP_INSTANCE_HEADER = "X-MindCore-Desktop-Instance"
 
 
 def _settings_from(config_path: str):
@@ -55,6 +59,8 @@ def _ensure_desktop_auth_config(config_path: str) -> None:
     """Provision desktop-local auth once, without exposing either secret."""
     path = Path(config_path)
     text = path.read_text(encoding="utf-8")
+    existing_mode = path.stat().st_mode & 0o700 if os.name != "nt" else None
+    secure_mode = (existing_mode or 0o600) if existing_mode is not None else None
     keys = {line.partition("=")[0] for line in text.splitlines() if "=" in line}
     additions = []
     if "PRIVATE_ACCESS_PASSWORD" not in keys:
@@ -62,10 +68,70 @@ def _ensure_desktop_auth_config(config_path: str) -> None:
     if "AUTH_SIGNING_SECRET" not in keys:
         additions.append(f"AUTH_SIGNING_SECRET={secrets.token_urlsafe(32)}")
     if not additions:
+        if secure_mode is not None:
+            # Existing auth material must not retain group/other access either.
+            os.chmod(path, secure_mode)
         return
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(text.rstrip("\n") + "\n" + "\n".join(additions) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    try:
+        # mkstemp creates files as owner-only. Keep the mode explicit so a
+        # permissive caller umask cannot broaden a file containing auth keys.
+        if secure_mode is not None:
+            os.fchmod(descriptor, secure_mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text.rstrip("\n") + "\n" + "\n".join(additions) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if secure_mode is not None and (path.stat().st_mode & 0o777) != secure_mode:
+            # Preserve an existing owner's permissions while removing any
+            # group/other access. A usual 0600 desktop config stays 0600.
+            os.chmod(path, secure_mode)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _register_desktop_shutdown_route(app: FastAPI, server: object, capability: str | None) -> None:
+    """Register parent-only lifecycle routes without exposing the capability."""
+
+    def require_parent_capability(request: Request) -> None:
+        candidate = request.headers.get(DESKTOP_SHUTDOWN_CAPABILITY_HEADER)
+        if not capability or not candidate or not secrets.compare_digest(candidate, capability):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Desktop lifecycle access is not authorized.")
+
+    @app.get("/_desktop/ready", include_in_schema=False)
+    async def ready(request: Request) -> Response:
+        require_parent_capability(request)
+        return Response(
+            status_code=204,
+            headers={DESKTOP_INSTANCE_HEADER: capability},
+        )
+
+    @app.post("/_desktop/shutdown", include_in_schema=False)
+    async def shutdown(request: Request) -> Response:
+        require_parent_capability(request)
+        # The capability is intentionally never written to a URL, argv, or log.
+        server.should_exit = True
+        return Response(status_code=204)
+
+
+def _stop_when_parent_exits(server: object, parent_pid: int, poll_interval: float = 0.5) -> None:
+    while not server.should_exit:
+        if not _parent_process_is_alive(parent_pid):
+            server.should_exit = True
+            return
+        time.sleep(poll_interval)
 
 
 def _desktop_session_token(config_path: str) -> str:
@@ -95,31 +161,29 @@ async def _setup_action(action: str, config_path: str) -> str:
     try:
         async with pool.acquire() as connection:
             await connection.fetchval("SELECT 1")
-            tables = {str(row["name"]) for row in await connection.fetch("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
             if action == "database":
                 return "DATABASE_CONNECTED"
-            if not tables:
-                classification = "EMPTY"
-            elif "schema_metadata" in tables and CORE_TABLES.issubset(tables):
-                classification = "INITIALIZED"
-            elif CORE_TABLES.issubset(tables):
-                classification = "INITIALIZED"
-            else:
-                classification = "PARTIAL_OR_UNKNOWN"
+            report = await classify_turso_schema(connection)
+            classification = (
+                "INITIALIZED" if report.state == SchemaState.CURRENT else report.state.value
+            )
             if action == "classify":
                 return classification
             if action != "initialize":
                 raise RuntimeError("unsupported_setup_action")
-            if classification == "PARTIAL_OR_UNKNOWN":
-                raise RuntimeError("partial_or_unknown")
+            if report.state == SchemaState.PARTIAL_OR_UNKNOWN:
+                raise RuntimeError(f"partial_or_unknown: {report.details()}")
             if classification == "INITIALIZED":
                 return "INITIALIZED"
+            if report.state == SchemaState.COMPATIBLE_LEGACY:
+                return "COMPATIBLE_LEGACY"
             baseline = RESOURCE_ROOT / "db" / "turso" / "baseline_v1.sql"
             async with connection.transaction():
                 for statement in baseline.read_text(encoding="utf-8").split(";"):
                     if statement.strip():
                         await connection.execute(statement)
-            if await connection.fetch("PRAGMA foreign_key_check") or (await connection.fetchval("PRAGMA integrity_check")) != "ok":
+            verified = await classify_turso_schema(connection)
+            if verified.state != SchemaState.CURRENT:
                 raise RuntimeError("schema_verification_failed")
             return "BOOTSTRAPPED"
     finally:
@@ -161,21 +225,17 @@ def main() -> None:
     server = uvicorn.Server(config)
 
     if args.parent_pid:
-        def stop_when_parent_exits() -> None:
-            while not server.should_exit:
-                if not _parent_process_is_alive(args.parent_pid):
-                    server.should_exit = True
-                    return
-                time.sleep(0.5)
+        threading.Thread(
+            target=_stop_when_parent_exits,
+            args=(server, args.parent_pid),
+            daemon=True,
+        ).start()
 
-        threading.Thread(target=stop_when_parent_exits, daemon=True).start()
-
-    @app.post("/_desktop/shutdown", include_in_schema=False)
-    async def shutdown() -> Response:
-        # Only the native parent can reach this fixed loopback endpoint. Ask
-        # Uvicorn to complete its lifespan cleanup before the parent fallback.
-        server.should_exit = True
-        return Response(status_code=204)
+    _register_desktop_shutdown_route(
+        app,
+        server,
+        os.environ.get(DESKTOP_SHUTDOWN_CAPABILITY_ENV),
+    )
 
     # Loopback only: the packaged desktop backend is never a LAN server.
     server.run()
