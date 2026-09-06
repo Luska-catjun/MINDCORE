@@ -8,6 +8,8 @@ import libsql
 
 from app.database.turso import TursoConnection
 from app.services.mindcore import observation_corrections as corrections
+from app.services.mindcore.narrative import get_narrative_snapshot, hydrate_narrative_snapshot
+from app.services.mindcore.snapshot_scope import CognitiveSnapshotScope
 
 
 class Connection:
@@ -46,6 +48,33 @@ class LocalPool:
 
 
 class ObservationCorrectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_narrative_delete_is_removed_from_runtime_snapshot(self) -> None:
+        pool = LocalPool()
+        scope = CognitiveSnapshotScope()
+        item_id = uuid4()
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """create table diana_narratives(
+                       id text primary key, narrative_key text, subject_key text, category text,
+                       summary text, status text, confidence real, evidence_count integer,
+                       distinct_episode_count integer, distinct_conversation_count integer,
+                       first_observed_at text, last_observed_at text, created_at text, updated_at text)"""
+            )
+            await connection.execute(
+                """insert into diana_narratives values(
+                       $1,'activity:test','test','activity_pattern','stale narrative','emerging',.7,
+                       4,2,2,'old','old','old','old')""",
+                item_id,
+            )
+        await hydrate_narrative_snapshot(pool, scope)
+        self.assertEqual([str(row["id"]) for row in get_narrative_snapshot(scope)], [str(item_id)])
+
+        await corrections.delete_narrative(pool, item_id, scope)
+
+        async with pool.acquire() as connection:
+            self.assertEqual(await connection.fetchval("select count(*) from diana_narratives"), 0)
+        self.assertEqual(get_narrative_snapshot(scope), ())
+
     async def test_memory_correction_normalizes_content_without_scoring_changes(self) -> None:
         connection = Connection()
         await corrections.update_memory(Pool(connection), uuid4(), "  Corrected memory  ")

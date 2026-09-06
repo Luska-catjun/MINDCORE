@@ -120,8 +120,8 @@ class FreshInstallAcceptance(TestCase):
         ), patch.object(coordinator, "build_context", side_effect=capture_context):
             app = self._app()
             with TestClient(app) as client:
-                self.assertEqual(get_narrative_snapshot(), ())
-                self.assertEqual(get_self_model_snapshot(), ())
+                self.assertEqual(get_narrative_snapshot(app.state.cognitive_snapshot_scope), ())
+                self.assertEqual(get_self_model_snapshot(app.state.cognitive_snapshot_scope), ())
                 self.assertEqual(client.get("/health").json(), {"status": "ok", "db": "connected"})
                 self._login(client)
                 created = client.post("/conversations", json={"source_device": "fresh-e2e"})

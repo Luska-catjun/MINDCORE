@@ -11,6 +11,9 @@ from uuid import UUID
 
 from app.services.memory_service import normalize_memory_content
 from app.services import repository
+from app.services.mindcore.narrative import apply_narrative_correction
+from app.services.mindcore.self_model import apply_self_model_correction
+from app.services.mindcore.snapshot_scope import CognitiveSnapshotScope
 
 
 def _text(value: str) -> str:
@@ -26,9 +29,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _changed(changed: bool) -> None:
-    if not changed:
+def _changed(result: Any) -> Any:
+    if result is None or result is False:
         raise KeyError("Observation item not found.")
+    return result
 
 
 async def update_memory(pool: Any, memory_id: UUID, content: str) -> None:
@@ -64,21 +68,43 @@ async def delete_persona_preference(pool: Any, preference_id: UUID) -> None:
             _changed(await repository.delete_observed_persona_preference(connection, preference_id=preference_id))
 
 
-async def update_self_model(pool: Any, item_id: UUID, summary: str) -> None:
+async def update_self_model(
+    pool: Any,
+    item_id: UUID,
+    summary: str,
+    snapshot_scope: CognitiveSnapshotScope | None = None,
+) -> None:
     async with pool.acquire() as connection:
-        _changed(await repository.update_observed_self_model(connection, item_id=item_id, summary=_text(summary), updated_at=_now()))
+        updated = _changed(await repository.update_observed_self_model(connection, item_id=item_id, summary=_text(summary), updated_at=_now()))
+    apply_self_model_correction(snapshot_scope, item_id=item_id, updated_row=dict(updated))
 
 
-async def delete_self_model(pool: Any, item_id: UUID) -> None:
+async def delete_self_model(
+    pool: Any,
+    item_id: UUID,
+    snapshot_scope: CognitiveSnapshotScope | None = None,
+) -> None:
     async with pool.acquire() as connection:
         _changed(await repository.delete_observed_self_model(connection, item_id=item_id))
+    apply_self_model_correction(snapshot_scope, item_id=item_id, updated_row=None)
 
 
-async def update_narrative(pool: Any, item_id: UUID, summary: str) -> None:
+async def update_narrative(
+    pool: Any,
+    item_id: UUID,
+    summary: str,
+    snapshot_scope: CognitiveSnapshotScope | None = None,
+) -> None:
     async with pool.acquire() as connection:
-        _changed(await repository.update_observed_narrative(connection, item_id=item_id, summary=_text(summary), updated_at=_now()))
+        updated = _changed(await repository.update_observed_narrative(connection, item_id=item_id, summary=_text(summary), updated_at=_now()))
+    apply_narrative_correction(snapshot_scope, item_id=item_id, updated_row=dict(updated))
 
 
-async def delete_narrative(pool: Any, item_id: UUID) -> None:
+async def delete_narrative(
+    pool: Any,
+    item_id: UUID,
+    snapshot_scope: CognitiveSnapshotScope | None = None,
+) -> None:
     async with pool.acquire() as connection:
         _changed(await repository.delete_observed_narrative(connection, item_id=item_id))
+    apply_narrative_correction(snapshot_scope, item_id=item_id, updated_row=None)

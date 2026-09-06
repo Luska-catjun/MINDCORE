@@ -39,6 +39,7 @@ from app.services.mindcore.consolidation import consolidate_recent_experience
 from app.services.mindcore.decisions import apply_grounded_decision_execution, cancel_active_decision_from_reply, decision_domain, decision_rejection_reason, detect_decision, extract_choice_options, is_durable_decision, link_decision_episode, record_decision, sanitize_decision_reason
 from app.services.mindcore.narrative import get_narrative_snapshot, update_narratives_for_episode
 from app.services.mindcore.self_model import get_self_model_snapshot, update_self_model_shadow
+from app.services.mindcore.snapshot_scope import CognitiveSnapshotScope
 from app.services.episode_service import classify_episode_provenance, finalize_episode_linkage
 from app.services.mindcore.working_memory import WorkingMemoryState, update_working_memory, update_working_memory_persistent, record_open_loop
 from app.services.skill_manuals import procedural_manual_context
@@ -85,18 +86,26 @@ def _lightweight_turn(content: str) -> bool:
     return len(normalized) <= 100 and not any(marker in normalized for marker in important_markers)
 
 
-async def _update_narrative_shadow(pool: asyncpg.Pool, episode_id) -> None:
+async def _update_narrative_shadow(
+    pool: asyncpg.Pool,
+    episode_id,
+    snapshot_scope: CognitiveSnapshotScope | None = None,
+) -> None:
     try:
-        await update_narratives_for_episode(pool, episode_id=episode_id)
+        await update_narratives_for_episode(pool, episode_id=episode_id, snapshot_scope=snapshot_scope)
     except Exception as exc:
         logger.warning("Narrative shadow update skipped error_type=%s error=%s", type(exc).__name__, str(exc))
 
 
-async def _update_shadow_models(pool: asyncpg.Pool, episode_id) -> None:
+async def _update_shadow_models(
+    pool: asyncpg.Pool,
+    episode_id,
+    snapshot_scope: CognitiveSnapshotScope | None = None,
+) -> None:
     """Run shadows in order without letting either failure affect chat."""
-    await _update_narrative_shadow(pool, episode_id)
+    await _update_narrative_shadow(pool, episode_id, snapshot_scope)
     try:
-        await update_self_model_shadow(pool, episode_id=episode_id)
+        await update_self_model_shadow(pool, episode_id=episode_id, snapshot_scope=snapshot_scope)
     except Exception as exc:
         logger.warning("Self model shadow update skipped error_type=%s error=%s", type(exc).__name__, str(exc))
 
@@ -107,6 +116,7 @@ async def _execute_chat_turn(
     pool: asyncpg.Pool,
     settings: Settings,
     identity_prompt: str,
+    snapshot_scope: CognitiveSnapshotScope | None = None,
 ) -> dict:
     started_at = perf_counter()
     latency = _Latency(payload.conversation_id); latency.mark('start')
@@ -211,8 +221,8 @@ async def _execute_chat_turn(
         except Exception as exc:
             logger.warning("Temporal context skipped error_type=%s error=%s", type(exc).__name__, str(exc))
             temporal_snapshot = None
-        narrative_snapshot = latency.measure_sync('narrative_snapshot', get_narrative_snapshot)
-        self_model_snapshot = latency.measure_sync('self_model_snapshot', get_self_model_snapshot)
+        narrative_snapshot = latency.measure_sync('narrative_snapshot', lambda: get_narrative_snapshot(snapshot_scope))
+        self_model_snapshot = latency.measure_sync('self_model_snapshot', lambda: get_self_model_snapshot(snapshot_scope))
         try:
             attention = latency.measure_sync('attention', lambda: build_attention_snapshot(
                 user_text=payload.content, memories=memories, working_memory=working_memory,
@@ -492,7 +502,7 @@ async def _execute_chat_turn(
                 ))
             # Shadow-only work starts after the response is sent and is never
             # available to Context Builder or the LLM for this (or any) turn.
-            background_tasks.add_task(_update_shadow_models, pool, episode_linkage["episode_id"])
+            background_tasks.add_task(_update_shadow_models, pool, episode_linkage["episode_id"], snapshot_scope)
     except Exception as exc:
         logger.warning("Episode finalize skipped error_type=%s error=%s", type(exc).__name__, str(exc))
 
@@ -533,8 +543,9 @@ class ChatTurnCoordinator:
     best-effort write ordering and warning boundaries.
     """
 
-    def __init__(self, *, pool: asyncpg.Pool) -> None:
+    def __init__(self, *, pool: asyncpg.Pool, snapshot_scope: CognitiveSnapshotScope | None = None) -> None:
         self.pool = pool
+        self.snapshot_scope = snapshot_scope
 
     async def execute(
         self,
@@ -545,5 +556,5 @@ class ChatTurnCoordinator:
         identity_prompt: str,
     ) -> dict:
         return await _execute_chat_turn(
-            payload, background_tasks, self.pool, settings, identity_prompt
+            payload, background_tasks, self.pool, settings, identity_prompt, self.snapshot_scope
         )

@@ -27,7 +27,10 @@ async def send_chat_message(
             detail="Chat requests must use role='user'.",
         )
     try:
-        return await ChatTurnCoordinator(pool=pool).execute(
+        return await ChatTurnCoordinator(
+            pool=pool,
+            snapshot_scope=getattr(request.app.state, "cognitive_snapshot_scope", None),
+        ).execute(
             payload=payload,
             background_tasks=background_tasks,
             settings=request.app.state.settings,

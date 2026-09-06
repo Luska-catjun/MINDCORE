@@ -13,12 +13,12 @@ import asyncpg
 
 from app.database.normalization import normalize_json_object
 from app.services.runtime_diagnostics import record_narrative_update
+from app.services.mindcore.snapshot_scope import CognitiveSnapshotScope, resolve_snapshot_scope
 
 logger = logging.getLogger("diana.narrative")
 
 _POSITIVE_EMOTIONS = {"joy", "delight", "amusement", "excitement", "comfort", "interest", "curiosity"}
 _CHOICE_TYPES = {"explicit_choice", "soft_choice", "explicit_accept"}
-_runtime_snapshot: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -155,27 +155,52 @@ def _confidence(*, evidence_count: int, episode_count: int, conversation_count: 
     return round(min(1.0, evidence + episodes + conversations + quality), 4)
 
 
-def get_narrative_snapshot() -> tuple[dict[str, Any], ...]:
+def get_narrative_snapshot(scope: CognitiveSnapshotScope | None = None) -> tuple[dict[str, Any], ...]:
     """Return the bounded, durable-derived snapshot used by foreground turns.
 
     The snapshot is refreshed at startup and after the already-existing
     Narrative background update.  Reading it during a chat turn is local only.
     """
-    return _runtime_snapshot
+    return resolve_snapshot_scope(scope).narrative.read()
 
 
-def _replace_runtime_snapshot(rows: list[dict[str, Any]]) -> None:
-    global _runtime_snapshot
+def _snapshot_rows(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
     # Candidate rows intentionally stay observable but are not activation
     # eligible.  Keep the complete bounded source here so promotion is visible
     # on the next turn without another database read.
     canonical_rows = select_canonical_narratives(rows)
     ordered = sorted(canonical_rows, key=lambda row: (-float(row.get("confidence") or 0), str(row.get("id") or "")))
-    _runtime_snapshot = tuple(dict(row) for row in ordered[:48])
+    return tuple(dict(row) for row in ordered[:48])
 
 
-async def hydrate_narrative_snapshot(pool: asyncpg.Pool) -> tuple[dict[str, Any], ...]:
+def apply_narrative_correction(
+    scope: CognitiveSnapshotScope | None,
+    *,
+    item_id: UUID,
+    updated_row: dict[str, Any] | None,
+) -> tuple[dict[str, Any], ...]:
+    """Apply one committed manual correction to its runtime scope."""
+    cell = resolve_snapshot_scope(scope).narrative
+
+    def corrected(current: tuple[dict[str, Any], ...]) -> tuple[dict[str, Any], ...]:
+        rows = {str(row.get("id")): dict(row) for row in current}
+        key = str(item_id)
+        if updated_row is None:
+            rows.pop(key, None)
+        else:
+            rows[key] = {**rows.get(key, {}), **dict(updated_row)}
+        return _snapshot_rows(list(rows.values()))
+
+    return cell.apply_correction(corrected)
+
+
+async def hydrate_narrative_snapshot(
+    pool: asyncpg.Pool,
+    scope: CognitiveSnapshotScope | None = None,
+) -> tuple[dict[str, Any], ...]:
     """Load durable Narrative rows once per process; never on the chat hot path."""
+    cell = resolve_snapshot_scope(scope).narrative
+    expected_epoch = cell.begin_refresh()
     try:
         async with pool.acquire() as connection:
             rows = await connection.fetch(
@@ -188,9 +213,9 @@ async def hydrate_narrative_snapshot(pool: asyncpg.Pool) -> tuple[dict[str, Any]
             )
     except Exception as exc:
         logger.warning("Narrative snapshot hydration skipped error_type=%s error=%s", type(exc).__name__, str(exc))
-        return _runtime_snapshot
-    _replace_runtime_snapshot([dict(row) for row in rows])
-    return _runtime_snapshot
+        return cell.read()
+    cell.publish_replace(expected_epoch, _snapshot_rows([dict(row) for row in rows]))
+    return cell.read()
 
 
 def build_narrative_context(narratives: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None, attention: Any | None) -> str | None:
@@ -272,9 +297,16 @@ async def _find_canonical_narrative(
     return _canonical_row(matches) if matches else None
 
 
-async def update_narratives_for_episode(pool: asyncpg.Pool, *, episode_id: UUID) -> list[dict[str, Any]]:
+async def update_narratives_for_episode(
+    pool: asyncpg.Pool,
+    *,
+    episode_id: UUID,
+    snapshot_scope: CognitiveSnapshotScope | None = None,
+) -> list[dict[str, Any]]:
     """Update only narratives touched by one grounded, promoted episode."""
     started = perf_counter()
+    cell = resolve_snapshot_scope(snapshot_scope).narrative
+    expected_epoch = cell.begin_refresh()
     timestamp = datetime.now(timezone.utc)
     async with pool.acquire() as connection:
         episode = await connection.fetchrow(
@@ -326,8 +358,11 @@ async def update_narratives_for_episode(pool: asyncpg.Pool, *, episode_id: UUID)
                 )
                 results.append(dict(updated))
     if results:
-        existing = {str(row.get("id")): row for row in _runtime_snapshot}
-        existing.update({str(row["id"]): row for row in results})
-        _replace_runtime_snapshot(list(existing.values()))
+        def merge(current: tuple[dict[str, Any], ...]) -> tuple[dict[str, Any], ...]:
+            existing = {str(row.get("id")): row for row in current}
+            existing.update({str(row["id"]): row for row in results})
+            return _snapshot_rows(list(existing.values()))
+
+        cell.publish_update(expected_epoch, merge)
     record_narrative_update(episode_id=str(episode_id), accepted=bool(results), subjects=[row["subject_key"] for row in results], latency_ms=(perf_counter() - started) * 1000)
     return results
