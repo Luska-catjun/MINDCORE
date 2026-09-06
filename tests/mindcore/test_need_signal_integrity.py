@@ -350,11 +350,13 @@ class NeedSignalIntegrityTests(unittest.IsolatedAsyncioTestCase):
         raw.close()
 
     async def test_restart_reads_durable_need_and_event_without_process_cache(self) -> None:
-        needs = await get_need_snapshot(self.pool)
-        await _apply(self.pool, needs, "curiosity", 0.20, "restart", "message", "restart-source", self.conversation_id)
+        fixed = datetime.now(timezone.utc)
+        with patch("app.services.mindcore.goals._now", return_value=fixed):
+            needs = await get_need_snapshot(self.pool, now=fixed)
+            await _apply(self.pool, needs, "curiosity", 0.20, "restart", "message", "restart-source", self.conversation_id)
 
-        fresh_pool = TursoPool(self.database, "isolated-test-token")
-        reloaded = await get_need_snapshot(fresh_pool)
+            fresh_pool = TursoPool(self.database, "isolated-test-token")
+            reloaded = await get_need_snapshot(fresh_pool, now=fixed)
         self.assertAlmostEqual(reloaded["curiosity"].value, 0.65)
         async with fresh_pool.acquire() as connection:
             self.assertEqual(await connection.fetchval("select count(*) from diana_need_events"), 1)

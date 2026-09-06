@@ -49,7 +49,11 @@ class CountingRawConnection:
 
     def close(self):
         self.close_calls += 1
-        return self.raw.close()
+        # libSQL can retain a Windows file handle while the closed native
+        # connection object is still referenced.  Drop that reference before
+        # TemporaryDirectory attempts to remove a file-backed fixture.
+        raw, self.raw = self.raw, None
+        return raw.close()
 
 
 class LocalPool:
