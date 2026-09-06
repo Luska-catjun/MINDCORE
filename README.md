@@ -6,6 +6,8 @@ MindCore is an experimental desktop runtime for building AI personas that can
 maintain persistent memory, preferences, emotional state, relationships,
 goals, self-models, and other long-term cognitive state across conversations.
 
+![MindCore Desktop](mindcore-main.png)
+
 Instead of treating every conversation as:
 
 ```text
