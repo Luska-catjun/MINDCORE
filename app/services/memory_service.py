@@ -391,7 +391,7 @@ def build_dynamic_context(
     if recent_messages:
         lines = ["[RECENT CONVERSATION]"]
         for message in recent_messages:
-            speaker = "User" if message["role"] == "user" else "Diana"
+            speaker = "User" if message["role"] == "user" else "Persona"
             lines.append(f"{speaker}: {message['content']}")
         sections.append("\n".join(lines))
 

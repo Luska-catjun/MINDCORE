@@ -1,4 +1,5 @@
 from functools import lru_cache
+import json
 from pathlib import Path
 import sys
 
@@ -36,8 +37,16 @@ def _load_prompt(path: Path, label: str) -> str:
 def load_persona_identity_prompt(settings: Settings) -> str:
     """Load a user-selected persona identity, or the public generic default."""
     if settings.persona_identity_path:
-        return _load_prompt(Path(settings.persona_identity_path).expanduser(), "Persona identity")
-    return _load_prompt(GENERIC_IDENTITY_PROMPT_PATH, "Generic persona identity")
+        identity = _load_prompt(Path(settings.persona_identity_path).expanduser(), "Persona identity")
+    else:
+        identity = _load_prompt(GENERIC_IDENTITY_PROMPT_PATH, "Generic persona identity")
+    configured_name = json.dumps(settings.persona_display_name, ensure_ascii=False)
+    return (
+        "[CONFIGURED IDENTITY]\n"
+        f"Your display name is {configured_name}. Use this exact name when referring to yourself; "
+        "generic labels in runtime context do not replace it.\n\n"
+        f"{identity}"
+    )
 
 
 @lru_cache(maxsize=1)

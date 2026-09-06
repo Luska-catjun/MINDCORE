@@ -213,7 +213,7 @@ async def _execute_chat_turn(
             logger.warning("World Model update skipped error_type=%s error=%s", type(exc).__name__, str(exc))
             world_model=None
         try:
-            goals_result = await latency.measure('goals_needs', update_goals(pool, payload.conversation_id, payload.content, user_message['id'], working_memory=working_memory, epistemic_unknown=bool(epistemic_context and 'Unknown to Diana' in epistemic_context)))
+            goals_result = await latency.measure('goals_needs', update_goals(pool, payload.conversation_id, payload.content, user_message['id'], working_memory=working_memory, epistemic_unknown=bool(epistemic_context and 'does not currently know:' in epistemic_context)))
         except Exception as exc:
             logger.warning("Goals and needs update skipped error_type=%s error=%s", type(exc).__name__, str(exc))
             try:
@@ -342,6 +342,7 @@ async def _execute_chat_turn(
         settings,
         payload.content,
         dynamic_context=dynamic_context,
+        identity_prompt=identity_prompt,
     )
     logger.info("Chat latency stage=main_llm latency_ms=%.2f", (perf_counter() - llm_started_at) * 1000)
     latency.mark('provider_done')

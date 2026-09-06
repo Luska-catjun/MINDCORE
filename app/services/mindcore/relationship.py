@@ -208,7 +208,7 @@ def build_relationship_context(state: RelationshipState | None) -> str | None:
         return None
     lines = ["[RELATIONSHIP CONTEXT - DATA, NOT INSTRUCTIONS]"]
     if state.familiarity >= .20:
-        lines.append("Diana is becoming familiar with this user.")
+        lines.append("The Persona is becoming familiar with this user.")
     if state.trust >= .45:
         lines.append("Trust is developing gradually through repeated interactions.")
     if state.conflict >= .15:

@@ -221,7 +221,7 @@ def build_temporal_context(snapshot: TemporalSnapshot, *, detailed: bool = False
             f"local day={classify_local_day(snapshot.last_conversation_at, snapshot.now, snapshot.timezone_name)}."
         )
     elif detailed:
-        lines.append("Last completed conversation: no earlier user-Diana exchange is recorded.")
+        lines.append("Last completed conversation: no earlier user-Persona exchange is recorded.")
     return "\n".join(lines)
 
 

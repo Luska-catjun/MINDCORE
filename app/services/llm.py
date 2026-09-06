@@ -46,18 +46,23 @@ async def _generate_with_provider(
     request_kind: str,
     *args: str,
     dynamic_context: str | None = None,
+    identity_prompt: str | None = None,
 ) -> str:
     if provider == "groq":
         from app.services import groq
 
         if request_kind == "main":
-            return await groq.generate_reply(settings, args[0], dynamic_context=dynamic_context)
+            return await groq.generate_reply(
+                settings, args[0], dynamic_context=dynamic_context, identity_prompt=identity_prompt
+            )
         return await groq.generate_memory_candidate(settings, args[0], args[1])
 
     from app.services import gemini
 
     if request_kind == "main":
-        return await gemini.generate_reply(settings, args[0], dynamic_context=dynamic_context)
+        return await gemini.generate_reply(
+            settings, args[0], dynamic_context=dynamic_context, identity_prompt=identity_prompt
+        )
     return await gemini.generate_memory_candidate(settings, args[0], args[1])
 
 
@@ -66,6 +71,7 @@ async def _generate_with_fallback(
     request_kind: str,
     *args: str,
     dynamic_context: str | None = None,
+    identity_prompt: str | None = None,
 ) -> str:
     primary = _provider(settings)
     fallback = _fallback_provider(settings, primary)
@@ -76,6 +82,7 @@ async def _generate_with_fallback(
             request_kind,
             *args,
             dynamic_context=dynamic_context,
+            identity_prompt=identity_prompt,
         )
         logger.info("LLM completed provider=%s request_kind=%s fallback_used=false", primary, request_kind)
         return response
@@ -107,6 +114,7 @@ async def _generate_with_fallback(
                 request_kind,
                 *args,
                 dynamic_context=dynamic_context,
+                identity_prompt=identity_prompt,
             )
         except LLMError as fallback_exc:
             logger.error(
@@ -127,12 +135,14 @@ async def generate_reply(
     user_message: str,
     *,
     dynamic_context: str | None = None,
+    identity_prompt: str | None = None,
 ) -> str:
     return await _generate_with_fallback(
         settings,
         "main",
         user_message,
         dynamic_context=dynamic_context,
+        identity_prompt=identity_prompt,
     )
 
 
