@@ -5,22 +5,29 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT))
 from app.config import get_settings
 from app.database.connection import create_pool,close_pool
+from app.database.schema_contract import (
+    CURRENT_TURSO_BASELINE_VERSION,
+    SchemaState,
+    classify_turso_schema,
+)
 
 BASELINE=ROOT/'db/turso/baseline_v1.sql'
-CORE={'conversations','messages','episodes','diana_state','diana_working_memory_items'}
 
 async def bootstrap(connection) -> str:
-    tables={str(row['name']) for row in await connection.fetch("select name from sqlite_master where type='table' and name not like 'sqlite_%'")}
-    if not tables:
+    report = await classify_turso_schema(connection)
+    if report.state == SchemaState.EMPTY:
         async with connection.transaction():
             for statement in BASELINE.read_text().split(';'):
                 if statement.strip(): await connection.execute(statement)
-        if await connection.fetch('pragma foreign_key_check') or (await connection.fetchval('pragma integrity_check'))!='ok':
-            raise RuntimeError('Fresh baseline integrity verification failed')
-        return 'TURSO_BOOTSTRAP_OK version=21'
-    if 'schema_metadata' in tables and CORE.issubset(tables): return 'TURSO_BOOTSTRAP_ALREADY_INITIALIZED'
-    if CORE.issubset(tables): return 'TURSO_BOOTSTRAP_EXISTING_SCHEMA_SKIPPED'
-    raise RuntimeError('PARTIAL_OR_UNKNOWN database; refusing bootstrap overwrite.')
+        verified = await classify_turso_schema(connection)
+        if verified.state != SchemaState.CURRENT:
+            raise RuntimeError(f'Fresh baseline verification failed: {verified.details()}')
+        return f'TURSO_BOOTSTRAP_OK version={CURRENT_TURSO_BASELINE_VERSION}'
+    if report.state == SchemaState.CURRENT:
+        return 'TURSO_BOOTSTRAP_ALREADY_INITIALIZED'
+    if report.state == SchemaState.COMPATIBLE_LEGACY:
+        return 'TURSO_BOOTSTRAP_COMPATIBLE_LEGACY'
+    raise RuntimeError(f'{report.details()}; refusing bootstrap overwrite.')
 
 async def main():
     settings=get_settings()

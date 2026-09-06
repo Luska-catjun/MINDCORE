@@ -15,11 +15,11 @@ import time
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response, status
 
+from app.database.schema_contract import SchemaState, classify_turso_schema
 from app.main import create_app
 
 
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
-CORE_TABLES = {"conversations", "messages", "episodes", "diana_state", "diana_working_memory_items"}
 DESKTOP_SHUTDOWN_CAPABILITY_ENV = "MINDCORE_DESKTOP_SHUTDOWN_CAPABILITY"
 DESKTOP_SHUTDOWN_CAPABILITY_HEADER = "X-MindCore-Desktop-Shutdown"
 
@@ -141,31 +141,29 @@ async def _setup_action(action: str, config_path: str) -> str:
     try:
         async with pool.acquire() as connection:
             await connection.fetchval("SELECT 1")
-            tables = {str(row["name"]) for row in await connection.fetch("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
             if action == "database":
                 return "DATABASE_CONNECTED"
-            if not tables:
-                classification = "EMPTY"
-            elif "schema_metadata" in tables and CORE_TABLES.issubset(tables):
-                classification = "INITIALIZED"
-            elif CORE_TABLES.issubset(tables):
-                classification = "INITIALIZED"
-            else:
-                classification = "PARTIAL_OR_UNKNOWN"
+            report = await classify_turso_schema(connection)
+            classification = (
+                "INITIALIZED" if report.state == SchemaState.CURRENT else report.state.value
+            )
             if action == "classify":
                 return classification
             if action != "initialize":
                 raise RuntimeError("unsupported_setup_action")
-            if classification == "PARTIAL_OR_UNKNOWN":
-                raise RuntimeError("partial_or_unknown")
+            if report.state == SchemaState.PARTIAL_OR_UNKNOWN:
+                raise RuntimeError(f"partial_or_unknown: {report.details()}")
             if classification == "INITIALIZED":
                 return "INITIALIZED"
+            if report.state == SchemaState.COMPATIBLE_LEGACY:
+                return "COMPATIBLE_LEGACY"
             baseline = RESOURCE_ROOT / "db" / "turso" / "baseline_v1.sql"
             async with connection.transaction():
                 for statement in baseline.read_text(encoding="utf-8").split(";"):
                     if statement.strip():
                         await connection.execute(statement)
-            if await connection.fetch("PRAGMA foreign_key_check") or (await connection.fetchval("PRAGMA integrity_check")) != "ok":
+            verified = await classify_turso_schema(connection)
+            if verified.state != SchemaState.CURRENT:
                 raise RuntimeError("schema_verification_failed")
             return "BOOTSTRAPPED"
     finally:
