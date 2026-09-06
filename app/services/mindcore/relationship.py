@@ -1,6 +1,7 @@
 """Slow, deterministic relationship updates backed by grounded Experience."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,6 +17,11 @@ logger = logging.getLogger("diana.relationship")
 RELATIONSHIP_CONTEXT_MAX_CHARS = 250
 RELATIONSHIP_BASELINE = {"familiarity": .10, "trust": .30, "affection": .15, "conflict": .0}
 CONFLICT_RECOVERY_HALF_LIFE_DAYS = 60.0
+RELATIONSHIP_EVENT_MAX_ATTEMPTS = 3
+
+
+class _RelationshipWriteConflict(RuntimeError):
+    """The durable singleton changed after this transaction read its base."""
 
 
 @dataclass(frozen=True)
@@ -113,39 +119,75 @@ async def update_relationship_from_experience(
     user_text: str,
     current_state: RelationshipState | None = None,
 ) -> RelationshipState | None:
-    """Persist one meaningful grounded relationship signal, if eligible."""
+    """Persist one meaningful grounded relationship signal, if eligible.
+
+    ``current_state`` remains a compatibility hint for callers and provisional
+    log values only.  The committed calculation always uses a durable row read
+    after the idempotence INSERT has acquired SQLite's writer reservation.
+    """
     started = perf_counter()
     signal = evaluate_relationship_signal(user_text)
     if signal is None:
         record_relationship_capture(eligible=False, signal=None, delta={}, result="rejected", reason="non_relational")
         return None
-    async with pool.acquire() as connection:
-        async with connection.transaction():
-            if current_state is None:
-                current = await connection.fetchrow("select familiarity,trust,affection,conflict,updated_at from relationship where id=1")
-                if current is None:
-                    current = await connection.fetchrow(
-                        "insert into relationship(id,familiarity,trust,affection,shared_experience,conflict_history,conflict,updated_at) values(1,.10,.30,.15,0,$1,0,$2) returning familiarity,trust,affection,conflict,updated_at",
-                        [], datetime.now(timezone.utc),
+    for attempt in range(RELATIONSHIP_EVENT_MAX_ATTEMPTS):
+        try:
+            async with pool.acquire() as connection:
+                async with connection.transaction():
+                    now = datetime.now(timezone.utc)
+                    provisional_before = current_state or RelationshipState(**RELATIONSHIP_BASELINE)
+                    provisional_after, provisional_delta = apply_relationship_signal(provisional_before, signal)
+                    inserted = await connection.fetchrow(
+                        """insert into relationship_log(relationship_log_id,source_experience_id,previous_state,delta,new_state,reason,created_at)
+                           values($1,$2,$3,$4,$5,$6,$7)
+                           on conflict(source_experience_id) do nothing returning relationship_log_id""",
+                        uuid4(), experience_id, _as_dict(provisional_before), provisional_delta,
+                        _as_dict(provisional_after), signal.kind, now,
                     )
-                before = _state(dict(current))
-            else:
-                before = current_state
-            after, applied_delta = apply_relationship_signal(before, signal)
-            inserted = await connection.fetchrow(
-                """insert into relationship_log(relationship_log_id,source_experience_id,previous_state,delta,new_state,reason,created_at)
-                   values($1,$2,$3,$4,$5,$6,$7)
-                   on conflict(source_experience_id) do nothing returning relationship_log_id""",
-                uuid4(), experience_id, _as_dict(before), applied_delta, _as_dict(after), signal.kind, datetime.now(timezone.utc),
-            )
-            if inserted is None:
-                record_relationship_capture(eligible=True, signal=signal.kind, delta=applied_delta, result="duplicate", reason=None)
-                return None
-            row = await connection.fetchrow(
-                """update relationship set familiarity=$1,trust=$2,affection=$3,conflict=$4,updated_at=$5
-                   where id=1 returning familiarity,trust,affection,conflict""",
-                *(_as_dict(after)[key] for key in ("familiarity", "trust", "affection", "conflict")), datetime.now(timezone.utc),
-            )
+                    if inserted is None:
+                        record_relationship_capture(
+                            eligible=True, signal=signal.kind, delta=provisional_delta,
+                            result="duplicate", reason=None,
+                        )
+                        return None
+                    # The log INSERT is the first write and therefore serializes
+                    # distinct events.  Read only now, while that writer
+                    # reservation is held, so diminishing returns use the last
+                    # committed singleton state rather than the pre-LLM hint.
+                    current = await connection.fetchrow(
+                        "select familiarity,trust,affection,conflict,updated_at from relationship where id=1"
+                    )
+                    if current is None:
+                        current = await connection.fetchrow(
+                            "insert into relationship(id,familiarity,trust,affection,shared_experience,conflict_history,conflict,updated_at) values(1,.10,.30,.15,0,$1,0,$2) returning familiarity,trust,affection,conflict,updated_at",
+                            [], now,
+                        )
+                    before = _state(dict(current), now=now)
+                    after, applied_delta = apply_relationship_signal(before, signal)
+                    row = await connection.fetchrow(
+                        """update relationship set familiarity=$1,trust=$2,affection=$3,conflict=$4,updated_at=$5
+                           where id=1
+                             and coalesce(familiarity,0)=$6 and coalesce(trust,0)=$7
+                             and coalesce(affection,0)=$8 and conflict=$9 and updated_at=$10
+                           returning familiarity,trust,affection,conflict""",
+                        *(_as_dict(after)[key] for key in ("familiarity", "trust", "affection", "conflict")), now,
+                        *(float(current[key] or 0) for key in ("familiarity", "trust", "affection", "conflict")),
+                        current["updated_at"],
+                    )
+                    if row is None:
+                        raise _RelationshipWriteConflict(
+                            "Relationship state changed during signal application."
+                        )
+                    await connection.execute(
+                        "update relationship_log set previous_state=$1,delta=$2,new_state=$3 where relationship_log_id=$4",
+                        _as_dict(before), applied_delta, _as_dict(after), inserted["relationship_log_id"],
+                    )
+            break
+        except (_RelationshipWriteConflict, ValueError) as exc:
+            retryable = isinstance(exc, _RelationshipWriteConflict) or "database is locked" in str(exc).casefold()
+            if not retryable or attempt + 1 == RELATIONSHIP_EVENT_MAX_ATTEMPTS:
+                raise
+            await asyncio.sleep(0.01 * (attempt + 1))
     record_relationship_capture(eligible=True, signal=signal.kind, delta=applied_delta, result="applied", reason=None)
     logger.info("Relationship updated latency_ms=%.2f signal=%s", (perf_counter() - started) * 1000, signal.kind)
     return _state(dict(row))
