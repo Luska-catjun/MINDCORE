@@ -44,6 +44,7 @@ from app.services.episode_service import classify_episode_provenance, finalize_e
 from app.services.mindcore.working_memory import WorkingMemoryState, update_working_memory, update_working_memory_persistent, record_open_loop
 from app.services.skill_manuals import procedural_manual_context
 from app.services.mindcore.temporal import (
+    build_temporal_context,
     get_temporal_snapshot,
     is_episode_recall_intent,
     is_temporal_query,
@@ -84,6 +85,35 @@ def _lightweight_turn(content: str) -> bool:
     normalized = " ".join(content.casefold().split())
     important_markers = ("기억", "전에", "계획", "목표", "힘들", "관계", "좋아", "싫어", "prefer", "remember")
     return len(normalized) <= 100 and not any(marker in normalized for marker in important_markers)
+
+
+def _build_grounding_preserving_fallback(
+    recent_messages: list[dict],
+    memories: list[dict],
+    *,
+    epistemic_context: str | None,
+    temporal_snapshot,
+    force_temporal_context: bool,
+) -> str | None:
+    """Keep mandatory grounding when optional full context assembly fails.
+
+    Identity/persona remains the provider's independent system instruction;
+    this fallback only reconstructs the dynamic grounding and legacy context.
+    """
+    sections: list[str] = []
+    if temporal_snapshot is not None:
+        sections.append(
+            build_temporal_context(
+                temporal_snapshot,
+                detailed=force_temporal_context,
+            )
+        )
+    if epistemic_context:
+        sections.append(epistemic_context)
+    legacy_context = build_dynamic_context(recent_messages, memories)
+    if legacy_context:
+        sections.append(legacy_context)
+    return "\n\n".join(sections) or None
 
 
 async def _update_narrative_shadow(
@@ -170,6 +200,7 @@ async def _execute_chat_turn(
     working_memory: WorkingMemoryState | None = None
     response_intention: ResponseIntention | None = None
     goals_result: GoalsNeedsTurnResult | None = None
+    temporal_snapshot = None
     try:
         try:
             working_memory = await latency.measure('working_memory', update_working_memory_persistent(pool, payload.conversation_id, payload.content, memories))
@@ -262,7 +293,7 @@ async def _execute_chat_turn(
                 logger.info("[TEMPORAL] resolved start = %s", recall_range.start.isoformat())
                 logger.info("[TEMPORAL] resolved end = %s", recall_range.end.isoformat())
                 episode_recall = await latency.measure('episode_recall', retrieve_episodes_for_range(pool, recall_range))
-        context_started=perf_counter(); context = build_context(
+        context = latency.measure_sync('context_builder', lambda: build_context(
             current_user_message=payload.content,
             recent_messages=recent_messages,
             memories=memories,
@@ -285,17 +316,23 @@ async def _execute_chat_turn(
             narratives=narrative_snapshot,
             self_models=self_model_snapshot,
             skill_manual=procedural_manual_context(working_memory.skill_manual_id if working_memory else None),
-        )
-        latency.stages['context_builder']=round((perf_counter()-context_started)*1000,2)
+        ))
         dynamic_context = context.dynamic_context
         if episode_recall is not None:
             logger.info("[RECALL] context built = yes")
             logger.info("[RECALL] context injected = %s", bool(dynamic_context and "[EPISODIC RECALL" in dynamic_context))
         selected_memories = context.selected_memories
-    except Exception:
-        # Context construction is optional. Preserve the prior minimum context
-        # so an auxiliary MindCore failure cannot block a completed chat.
-        dynamic_context = build_dynamic_context(recent_messages, memories)
+    except Exception as exc:
+        # Context construction is optional, but the grounding already computed
+        # for this turn must survive degradation to the minimum context.
+        logger.warning("Context construction skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+        dynamic_context = _build_grounding_preserving_fallback(
+            recent_messages,
+            memories,
+            epistemic_context=epistemic_context,
+            temporal_snapshot=temporal_snapshot,
+            force_temporal_context=temporal_query,
+        )
 
     logger.info("Chat prompt context_mode=%s dynamic_chars=%s identity_chars=%s", "fast" if lightweight else "full", len(dynamic_context or ""), len(identity_prompt))
     latency.mark('pre_llm_done')
@@ -453,6 +490,11 @@ async def _execute_chat_turn(
         except Exception as exc:
             logger.warning("Consolidation skipped error_type=%s error=%s", type(exc).__name__, str(exc))
 
+    # Optional stage results have deterministic unavailable states so one
+    # owner failure cannot prevent independent downstream work.
+    episode_linkage = None
+    learned_knowledge = []
+
     # Link only completed downstream records. This remains best-effort so a
     # provenance/indexing failure cannot invalidate an already saved reply.
     try:
@@ -469,20 +511,23 @@ async def _execute_chat_turn(
             memory_id=memory_record.get("memory_id") if memory_record else None,
             decision=decision_candidate,
         ))
-        if decision_record is not None and episode_linkage is not None:
-            try:
-                await latency.measure('decision_episode_link', link_decision_episode(pool, decision_id=decision_record["id"], episode_id=episode_linkage["episode_id"]))
-                record_decision_capture(context_detected=True, detected=True, chosen=decision_candidate.chosen if decision_candidate else None,
-                    reason_valid=decision_candidate.reason is not None if decision_candidate else None, persisted=True, episode_linked=True,
-                    domain=decision_record.get("decision_domain") if decision_record else None,
-                    confidence=decision_candidate.confidence if decision_candidate else None,
-                    result=decision_record.get("acquisition_result", "created") if decision_record else "created")
-            except Exception as exc:
-                logger.warning("Decision episode link skipped error_type=%s error=%s", type(exc).__name__, str(exc))
-        # Explicit user teaching is grounded in the message itself.  A promoted
-        # Episode is attached as additional provenance when one exists, but a
-        # concise factual explanation must not be lost merely because it was
-        # too small to become autobiographical memory.
+    except Exception as exc:
+        logger.warning("Episode finalize skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+
+    if decision_record is not None and episode_linkage is not None:
+        try:
+            await latency.measure('decision_episode_link', link_decision_episode(pool, decision_id=decision_record["id"], episode_id=episode_linkage["episode_id"]))
+            record_decision_capture(context_detected=True, detected=True, chosen=decision_candidate.chosen if decision_candidate else None,
+                reason_valid=decision_candidate.reason is not None if decision_candidate else None, persisted=True, episode_linked=True,
+                domain=decision_record.get("decision_domain") if decision_record else None,
+                confidence=decision_candidate.confidence if decision_candidate else None,
+                result=decision_record.get("acquisition_result", "created") if decision_record else "created")
+        except Exception as exc:
+            logger.warning("Decision episode link skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+
+    # Explicit user teaching is grounded in the message itself. A promoted
+    # Episode is attached as optional additional provenance when one exists.
+    try:
         learned_knowledge = await latency.measure('knowledge', acquire_user_knowledge(
             pool,
             user_text=payload.content,
@@ -490,21 +535,25 @@ async def _execute_chat_turn(
             source_episode_id=episode_linkage["episode_id"] if episode_linkage else None,
             episode_is_grounded=True,
             conversation_id=payload.conversation_id,
-        ))
-        if episode_linkage is not None:
-            learned_story_keys = [
-                str(item['subject_key']) for item in learned_knowledge
-                if item.get('knowledge_type') == 'story'
-            ]
-            if learned_story_keys:
+        )) or []
+    except Exception as exc:
+        logger.warning("Knowledge acquisition skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+
+    if episode_linkage is not None:
+        learned_story_keys = [
+            str(item['subject_key']) for item in learned_knowledge
+            if item.get('knowledge_type') == 'story'
+        ]
+        if learned_story_keys:
+            try:
                 await latency.measure('goal_fulfillment', satisfy_story_goals(
                     pool, payload.conversation_id, learned_story_keys,
                 ))
-            # Shadow-only work starts after the response is sent and is never
-            # available to Context Builder or the LLM for this (or any) turn.
-            background_tasks.add_task(_update_shadow_models, pool, episode_linkage["episode_id"], snapshot_scope)
-    except Exception as exc:
-        logger.warning("Episode finalize skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            except Exception as exc:
+                logger.warning("Story goal fulfillment skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+        # Shadow-only work starts after the response is sent and is never
+        # available to Context Builder or the LLM for this (or any) turn.
+        background_tasks.add_task(_update_shadow_models, pool, episode_linkage["episode_id"], snapshot_scope)
 
     if decision_candidate is None:
         try:
