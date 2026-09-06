@@ -18,6 +18,7 @@ import { DesktopUpdater } from "./components/DesktopUpdater";
 import { invoke } from "@tauri-apps/api/core";
 import "./buildRevision";
 import { chatDebug } from "./chatDebug";
+import { DEFAULT_PERSONA_DISPLAY_NAME } from "./assets";
 import "./styles.css";
 
 const SOURCE_DEVICE = "web";
@@ -29,6 +30,7 @@ type AuthStatus = "checking" | "authenticated" | "unauthenticated";
 type SetupState = "checking" | "needed" | "configured";
 
 function App() {
+  const [personaDisplayName, setPersonaDisplayName] = useState(DEFAULT_PERSONA_DISPLAY_NAME);
   const [mainConversationId, setMainConversationId] = useState<string | null>(null);
   // Chat is conditionally unmounted while an Observation view is open. Keep
   // its per-conversation history above that view boundary so returning to Chat
@@ -56,6 +58,7 @@ function App() {
     setChatHistory({});
     setPendingSends({});
     setSidebarOpen(false);
+    setPersonaDisplayName(DEFAULT_PERSONA_DISPLAY_NAME);
   }, []);
 
   const loadMainConversation = useCallback(async () => {
@@ -138,7 +141,10 @@ function App() {
     const authenticate = isDesktopRuntime()
       ? invoke<string>("get_desktop_session").then((token) => { storeDesktopSession(token); return api.me(); })
       : api.me();
-    authenticate.then(() => setAuthStatus("authenticated")).catch((error) => {
+    authenticate.then((session) => {
+      setPersonaDisplayName(session.persona_display_name || DEFAULT_PERSONA_DISPLAY_NAME);
+      setAuthStatus("authenticated");
+    }).catch((error) => {
       if (isDesktopRuntime()) {
         setDesktopSessionError(true);
         setAuthStatus("unauthenticated");
@@ -160,7 +166,8 @@ function App() {
   const handleLogin = async (password: string) => {
     setLoginError(null);
     try {
-      await api.login(password);
+      const session = await api.login(password);
+      setPersonaDisplayName(session.persona_display_name || DEFAULT_PERSONA_DISPLAY_NAME);
       setAuthStatus("authenticated");
     } catch (error) {
       setLoginError(error instanceof ApiError ? error.message : "Sign in failed.");
@@ -347,6 +354,7 @@ function App() {
 
         {activeView === "chat" ? (
           <ChatWindow
+            personaDisplayName={personaDisplayName}
             conversationId={mainConversationId}
             loadingConversation={conversationLoading}
             onToggleSidebar={() => setSidebarOpen((open) => !open)}

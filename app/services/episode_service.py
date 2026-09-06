@@ -169,7 +169,7 @@ def build_episode_candidate(
     memory_strength = _clamp(0.12 + importance * 0.55 + emotional_impact * 0.12 + personal_relevance * 0.10)
 
     return EpisodeCandidate(
-        content=f"User: {user_text.strip()}\nDiana: {diana_text.strip()}",
+        content=f"User: {user_text.strip()}\nPersona: {diana_text.strip()}",
         importance=importance,
         emotional_impact=emotional_impact,
         personal_relevance=personal_relevance,

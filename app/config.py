@@ -87,6 +87,14 @@ class Settings(BaseSettings):
             raise ValueError("DIANA_TIMEZONE must be a valid IANA timezone.") from exc
         return value
 
+    @field_validator("persona_display_name")
+    @classmethod
+    def validate_persona_display_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or len(normalized) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in normalized):
+            raise ValueError("PERSONA_DISPLAY_NAME must be 1-80 characters without control characters.")
+        return normalized
+
     @property
     def is_production(self) -> bool:
         return self.environment.lower() == "production"

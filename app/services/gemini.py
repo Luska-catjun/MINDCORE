@@ -232,20 +232,26 @@ def _request_gemini_sync(settings: Settings, payload: dict[str, Any], request_ki
     return _extract_text(parsed)
 
 
-def _call_gemini_sync(settings: Settings, prompt: str, dynamic_context: str | None = None) -> str:
-    try:
-        system_instruction = load_persona_identity_prompt(settings)
-    except PromptLoadError as exc:
-        raise GeminiError(
-            str(exc),
-            category="prompt_configuration",
-            model=settings.gemini_model,
-            api_base_url=settings.gemini_api_base_url,
-        ) from exc
+def _call_gemini_sync(
+    settings: Settings,
+    prompt: str,
+    dynamic_context: str | None = None,
+    identity_prompt: str | None = None,
+) -> str:
+    if identity_prompt is None:
+        try:
+            identity_prompt = load_persona_identity_prompt(settings)
+        except PromptLoadError as exc:
+            raise GeminiError(
+                str(exc),
+                category="prompt_configuration",
+                model=settings.gemini_model,
+                api_base_url=settings.gemini_api_base_url,
+            ) from exc
 
     payload = build_generate_content_payload(
         prompt,
-        system_instruction,
+        identity_prompt,
         dynamic_context=dynamic_context,
         thinking_level=settings.gemini_thinking_level,
     )
@@ -264,7 +270,7 @@ def _extract_memory_candidate_sync(settings: Settings, user_content: str, diana_
         ) from exc
 
     payload = build_generate_content_payload(
-        f"[USER MESSAGE]\n{user_content}\n\n[DIANA RESPONSE]\n{diana_content}",
+        f"[USER MESSAGE]\n{user_content}\n\n[PERSONA RESPONSE]\n{diana_content}",
         system_instruction,
     )
     payload["generationConfig"] = {
@@ -281,8 +287,11 @@ async def generate_reply(
     user_message: str,
     *,
     dynamic_context: str | None = None,
+    identity_prompt: str | None = None,
 ) -> str:
-    return await asyncio.to_thread(_call_gemini_sync, settings, user_message, dynamic_context)
+    return await asyncio.to_thread(
+        _call_gemini_sync, settings, user_message, dynamic_context, identity_prompt
+    )
 
 
 async def generate_memory_candidate(settings: Settings, user_content: str, diana_content: str) -> str:

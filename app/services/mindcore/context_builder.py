@@ -90,7 +90,7 @@ def _build_recent_section(recent_messages: list[dict[str, Any]], current_user_me
         content = " ".join(str(message.get("content", "")).split())
         if not content or (message.get("role") == "user" and _normalize(content) == current_normalized):
             continue
-        speaker = "User" if message.get("role") == "user" else "Diana"
+        speaker = "User" if message.get("role") == "user" else "Persona"
         relative = format_event_reference(message, temporal) if temporal else None
         line = f"{speaker}: {content[:RECENT_MESSAGE_MAX_CHARS]}" + (f" [{relative}]" if relative else "")
         prospective = [line, *lines]

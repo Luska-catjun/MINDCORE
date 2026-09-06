@@ -119,7 +119,10 @@ async def login(payload: Login, request: Request, response: Response) -> dict[st
         settings.auth_cookie_samesite,
         bool(settings.auth_cookie_domain),
     )
-    result: dict[str, bool | str] = {"authenticated": True}
+    result: dict[str, bool | str] = {
+        "authenticated": True,
+        "persona_display_name": settings.persona_display_name,
+    }
     if payload.include_access_token:
         # This is requested only after a cookie-authenticated check fails, for
         # browsers that block the cross-site cookie. Never log this value.
@@ -145,7 +148,7 @@ async def logout(request: Request, response: Response) -> dict[str, bool]:
 
 
 @router.get("/me")
-async def me(request: Request) -> dict[str, bool]:
+async def me(request: Request) -> dict[str, bool | str]:
     settings: Settings = request.app.state.settings
     require_auth_settings(settings)
     authenticated, source = request_is_authenticated(settings, request)
@@ -154,4 +157,7 @@ async def me(request: Request) -> dict[str, bool]:
         logger.warning("[AUTH] authentication failed reason=missing_or_invalid_credential path=/auth/me")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
     logger.info("[AUTH] authentication success path=/auth/me credential=%s", source)
-    return {"authenticated": True}
+    return {
+        "authenticated": True,
+        "persona_display_name": settings.persona_display_name,
+    }

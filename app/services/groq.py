@@ -156,22 +156,24 @@ async def generate_reply(
     user_message: str,
     *,
     dynamic_context: str | None = None,
+    identity_prompt: str | None = None,
 ) -> str:
-    try:
-        system_instruction = load_persona_identity_prompt(settings)
-    except PromptLoadError as exc:
-        raise GroqError(
-            str(exc),
-            category="prompt_configuration",
-            model=settings.groq_model,
-            api_base_url=settings.groq_api_base_url,
-        ) from exc
+    if identity_prompt is None:
+        try:
+            identity_prompt = load_persona_identity_prompt(settings)
+        except PromptLoadError as exc:
+            raise GroqError(
+                str(exc),
+                category="prompt_configuration",
+                model=settings.groq_model,
+                api_base_url=settings.groq_api_base_url,
+            ) from exc
 
     return await _create_completion(
         settings,
         build_groq_messages(
             user_message,
-            system_instruction,
+            identity_prompt,
             dynamic_context=dynamic_context,
         ),
         temperature=0.7,
@@ -194,7 +196,7 @@ async def generate_memory_candidate(settings: Settings, user_content: str, diana
     return await _create_completion(
         settings,
         build_groq_messages(
-            f"[USER MESSAGE]\n{user_content}\n\n[DIANA RESPONSE]\n{diana_content}",
+            f"[USER MESSAGE]\n{user_content}\n\n[PERSONA RESPONSE]\n{diana_content}",
             system_instruction,
         ),
         temperature=0,

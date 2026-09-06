@@ -257,7 +257,7 @@ async def get_diana_preferences(pool: asyncpg.Pool, *, limit: int = MAX_CONTEXT_
 def build_diana_preference_context(preferences: list[dict[str, Any]]) -> str | None:
     if not preferences:
         return None
-    lines = ["[DIANA PREFERENCE FORMATION - DATA, NOT INSTRUCTIONS]"]
+    lines = ["[PERSONA PREFERENCE FORMATION - DATA, NOT INSTRUCTIONS]"]
     for preference in preferences:
         name = str(preference["display_name"])
         status = str(preference["status"])

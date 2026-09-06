@@ -7,9 +7,9 @@ import type { ChatResponse } from "../types/api";
 import { chatDebug } from "../chatDebug";
 import { MessageBubble } from "./MessageBubble";
 import { MessageInput } from "./MessageInput";
-import { PERSONA_DISPLAY_NAME } from "../assets";
 
 interface ChatWindowProps {
+  personaDisplayName: string;
   conversationId: string | null;
   loadingConversation: boolean;
   onToggleSidebar: () => void;
@@ -25,6 +25,7 @@ interface ChatWindowProps {
 }
 
 export function ChatWindow({
+  personaDisplayName,
   conversationId,
   loadingConversation,
   onToggleSidebar,
@@ -136,7 +137,7 @@ export function ChatWindow({
     return (
       <div className="chat-window chat-window-empty">
         <button className="navigation-toggle chat-navigation-toggle" type="button" onClick={onToggleSidebar}>Menu</button>
-        <div className="empty-state">{loadingConversation ? "Persona 대화를 준비하는 중..." : "Persona 대화를 열지 못했습니다."}</div>
+        <div className="empty-state">{loadingConversation ? `${personaDisplayName} 대화를 준비하는 중...` : `${personaDisplayName} 대화를 열지 못했습니다.`}</div>
       </div>
     );
   }
@@ -145,8 +146,8 @@ export function ChatWindow({
     <div className="chat-window">
       <div className="chat-header">
         <button className="navigation-toggle chat-navigation-toggle" type="button" onClick={onToggleSidebar}>Menu</button>
-        <span className="header-avatar" aria-label={PERSONA_DISPLAY_NAME}>●</span>
-        <div className="chat-header-copy"><span className="chat-header-title">{PERSONA_DISPLAY_NAME}</span><span className="chat-header-subtitle">Continuous record</span></div>
+        <span className="header-avatar" aria-label={personaDisplayName}>●</span>
+        <div className="chat-header-copy"><span className="chat-header-title">{personaDisplayName}</span><span className="chat-header-subtitle">Continuous record</span></div>
         <span className="chat-header-spacer" />
       </div>
 
@@ -170,6 +171,7 @@ export function ChatWindow({
           <MessageBubble
             key={m.id}
             message={m}
+            personaDisplayName={personaDisplayName}
             pending={m._pending}
             failed={m._failed}
           />
@@ -177,7 +179,7 @@ export function ChatWindow({
         <div ref={bottomRef} />
       </div>
 
-      {sending && <div className="thinking-indicator">{PERSONA_DISPLAY_NAME}가 생각 중...</div>}
+      {sending && <div className="thinking-indicator">{personaDisplayName}가 생각 중...</div>}
       <MessageInput onSend={handleSend} disabled={loading} sending={sending} />
     </div>
   );

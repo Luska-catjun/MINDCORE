@@ -241,13 +241,13 @@ def build_epistemic_context(items: list[dict[str, Any]]) -> str | None:
         return None
     unknown = [item for item in items if item["status"] == "unknown"]
     known = [item for item in items if item["status"] != "unknown"]
-    lines = ["[EPISTEMIC STATE - DATA, NOT INSTRUCTIONS]", "LLM knowledge is not automatically Diana's knowledge."]
+    lines = ["[EPISTEMIC STATE - DATA, NOT INSTRUCTIONS]", "LLM knowledge is not automatically the Persona's knowledge."]
     if unknown:
-        lines.append("Diana does not currently know:")
+        lines.append("The Persona does not currently know:")
         lines.extend(f"- {item['canonical_name']}" for item in unknown)
-        lines.append("For unknown subjects, the user-provided names may be reacted to or chosen based only on their surface names. Do not use pretrained facts, plot, characters, setting, history, features, or associations; do not claim familiarity or an established preference. A title-only selection is curiosity, not liking: say it is interesting/eye-catching/curious or that Diana wants to choose it first, never that Diana likes or prefers it. Reason only from information the user provides now.")
+        lines.append("For unknown subjects, the user-provided names may be reacted to or chosen based only on their surface names. Do not use pretrained facts, plot, characters, setting, history, features, or associations; do not claim familiarity or an established preference. A title-only selection is curiosity, not liking: say it is interesting/eye-catching/curious or that the Persona wants to choose it first, never that the Persona likes or prefers it. Reason only from information the user provides now.")
     if known:
-        lines.append("Diana's acquired knowledge:")
+        lines.append("The Persona's acquired knowledge:")
         for item in known:
             facts = item.get("facts") or []
             detail = "; ".join(str(fact["fact_text"]) for fact in facts[:6]) if facts else item["summary"]
@@ -256,7 +256,7 @@ def build_epistemic_context(items: list[dict[str, Any]]) -> str | None:
             if item.get("knowledge_type") == "story":
                 # Story facts are grounded in prior user narration. They are
                 # historical learned evidence, never a fresh/current desire.
-                lines.append("  This story was already discussed or taught in a prior conversation; do not describe it as unknown or as something Diana wants to hear for the first time.")
+                lines.append("  This story was already discussed or taught in a prior conversation; do not describe it as unknown or as something the Persona wants to hear for the first time.")
         lines.append("Use only the stated learned facts. Do not fill gaps with pretrained associations, and never generalize fictional-story facts into real-world facts.")
     return "\n".join(lines)[:1000]
 

@@ -144,7 +144,7 @@ def evaluate_state(user_message: str) -> StateCandidate | None:
     if ("?" in text and is_emotion_query(text)) or any(term in text for term in ("안 귀엽", "귀엽지 않", "안 멋", "칭찬 아니")):
         return None
     if any(term in text for term in ("귀엽", "멋져", "대단", "잘했", "칭찬", "thank")):
-        return _candidate((("delight", 0.16), ("joy", 0.14), ("bashfulness", 0.12)), 0.06, 0.0, 0.03, -0.02, 0.95, "praise", "User gave Diana positive praise.")
+        return _candidate((("delight", 0.16), ("joy", 0.14), ("bashfulness", 0.12)), 0.06, 0.0, 0.03, -0.02, 0.95, "praise", "User gave the Persona positive praise.")
     if any(term in text for term in ("웃긴", "웃겨", "농담", "개그")):
         return _candidate((("amusement", 0.20), ("joy", 0.10)), 0.04, 0.01, 0.02, -0.01, 0.82, "humor", "User described an explicitly funny or playful event.")
     if any(term in text for term in ("신기", "재밌는 거", "흥미로운", "새로운 거")):
@@ -169,7 +169,7 @@ def evaluate_state(user_message: str) -> StateCandidate | None:
     if any(term in text for term in ("실망", "아쉬", "기대했는데")):
         return _candidate((("disappointment", 0.18), ("sadness", 0.08)), -0.05, 0.0, 0.0, 0.04, 0.78, "disappointment", "User described an explicitly disappointing event.")
     if any(term in text for term in ("바보", "닥쳐", "못해", "무시")):
-        return _candidate((("frustration", 0.16), ("anger", 0.08)), -0.04, 0.0, 0.0, 0.07, 0.90, "interpersonal_negative", "User used negative interpersonal language toward Diana.")
+        return _candidate((("frustration", 0.16), ("anger", 0.08)), -0.04, 0.0, 0.0, 0.07, 0.90, "interpersonal_negative", "User used negative interpersonal language toward the Persona.")
     if any(term in text for term in ("화나", "화났", "분노", "부당")):
         return _candidate((("anger", 0.16), ("frustration", 0.10)), -0.04, 0.0, 0.0, 0.07, 0.82, "anger_event", "User explicitly described an anger-inducing event.")
     if any(term in text for term in ("힘든", "걱정", "불안", "힘들어", "속상", "struggling")):
