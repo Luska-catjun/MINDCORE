@@ -9,16 +9,19 @@ import os
 from pathlib import Path
 import secrets
 import sys
+import tempfile
 import threading
 import time
 import uvicorn
-from fastapi import Response
+from fastapi import FastAPI, HTTPException, Request, Response, status
 
 from app.main import create_app
 
 
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
 CORE_TABLES = {"conversations", "messages", "episodes", "diana_state", "diana_working_memory_items"}
+DESKTOP_SHUTDOWN_CAPABILITY_ENV = "MINDCORE_DESKTOP_SHUTDOWN_CAPABILITY"
+DESKTOP_SHUTDOWN_CAPABILITY_HEADER = "X-MindCore-Desktop-Shutdown"
 
 
 def _settings_from(config_path: str):
@@ -55,6 +58,8 @@ def _ensure_desktop_auth_config(config_path: str) -> None:
     """Provision desktop-local auth once, without exposing either secret."""
     path = Path(config_path)
     text = path.read_text(encoding="utf-8")
+    existing_mode = path.stat().st_mode & 0o700 if os.name != "nt" else None
+    secure_mode = (existing_mode or 0o600) if existing_mode is not None else None
     keys = {line.partition("=")[0] for line in text.splitlines() if "=" in line}
     additions = []
     if "PRIVATE_ACCESS_PASSWORD" not in keys:
@@ -62,10 +67,51 @@ def _ensure_desktop_auth_config(config_path: str) -> None:
     if "AUTH_SIGNING_SECRET" not in keys:
         additions.append(f"AUTH_SIGNING_SECRET={secrets.token_urlsafe(32)}")
     if not additions:
+        if secure_mode is not None:
+            # Existing auth material must not retain group/other access either.
+            os.chmod(path, secure_mode)
         return
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(text.rstrip("\n") + "\n" + "\n".join(additions) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    try:
+        # mkstemp creates files as owner-only. Keep the mode explicit so a
+        # permissive caller umask cannot broaden a file containing auth keys.
+        if secure_mode is not None:
+            os.fchmod(descriptor, secure_mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text.rstrip("\n") + "\n" + "\n".join(additions) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if secure_mode is not None and (path.stat().st_mode & 0o777) != secure_mode:
+            # Preserve an existing owner's permissions while removing any
+            # group/other access. A usual 0600 desktop config stays 0600.
+            os.chmod(path, secure_mode)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _register_desktop_shutdown_route(app: FastAPI, server: object, capability: str | None) -> None:
+    """Register the parent-only shutdown route without exposing its capability."""
+
+    @app.post("/_desktop/shutdown", include_in_schema=False)
+    async def shutdown(request: Request) -> Response:
+        candidate = request.headers.get(DESKTOP_SHUTDOWN_CAPABILITY_HEADER)
+        if not capability or not candidate or not secrets.compare_digest(candidate, capability):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Desktop shutdown is not authorized.")
+        # The capability is intentionally never written to a URL, argv, or log.
+        server.should_exit = True
+        return Response(status_code=204)
 
 
 def _desktop_session_token(config_path: str) -> str:
@@ -170,12 +216,11 @@ def main() -> None:
 
         threading.Thread(target=stop_when_parent_exits, daemon=True).start()
 
-    @app.post("/_desktop/shutdown", include_in_schema=False)
-    async def shutdown() -> Response:
-        # Only the native parent can reach this fixed loopback endpoint. Ask
-        # Uvicorn to complete its lifespan cleanup before the parent fallback.
-        server.should_exit = True
-        return Response(status_code=204)
+    _register_desktop_shutdown_route(
+        app,
+        server,
+        os.environ.get(DESKTOP_SHUTDOWN_CAPABILITY_ENV),
+    )
 
     # Loopback only: the packaged desktop backend is never a LAN server.
     server.run()
