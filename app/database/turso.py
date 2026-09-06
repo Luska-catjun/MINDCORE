@@ -126,6 +126,30 @@ class TursoConnection:
         execute_ms = (perf_counter() - execute_started) * 1000
         return cursor, execute_ms, self._transaction_depth == 0 and self._connection.in_transaction
 
+    async def _close_cursor(self, cursor: Any, original: BaseException | None = None) -> None:
+        """Release the native statement owner at the adapter boundary.
+
+        libSQL cursors own native resources independently of the connection.
+        In particular, retaining a completed cursor can keep a file-backed
+        database open on Windows even after ``Connection.close()``.  Every
+        cursor created by this adapter is therefore closed as soon as its
+        result has been consumed.
+        """
+        close = getattr(cursor, "close", None)
+        if close is None:
+            return
+        try:
+            await _run_blocking(close)
+        except BaseException as cleanup:
+            if original is None:
+                raise
+            self._record_cleanup_failure(original, cleanup, "cursor close")
+
+    async def _execute_control(self, statement: str) -> None:
+        """Execute and immediately release a transaction-control cursor."""
+        cursor = await _run_blocking(self._connection.execute, statement)
+        await self._close_cursor(cursor)
+
     async def _commit_and_log(
         self,
         *,
@@ -158,10 +182,15 @@ class TursoConnection:
             # commit and restores regular execution immediately afterwards.
             self._deferred_execution = (execute_ms, should_commit, started)
             return cursor
-        await self._commit_and_log(
-            operation="execute", execute_ms=execute_ms,
-            should_commit=should_commit, started=started,
-        )
+        try:
+            await self._commit_and_log(
+                operation="execute", execute_ms=execute_ms,
+                should_commit=should_commit, started=started,
+            )
+        except BaseException as error:
+            await self._close_cursor(cursor, error)
+            raise
+        await self._close_cursor(cursor)
         return cursor
 
     async def fetch(self, statement: str, *args: Any) -> list[dict[str, Any]]:
@@ -174,20 +203,26 @@ class TursoConnection:
             cursor = await self.execute(statement, *args)
         finally:
             self._defer_auto_commit = False
-        names = [item[0] for item in cursor.description or []]
-        source_tables = _source_tables(statement)
-        rows = cursor.fetchall()
-        # DML with RETURNING keeps its statement active until its result rows
-        # are consumed.  Commit after materialization, while pure reads keep
-        # ``should_commit`` false and therefore issue no commit at all.
-        deferred = self._deferred_execution
-        self._deferred_execution = None
-        if deferred is not None:
-            execute_ms, should_commit, started = deferred
-            await self._commit_and_log(
-                operation="fetch", execute_ms=execute_ms,
-                should_commit=should_commit, started=started,
-            )
+        try:
+            names = [item[0] for item in cursor.description or []]
+            source_tables = _source_tables(statement)
+            rows = cursor.fetchall()
+            # DML with RETURNING keeps its statement active until its result
+            # rows are consumed. Commit after materialization, while pure
+            # reads keep ``should_commit`` false.
+            deferred = self._deferred_execution
+            self._deferred_execution = None
+            if deferred is not None:
+                execute_ms, should_commit, started = deferred
+                await self._commit_and_log(
+                    operation="fetch", execute_ms=execute_ms,
+                    should_commit=should_commit, started=started,
+                )
+        except BaseException as error:
+            self._deferred_execution = None
+            await self._close_cursor(cursor, error)
+            raise
+        await self._close_cursor(cursor)
         return [dict(zip(names, (_read_value(name, value, source_tables=source_tables) for name, value in zip(names, row)))) for row in rows]
 
     async def fetchrow(self, statement: str, *args: Any) -> dict[str, Any] | None:
@@ -222,13 +257,13 @@ class TursoConnection:
 
     async def _rollback_savepoint_preserving(self, name: str, original: BaseException) -> None:
         try:
-            await _run_blocking(self._connection.execute, f"ROLLBACK TO SAVEPOINT {name}")
+            await self._execute_control(f"ROLLBACK TO SAVEPOINT {name}")
         except BaseException as cleanup:
             self._transaction_broken = True
             self._record_cleanup_failure(original, cleanup, "savepoint rollback")
             return
         try:
-            await _run_blocking(self._connection.execute, f"RELEASE SAVEPOINT {name}")
+            await self._execute_control(f"RELEASE SAVEPOINT {name}")
         except BaseException as cleanup:
             self._transaction_broken = True
             self._record_cleanup_failure(original, cleanup, "savepoint release after rollback")
@@ -251,7 +286,7 @@ class TursoConnection:
         savepoint: str | None = None
         if outermost:
             try:
-                await _run_blocking(self._connection.execute, "BEGIN")
+                await self._execute_control("BEGIN")
             except BaseException as error:
                 if self._connection.in_transaction:
                     await self._rollback_preserving(error, operation="transaction entry rollback")
@@ -261,7 +296,7 @@ class TursoConnection:
             self._savepoint_counter += 1
             savepoint = f"mindcore_sp_{self._savepoint_counter}"
             try:
-                await _run_blocking(self._connection.execute, f"SAVEPOINT {savepoint}")
+                await self._execute_control(f"SAVEPOINT {savepoint}")
             except BaseException as error:
                 await self._rollback_savepoint_preserving(savepoint, error)
                 raise
@@ -294,7 +329,7 @@ class TursoConnection:
             else:
                 assert savepoint is not None
                 try:
-                    await _run_blocking(self._connection.execute, f"RELEASE SAVEPOINT {savepoint}")
+                    await self._execute_control(f"RELEASE SAVEPOINT {savepoint}")
                 except BaseException as error:
                     await self._rollback_savepoint_preserving(savepoint, error)
                     raise

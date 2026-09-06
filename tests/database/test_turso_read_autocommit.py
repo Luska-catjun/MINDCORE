@@ -22,6 +22,7 @@ class CountingRawConnection:
         self.commit_calls = 0
         self.rollback_calls = 0
         self.close_calls = 0
+        self.cursor_close_calls = 0
         self.fail_next_commit = False
         self.fail_next_rollback = False
 
@@ -31,7 +32,7 @@ class CountingRawConnection:
 
     def execute(self, *args, **kwargs):
         self.execute_calls += 1
-        return self.raw.execute(*args, **kwargs)
+        return TrackingCursor(self.raw.execute(*args, **kwargs), self)
 
     def commit(self):
         self.commit_calls += 1
@@ -54,6 +55,24 @@ class CountingRawConnection:
         # TemporaryDirectory attempts to remove a file-backed fixture.
         raw, self.raw = self.raw, None
         return raw.close()
+
+
+class TrackingCursor:
+    """Expose the native cursor API while making ownership release observable."""
+
+    def __init__(self, cursor, owner: CountingRawConnection) -> None:
+        self._cursor = cursor
+        self._owner = owner
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+    def close(self):
+        cursor, self._cursor = self._cursor, None
+        if cursor is not None:
+            self._owner.cursor_close_calls += 1
+            return cursor.close()
+        return None
 
 
 class LocalPool:
@@ -173,6 +192,35 @@ class TursoReadAutocommitTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await connection.fetchval("select value from probe"), 7)
             await first.close()
             await second.close()
+
+    async def test_file_backed_pool_releases_native_owners_before_cleanup(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "native-owner.db"
+            pool = TursoPool(str(database), "isolated-test-token")
+            async with pool.acquire() as connection:
+                await connection.execute("create table probe(value integer)")
+                await connection.execute("insert into probe values($1)", 7)
+                self.assertEqual(await connection.fetchval("select value from probe"), 7)
+                async with connection.transaction():
+                    await connection.execute("insert into probe values($1)", 8)
+            await pool.close()
+
+            # Windows refuses this unlink while either a native Cursor or
+            # Connection still owns the database handle. No sleep, retry, or
+            # garbage collection is permitted at this lifecycle boundary.
+            database.unlink()
+            self.assertFalse(database.exists())
+
+    async def test_adapter_closes_every_native_cursor_after_consumption(self) -> None:
+        raw = CountingRawConnection()
+        connection = TursoConnection(raw)
+        await connection.execute("create table probe(value integer)")
+        await connection.execute("insert into probe values($1)", 1)
+        self.assertEqual(await connection.fetchval("select value from probe"), 1)
+        async with connection.transaction():
+            await connection.execute("insert into probe values($1)", 2)
+        self.assertEqual(raw.cursor_close_calls, raw.execute_calls)
+        raw.close()
 
     async def test_explicit_transaction_commits_once_and_failure_rolls_back(self) -> None:
         async with self.pool.connection.transaction():
