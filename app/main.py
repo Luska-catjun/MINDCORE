@@ -86,7 +86,7 @@ def create_app(*, settings_override: Settings | None = None, db_pool_factory: Ca
     app.include_router(auth.router)
     @app.middleware("http")
     async def private_access(request: Request, call_next):
-        if request.method == "OPTIONS" or request.url.path in {"/health", "/_desktop/shutdown"} or request.url.path.startswith("/auth/"):
+        if request.method == "OPTIONS" or request.url.path in {"/health", "/_desktop/ready", "/_desktop/shutdown"} or request.url.path.startswith("/auth/"):
             return await call_next(request)
         settings = request.app.state.settings
         try:

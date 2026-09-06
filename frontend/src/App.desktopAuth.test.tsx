@@ -31,9 +31,11 @@ describe("desktop authentication", () => {
   });
 
   it("shows a local-session startup error instead of the password login", async () => {
-    invoke.mockImplementation((command: string) => command === "get_setup_status"
-      ? Promise.resolve({ configured: true })
-      : Promise.reject(new Error("native session unavailable")));
+    invoke.mockImplementation((command: string) => {
+      if (command === "get_setup_status") return Promise.resolve({ configured: true });
+      if (command === "start_mindcore_backend") return Promise.resolve();
+      return Promise.reject(new Error("native session unavailable"));
+    });
     apiMock.health.mockResolvedValue({ status: "ok" });
 
     render(<App />);

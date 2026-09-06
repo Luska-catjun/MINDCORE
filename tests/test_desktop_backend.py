@@ -11,11 +11,13 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings, get_settings
 from app.desktop_backend import (
+    DESKTOP_INSTANCE_HEADER,
     DESKTOP_SHUTDOWN_CAPABILITY_HEADER,
     _desktop_session_token,
     _ensure_desktop_auth_config,
     _parent_process_is_alive,
     _register_desktop_shutdown_route,
+    _stop_when_parent_exits,
 )
 from app.main import create_app
 from app.routers.auth import is_valid_session_token
@@ -43,6 +45,13 @@ class DesktopBackendTests(TestCase):
 
     def test_parent_liveness_recognizes_the_current_process(self) -> None:
         self.assertTrue(_parent_process_is_alive(os.getpid()))
+
+    def test_parent_exit_marks_the_backend_for_shutdown(self) -> None:
+        server = type("TestServer", (), {"should_exit": False})()
+        with patch("app.desktop_backend._parent_process_is_alive", return_value=False):
+            _stop_when_parent_exits(server, 999_999, poll_interval=0)
+
+        self.assertTrue(server.should_exit)
 
     def _shutdown_client(self):
         settings = Settings(
@@ -87,6 +96,27 @@ class DesktopBackendTests(TestCase):
         self.assertTrue(server.should_exit)
         self.assertNotIn(capability, str(response.request.url))
         self.assertNotIn(capability, response.text)
+
+    def test_desktop_readiness_requires_the_current_parent_capability(self) -> None:
+        client, server, capability = self._shutdown_client()
+        with client, self.assertNoLogs("diana.auth", level="INFO"):
+            missing = client.get("/_desktop/ready")
+            wrong = client.get(
+                "/_desktop/ready",
+                headers={DESKTOP_SHUTDOWN_CAPABILITY_HEADER: "wrong-capability"},
+            )
+            accepted = client.get(
+                "/_desktop/ready",
+                headers={DESKTOP_SHUTDOWN_CAPABILITY_HEADER: capability},
+            )
+
+        self.assertEqual(missing.status_code, 403)
+        self.assertEqual(wrong.status_code, 403)
+        self.assertEqual(accepted.status_code, 204)
+        self.assertFalse(server.should_exit)
+        self.assertEqual(accepted.headers[DESKTOP_INSTANCE_HEADER], capability)
+        self.assertNotIn(capability, str(accepted.request.url))
+        self.assertNotIn(capability, accepted.text)
 
     @staticmethod
     def _mode(path: Path) -> int:

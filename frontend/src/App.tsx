@@ -95,6 +95,16 @@ function App() {
     const checkHealth = async () => {
       setBackendStatus("checking");
       setStartupProgress(18);
+      if (isDesktopRuntime()) {
+        try {
+          // Native start is idempotent for a healthy managed child and creates
+          // a new generation after a crash or completed stop.
+          await invoke("start_mindcore_backend");
+        } catch {
+          if (!cancelled) setBackendStatus("error");
+          return;
+        }
+      }
       // The packaged sidecar normally starts in well under a second. Polling
       // avoids an authentication/API storm while it is still coming up.
       const deadline = Date.now() + (isDesktopRuntime() ? 30_000 : 0);
@@ -164,6 +174,13 @@ function App() {
       clearSessionState();
     }
   };
+
+  const retryDesktopBackend = useCallback(() => {
+    setBackendStatus("checking");
+    setAuthStatus("checking");
+    setDesktopSessionError(false);
+    setStartupAttempt((value) => value + 1);
+  }, []);
 
   const handleViewChange = (view: WorkspaceView) => {
     setActiveView(view);
@@ -296,11 +313,11 @@ function App() {
   }
 
   if (isDesktopRuntime() && backendStatus === "error") {
-    return <main className="login-screen"><div className="login-form"><div className="login-title">MINDCORE</div><p>MindCore could not start.</p><button className="login-button" type="button" onClick={() => setStartupAttempt((value) => value + 1)}>Retry</button><button className="login-button" type="button" onClick={() => void invoke("open_configuration_folder")}>Open Configuration</button><p className="workspace-muted">Check the desktop backend diagnostics in the app log.</p></div></main>;
+    return <main className="login-screen"><div className="login-form"><div className="login-title">MINDCORE</div><p>MindCore could not start.</p><button className="login-button" type="button" onClick={retryDesktopBackend}>Retry</button><button className="login-button" type="button" onClick={() => void invoke("open_configuration_folder")}>Open Configuration</button><p className="workspace-muted">Check the desktop backend diagnostics in the app log.</p></div></main>;
   }
 
   if (isDesktopRuntime() && (desktopSessionError || authStatus === "unauthenticated")) {
-    return <main className="login-screen"><div className="login-form"><div className="login-title">MINDCORE</div><p>MindCore could not start the local session.</p><button className="login-button" type="button" onClick={() => setStartupAttempt((value) => value + 1)}>Restart MindCore</button></div></main>;
+    return <main className="login-screen"><div className="login-form"><div className="login-title">MINDCORE</div><p>MindCore could not start the local session.</p><button className="login-button" type="button" onClick={retryDesktopBackend}>Restart MindCore</button></div></main>;
   }
 
   if (authStatus !== "authenticated") {

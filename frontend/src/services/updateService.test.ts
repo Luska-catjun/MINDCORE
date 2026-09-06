@@ -43,10 +43,12 @@ describe("desktop update service", () => {
   });
 
   it("restores the local backend if installation fails", async () => {
-    const startBackend = vi.fn().mockResolvedValue(undefined);
-    const service = createUpdateService({ getVersion: vi.fn(), check: vi.fn(), stopBackend: vi.fn().mockResolvedValue(undefined), startBackend, relaunch: vi.fn() });
-    await expect(service.installAndRelaunch({ currentVersion: "0.1.0", version: "0.1.1", download: async () => undefined, install: async () => { throw new Error("signature verification failed"); } })).rejects.toThrow("signature");
+    const order: string[] = [];
+    const startBackend = vi.fn(async () => { order.push("restart"); });
+    const service = createUpdateService({ getVersion: vi.fn(), check: vi.fn(), stopBackend: vi.fn(async () => { order.push("stop"); }), startBackend, relaunch: vi.fn() });
+    await expect(service.installAndRelaunch({ currentVersion: "0.1.0", version: "0.1.1", download: async () => undefined, install: async () => { order.push("install"); throw new Error("signature verification failed"); } })).rejects.toThrow("signature");
     expect(startBackend).toHaveBeenCalledOnce();
+    expect(order).toEqual(["stop", "install", "restart"]);
   });
 
   it("keeps verification failures hard and update errors non-fatal", () => {

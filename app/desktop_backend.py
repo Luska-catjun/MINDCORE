@@ -22,6 +22,7 @@ from app.main import create_app
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
 DESKTOP_SHUTDOWN_CAPABILITY_ENV = "MINDCORE_DESKTOP_SHUTDOWN_CAPABILITY"
 DESKTOP_SHUTDOWN_CAPABILITY_HEADER = "X-MindCore-Desktop-Shutdown"
+DESKTOP_INSTANCE_HEADER = "X-MindCore-Desktop-Instance"
 
 
 def _settings_from(config_path: str):
@@ -102,16 +103,35 @@ def _ensure_desktop_auth_config(config_path: str) -> None:
 
 
 def _register_desktop_shutdown_route(app: FastAPI, server: object, capability: str | None) -> None:
-    """Register the parent-only shutdown route without exposing its capability."""
+    """Register parent-only lifecycle routes without exposing the capability."""
+
+    def require_parent_capability(request: Request) -> None:
+        candidate = request.headers.get(DESKTOP_SHUTDOWN_CAPABILITY_HEADER)
+        if not capability or not candidate or not secrets.compare_digest(candidate, capability):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Desktop lifecycle access is not authorized.")
+
+    @app.get("/_desktop/ready", include_in_schema=False)
+    async def ready(request: Request) -> Response:
+        require_parent_capability(request)
+        return Response(
+            status_code=204,
+            headers={DESKTOP_INSTANCE_HEADER: capability},
+        )
 
     @app.post("/_desktop/shutdown", include_in_schema=False)
     async def shutdown(request: Request) -> Response:
-        candidate = request.headers.get(DESKTOP_SHUTDOWN_CAPABILITY_HEADER)
-        if not capability or not candidate or not secrets.compare_digest(candidate, capability):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Desktop shutdown is not authorized.")
+        require_parent_capability(request)
         # The capability is intentionally never written to a URL, argv, or log.
         server.should_exit = True
         return Response(status_code=204)
+
+
+def _stop_when_parent_exits(server: object, parent_pid: int, poll_interval: float = 0.5) -> None:
+    while not server.should_exit:
+        if not _parent_process_is_alive(parent_pid):
+            server.should_exit = True
+            return
+        time.sleep(poll_interval)
 
 
 def _desktop_session_token(config_path: str) -> str:
@@ -205,14 +225,11 @@ def main() -> None:
     server = uvicorn.Server(config)
 
     if args.parent_pid:
-        def stop_when_parent_exits() -> None:
-            while not server.should_exit:
-                if not _parent_process_is_alive(args.parent_pid):
-                    server.should_exit = True
-                    return
-                time.sleep(0.5)
-
-        threading.Thread(target=stop_when_parent_exits, daemon=True).start()
+        threading.Thread(
+            target=_stop_when_parent_exits,
+            args=(server, args.parent_pid),
+            daemon=True,
+        ).start()
 
     _register_desktop_shutdown_route(
         app,
