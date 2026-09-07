@@ -8,6 +8,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from app.config import Settings, get_settings
 from app.desktop_backend import (
@@ -79,6 +80,16 @@ class DesktopBackendTests(TestCase):
         )
         self.assertNotIn(database_url, diagnostic)
         self.assertNotIn(database_token, diagnostic)
+
+    def test_preflight_persona_placeholder_passes_settings_validation_but_blank_does_not(self) -> None:
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "mindcore.env"
+            config.write_text('PERSONA_DISPLAY_NAME="MindCore Setup"\n', encoding="utf-8")
+            self.assertEqual(Settings(_env_file=config).persona_display_name, "MindCore Setup")
+
+            config.write_text('PERSONA_DISPLAY_NAME=""\n', encoding="utf-8")
+            with self.assertRaises(ValidationError):
+                Settings(_env_file=config)
 
     def _shutdown_client(self):
         settings = Settings(
