@@ -16,6 +16,7 @@ type Mode = "add" | "manage";
 interface PersonaManagerProps {
   mode: Mode;
   personas: PersonaSummary[];
+  avatarRevision?: number;
   onClose: () => void;
   onChanged: (switchTo?: string) => Promise<void>;
 }
@@ -97,7 +98,7 @@ function AddPersona({ onClose, onChanged }: Pick<PersonaManagerProps, "onClose" 
   </>;
 }
 
-function ManagePersonas({ personas, onClose, onChanged }: PersonaManagerProps) {
+function ManagePersonas({ personas, avatarRevision = 0, onClose, onChanged }: PersonaManagerProps) {
   const [renameId, setRenameId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [deleteId, setDeleteId] = useState<string | null>(null);
@@ -157,7 +158,7 @@ function ManagePersonas({ personas, onClose, onChanged }: PersonaManagerProps) {
     <h2>Manage Personas</h2>
     <div className="persona-list">
       {personas.map((persona) => <div className="persona-row" key={persona.persona_id}>
-        <div className="persona-row-identity"><PersonaAvatar personaId={persona.persona_id} displayName={persona.display_name} avatarExtension={persona.avatar_extension} /><span><b>{persona.display_name}</b>{persona.active && <span> Active</span>}<small>{persona.persona_id}</small></span></div>
+        <div className="persona-row-identity"><PersonaAvatar personaId={persona.persona_id} displayName={persona.display_name} avatarExtension={persona.avatar_extension} revision={avatarRevision} /><span><b>{persona.display_name}</b>{persona.active && <span> Active</span>}<small>{persona.persona_id}</small></span></div>
         <div>
           <button type="button" onClick={() => { setRenameId(persona.persona_id); setRenameValue(persona.display_name); }}>Rename</button>
           <label className="persona-avatar-change">Change avatar<input aria-label={`Avatar ${persona.display_name}`} type="file" accept="image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp" onChange={(event) => { const file = event.target.files?.[0]; if (file) void setAvatar(persona, file); event.currentTarget.value = ""; }} /></label>
