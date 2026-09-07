@@ -298,6 +298,17 @@ function App() {
     [handleMessagesChange, settlePendingSend],
   );
 
+  const handleMessageDeleted = useCallback(
+    (conversationId: string, messageId: string) => {
+      handleMessagesChange(
+        conversationId,
+        (messages) => messages.filter((message) => message.id !== messageId),
+        "message_deleted",
+      );
+    },
+    [handleMessagesChange],
+  );
+
   const currentHistory = mainConversationId ? chatHistory[mainConversationId] : undefined;
 
   useEffect(() => {
@@ -373,6 +384,7 @@ function App() {
             view={activeView}
             backendStatus={backendStatus}
             onToggleSidebar={() => setSidebarOpen((open) => !open)}
+            onMessageDeleted={handleMessageDeleted}
           />
         )}
       </main>

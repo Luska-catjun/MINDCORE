@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const apiMock = vi.hoisted(() => ({
+  observeMessages: vi.fn(), deleteMessage: vi.fn(),
   observeMemory: vi.fn(), correctMemory: vi.fn(), deleteMemory: vi.fn(),
   observeKnowledge: vi.fn(), correctKnowledge: vi.fn(), deleteKnowledge: vi.fn(),
   observePreferences: vi.fn(), correctPersonaPreference: vi.fn(), deletePersonaPreference: vi.fn(),
@@ -23,16 +24,19 @@ const knowledge = { id: "knowledge-1", canonical_name: "Topic", knowledge_type: 
 const preference = { id: "preference-1", subject: "topic", display_name: "Original preference", status: "stable", affinity: 0.8, confidence: 0.8, evidence_count: 2, positive_evidence: 2, negative_evidence: 0, curiosity_evidence: 0, first_observed_at: null, last_observed_at: null, stabilized_at: null, recent_evidence: [] };
 const narrative = { id: "narrative-1", category: "pattern", subject_key: "topic", status: "established", summary: "Original narrative", confidence: 0.8, evidence_count: 2, distinct_episode_count: 1, distinct_conversation_count: 1, activation_eligible: true, attention_score: null, attention_reasons: [], first_observed_at: null, last_observed_at: null, evidence: [] };
 const selfModel = { id: "self-1", category: "belief", subject: "self", status: "established", summary: "Original self model", confidence: 0.8, support_count: 2, independent_source_count: 1, current: true, attention_score: null, source_types: [], first_observed_at: null, last_reinforced_at: null, evidence: [] };
+const message = { id: "message-1", conversation_id: "conversation-1", role: "user", content: "Message to delete", created_at: "2026-01-01T00:00:00Z" };
 
 describe("Observation corrections", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    apiMock.observeMessages.mockResolvedValue({ items: [message], total: 1, limit: 100, offset: 0, query_latency_ms: 1 });
     apiMock.observeMemory.mockResolvedValue({ items: [memory], total: 1, query_latency_ms: 1 });
     apiMock.observeKnowledge.mockResolvedValue({ items: [knowledge], total: 1, query_latency_ms: 1 });
     apiMock.observePreferences.mockResolvedValue({ diana_preferences: [preference], user_preferences: [], query_latency_ms: 1 });
     apiMock.observeNarratives.mockResolvedValue({ items: [narrative], total: 1, query_latency_ms: 1 });
     apiMock.observeSelfModel.mockResolvedValue({ items: [selfModel], total: 1, query_latency_ms: 1 });
     for (const method of [apiMock.correctMemory, apiMock.deleteMemory, apiMock.correctKnowledge, apiMock.deleteKnowledge, apiMock.correctPersonaPreference, apiMock.deletePersonaPreference, apiMock.correctNarrative, apiMock.deleteNarrative, apiMock.correctSelfModel, apiMock.deleteSelfModel]) method.mockResolvedValue({});
+    apiMock.deleteMessage.mockResolvedValue({ id: message.id, deleted: true });
   });
 
   async function open(view: "memory" | "knowledge" | "preferences" | "narratives" | "self-model", text: string) {
@@ -95,5 +99,45 @@ describe("Observation corrections", () => {
     await userEvent.click(screen.getByRole("button", { name: "Delete Item" }));
     await waitFor(() => expect(apiMock.deleteMemory).toHaveBeenCalledWith("memory-1"));
     expect(apiMock.observeMemory).toHaveBeenCalledTimes(2);
+  });
+
+  it("requires an in-app confirmation and removes a successfully deleted Message", async () => {
+    const deleted = vi.fn();
+    render(<WorkspacePanel view="messages" backendStatus="connected" onToggleSidebar={noop} onMessageDeleted={deleted} />);
+    await screen.findByText("Message to delete");
+
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(apiMock.deleteMessage).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Confirm message deletion" })).toBeTruthy();
+
+    await userEvent.click(screen.getByRole("button", { name: "Delete Message" }));
+    await waitFor(() => expect(apiMock.deleteMessage).toHaveBeenCalledWith("message-1"));
+    expect(screen.queryByText("Message to delete")).toBeNull();
+    expect(deleted).toHaveBeenCalledWith("conversation-1", "message-1");
+  });
+
+  it("does not call the Message delete API when confirmation is cancelled", async () => {
+    render(<WorkspacePanel view="messages" backendStatus="connected" onToggleSidebar={noop} />);
+    await screen.findByText("Message to delete");
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(apiMock.deleteMessage).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Confirm message deletion" })).toBeNull();
+    expect(screen.getByText("Message to delete")).toBeTruthy();
+  });
+
+  it("keeps a Message visible on failure and allows retry", async () => {
+    apiMock.deleteMessage.mockRejectedValueOnce(new Error("network"));
+    render(<WorkspacePanel view="messages" backendStatus="connected" onToggleSidebar={noop} />);
+    await screen.findByText("Message to delete");
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await userEvent.click(screen.getByRole("button", { name: "Delete Message" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("Message could not be deleted");
+    expect(screen.getByText("Message to delete")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(apiMock.deleteMessage).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("Message to delete")).toBeNull();
   });
 });

@@ -24,7 +24,22 @@ vi.mock("./api/client", () => ({
 }));
 
 vi.mock("./components/WorkspacePanel", () => ({
-  WorkspacePanel: ({ view }: { view: string }) => <div data-testid="workspace">Observation: {view}</div>,
+  WorkspacePanel: ({
+    view,
+    onMessageDeleted,
+  }: {
+    view: string;
+    onMessageDeleted?: (conversationId: string, messageId: string) => void;
+  }) => (
+    <div data-testid="workspace">
+      Observation: {view}
+      {view === "messages" ? (
+        <button type="button" onClick={() => onMessageDeleted?.("conversation-x", "b")}>
+          Simulate durable message deletion
+        </button>
+      ) : null}
+    </div>
+  ),
 }));
 
 import App from "./App";
@@ -229,6 +244,21 @@ describe("Chat history across Observation views", () => {
       ["conversation-x", 200, 0, true],
       ["conversation-x", 200, 0, true],
     ]);
+  });
+
+  it("invalidates the canonical Chat cache after an Observation message deletion", async () => {
+    await renderReadyApp();
+
+    await userEvent.click(screen.getByRole("button", { name: "Messages" }));
+    await userEvent.click(screen.getByRole("button", { name: "Simulate durable message deletion" }));
+    durableMessages = durableMessages.filter((item) => item.id !== "b");
+    expect(window.__DIANA_CHAT_DEBUG__?.cache?.map((item) => item.id)).toEqual(["a"]);
+
+    await userEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await screen.findByText("A");
+    expect(screen.queryByText("B")).toBeNull();
+    await waitFor(() => expect(apiMock.listMessages).toHaveBeenCalledTimes(2));
+    expect(window.__DIANA_CHAT_DEBUG__?.cache?.map((item) => item.id)).toEqual(["a"]);
   });
 
   it("keeps new messages after remounting a 200-message latest window", async () => {

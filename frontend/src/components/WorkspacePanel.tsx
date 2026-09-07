@@ -4,7 +4,12 @@ import type { ObserveDebug, ObserveEmotion, ObserveGoalsNeeds, ObservePreference
 import type { WorkspaceView } from "./Sidebar";
 import { formatKstDateTime, formatKstDateTimeWithSeconds } from "../utils/datetime";
 
-interface WorkspacePanelProps { view: Exclude<WorkspaceView, "chat">; backendStatus: "checking" | "connected" | "error"; onToggleSidebar: () => void; }
+interface WorkspacePanelProps {
+  view: Exclude<WorkspaceView, "chat">;
+  backendStatus: "checking" | "connected" | "error";
+  onToggleSidebar: () => void;
+  onMessageDeleted?: (conversationId: string, messageId: string) => void;
+}
 type ObservationData = ObservationList<ObservedMemory> | ObservationList<ObservedMessage> | ObserveEmotion | ObservePreferences | ObservationList<ObservedEpisode> | ObservationList<ObservedDecision> | ObservationList<ObservedIntention> | ObservationList<ObservedNarrative> | ObservationList<ObservedSelfModel> | ObservationList<ObservedKnowledge> | ObserveRelationship | ObserveStats | ObserveDebug | ObserveWorldModel | ObserveGoalsNeeds;
 type ObservationView = Exclude<WorkspaceView, "chat">;
 type ObservationResource = { view: ObservationView; data: ObservationData };
@@ -26,7 +31,41 @@ function MemoryWorkspace({ data, refresh }: { data: ObservationList<ObservedMemo
   useEffect(()=>setItems(data.items),[data.items]); const changeSort = async (next: typeof sort) => { setSort(next); setLoading(true); try { setItems((await api.observeMemory(next)).items); } finally { setLoading(false); } };
   return <section className="workspace-content"><Heading title="Memory" latency={data.query_latency_ms} /><div className="workspace-toolbar"><span>{data.total} long-term memories</span><div className="filter-buttons">{(["recent", "strongest", "most_recalled"] as const).map((item) => <button key={item} onClick={() => void changeSort(item)} className={sort === item ? "active" : ""}>{item.replace("_", " ")}</button>)}</div></div>{loading ? <p className="workspace-muted">Loading memories…</p> : items.length === 0 ? <p className="workspace-muted">No long-term memories yet.</p> : <div className="observation-list">{items.map((item) => <article className="observation-card" key={item.id}><p className="card-content">{item.content}</p><CorrectionControls value={item.content} onSave={(value)=>api.correctMemory(item.id,value)} onDelete={()=>api.deleteMemory(item.id)} refresh={refresh}/><dl className="card-metrics"><Metric label="Importance" value={number(item.importance)} /><Metric label="Strength" value={number(item.memory_strength)} /><Metric label="Effective" value={number(item.effective_strength)} /><Metric label="Recall" value={String(item.recall_frequency)} /></dl><p className="card-meta">Created {date(item.created_at)} · Episode {shortId(item.source_episode_id)}</p></article>)}</div>}</section>;
 }
-function MessagesWorkspace({ data }: { data: ObservationList<ObservedMessage> }) { const [items,setItems]=useState(data.items); const [error,setError]=useState<string|null>(null); const remove=async(item:ObservedMessage)=>{if(!window.confirm(`Delete this message?\n${item.role}\n${item.content.slice(0,120)}\n${date(item.created_at)}\n${item.id}`))return;setError(null);try{await api.deleteMessage(item.id);setItems(v=>v.filter(x=>x.id!==item.id));}catch(reason){if(import.meta.env.DEV&&reason instanceof ApiError)console.warn("Message delete failed",{messageId:item.id,status:reason.status,detail:reason.detail});setError(errorText(reason));}};return <section className="workspace-content"><Heading title="Messages" latency={data.query_latency_ms}/>{error&&<p className="workspace-muted">{error}</p>}<div className="observation-list">{items.map(item=><article className="observation-card" key={item.id}><div className="card-title"><b>{item.role}</b><button type="button" onClick={()=>void remove(item)}>Delete</button></div><p className="card-content">{item.content}</p><p className="card-meta">Conversation {shortId(item.conversation_id)} · Message {shortId(item.id)} · {date(item.created_at)}</p></article>)}</div></section>; }
+function MessagesWorkspace({ data, onDeleted }: { data: ObservationList<ObservedMessage>; onDeleted?: (conversationId: string, messageId: string) => void }) {
+  const [items, setItems] = useState(data.items);
+  const [pending, setPending] = useState<ObservedMessage | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => setItems(data.items), [data.items]);
+
+  const remove = async (item: ObservedMessage) => {
+    setDeleting(true);
+    setError(null);
+    try {
+      const result = await api.deleteMessage(item.id);
+      if (!result.deleted) throw new Error("delete_not_confirmed");
+      setItems((current) => current.filter((candidate) => candidate.id !== item.id));
+      onDeleted?.(item.conversation_id, item.id);
+      setPending(null);
+    } catch (reason) {
+      if (import.meta.env.DEV) {
+        console.warn("Message delete failed", {
+          messageId: item.id,
+          status: reason instanceof ApiError ? reason.status : undefined,
+          code: reason instanceof ApiError && typeof reason.detail === "object" && reason.detail !== null && "code" in reason.detail
+            ? reason.detail.code
+            : undefined,
+        });
+      }
+      setError("Message could not be deleted. Nothing was changed.");
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  return <section className="workspace-content"><Heading title="Messages" latency={data.query_latency_ms}/><div className="observation-list">{items.map(item=><article className="observation-card" key={item.id}><div className="card-title"><b>{item.role}</b><button type="button" disabled={deleting} onClick={()=>{setPending(item);setError(null);}}>Delete</button></div><p className="card-content">{item.content}</p><p className="card-meta">Conversation {shortId(item.conversation_id)} · Message {shortId(item.id)} · {date(item.created_at)}</p></article>)}</div>{pending&&<div className="correction-dialog" role="dialog" aria-label="Confirm message deletion"><p>Delete this durable message? Long-term cognition records will follow their existing provenance policy.</p><p className="card-meta">{pending.role} · Message {shortId(pending.id)} · {date(pending.created_at)}</p><div><button type="button" disabled={deleting} onClick={()=>{setPending(null);setError(null);}}>Cancel</button><button type="button" disabled={deleting} onClick={()=>void remove(pending)}>{deleting?"Deleting…":"Delete Message"}</button></div>{error&&<p className="workspace-muted" role="alert">{error} <button type="button" disabled={deleting} onClick={()=>void remove(pending)}>Retry</button></p>}</div>}</section>;
+}
 
 function EmotionWorkspace({ data }: { data: ObserveEmotion }) {
   if (!data.state) return <EmptyWorkspace title="Emotion" detail="No current internal state is available." />;
@@ -51,7 +90,7 @@ function DebugWorkspace({ data }: { data: ObserveDebug }) { return <section clas
 
 function fetchObservation(view: ObservationView): Promise<ObservationData> { switch (view) { case "messages": return api.observeMessages(); case "memory": return api.observeMemory(); case "emotion": return api.observeEmotion(); case "knowledge": return api.observeKnowledge(); case "preferences": return api.observePreferences(); case "episodes": return api.observeEpisodes(); case "decisions": return api.observeDecisions(); case "intentions": return api.observeIntentions(); case "narratives": return api.observeNarratives(); case "self-model": return api.observeSelfModel(); case "world-model": return api.observeWorldModel(); case "relationship": return api.observeRelationship(); case "goals-needs": return api.observeGoalsNeeds(); case "stats": return api.observeStats(); case "debug": return api.observeDebug(); } }
 
-export function WorkspacePanel({ view, backendStatus, onToggleSidebar }: WorkspacePanelProps) {
+export function WorkspacePanel({ view, backendStatus, onToggleSidebar, onMessageDeleted }: WorkspacePanelProps) {
   const [resource, setResource] = useState<ObservationResource | null>(null);
   const [error, setError] = useState<ObservationError | null>(null);
   const refresh = useCallback(async () => { setError(null); const data = await fetchObservation(view); setResource({ view, data }); }, [view]);
@@ -69,6 +108,6 @@ export function WorkspacePanel({ view, backendStatus, onToggleSidebar }: Workspa
   let content: ReactNode;
   if (currentError) content = <EmptyWorkspace title={view[0].toUpperCase() + view.slice(1)} detail={currentError} />;
   else if (!data) content = <EmptyWorkspace title={view[0].toUpperCase() + view.slice(1)} detail="Loading observation data…" />;
-  else { switch (view) { case "messages": content = <MessagesWorkspace data={data as ObservationList<ObservedMessage>} />; break; case "memory": content = <MemoryWorkspace data={data as ObservationList<ObservedMemory>} refresh={refresh} />; break; case "emotion": content = <EmotionWorkspace data={data as ObserveEmotion} />; break; case "knowledge": content = <KnowledgeWorkspace data={data as ObservationList<ObservedKnowledge>} refresh={refresh} />; break; case "preferences": content = <PreferencesWorkspace data={data as ObservePreferences} refresh={refresh} />; break; case "episodes": content = <EpisodesWorkspace data={data as ObservationList<ObservedEpisode>} />; break; case "decisions": content = <DecisionsWorkspace data={data as ObservationList<ObservedDecision>} />; break; case "intentions": content = <IntentionsWorkspace data={data as ObservationList<ObservedIntention>} />; break; case "narratives": content = <NarrativesWorkspace data={data as ObservationList<ObservedNarrative>} refresh={refresh} />; break; case "self-model": content = <SelfModelWorkspace data={data as ObservationList<ObservedSelfModel>} refresh={refresh} />; break; case "world-model": content = <WorldModelWorkspace data={data as ObserveWorldModel} />; break; case "relationship": content = <RelationshipWorkspace data={data as ObserveRelationship} />; break; case "goals-needs": content = <GoalsNeedsWorkspace data={data as ObserveGoalsNeeds} />; break; case "stats": content = <StatsWorkspace data={data as ObserveStats} />; break; case "debug": content = <DebugWorkspace data={data as ObserveDebug} />; break; } }
+  else { switch (view) { case "messages": content = <MessagesWorkspace data={data as ObservationList<ObservedMessage>} onDeleted={onMessageDeleted} />; break; case "memory": content = <MemoryWorkspace data={data as ObservationList<ObservedMemory>} refresh={refresh} />; break; case "emotion": content = <EmotionWorkspace data={data as ObserveEmotion} />; break; case "knowledge": content = <KnowledgeWorkspace data={data as ObservationList<ObservedKnowledge>} refresh={refresh} />; break; case "preferences": content = <PreferencesWorkspace data={data as ObservePreferences} refresh={refresh} />; break; case "episodes": content = <EpisodesWorkspace data={data as ObservationList<ObservedEpisode>} />; break; case "decisions": content = <DecisionsWorkspace data={data as ObservationList<ObservedDecision>} />; break; case "intentions": content = <IntentionsWorkspace data={data as ObservationList<ObservedIntention>} />; break; case "narratives": content = <NarrativesWorkspace data={data as ObservationList<ObservedNarrative>} refresh={refresh} />; break; case "self-model": content = <SelfModelWorkspace data={data as ObservationList<ObservedSelfModel>} refresh={refresh} />; break; case "world-model": content = <WorldModelWorkspace data={data as ObserveWorldModel} />; break; case "relationship": content = <RelationshipWorkspace data={data as ObserveRelationship} />; break; case "goals-needs": content = <GoalsNeedsWorkspace data={data as ObserveGoalsNeeds} />; break; case "stats": content = <StatsWorkspace data={data as ObserveStats} />; break; case "debug": content = <DebugWorkspace data={data as ObserveDebug} />; break; } }
   return <div className="workspace-panel"><header className="workspace-topbar"><button className="navigation-toggle" type="button" onClick={onToggleSidebar} aria-label="Open navigation">Menu</button><span className="workspace-connection">{backendStatus === "connected" ? "Live backend" : "Backend status unavailable"}</span></header>{content}</div>;
 }
