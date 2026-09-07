@@ -202,7 +202,18 @@ fn env_value(v: &str) -> String {
             .replace('\n', "")
     )
 }
-fn draft_env(app: &AppHandle, d: &SetupDraft) -> Result<String, String> {
+fn preflight_persona_display_name<'a>(action: &str, d: &'a SetupDraft) -> &'a str {
+    if matches!(action, "database" | "llm") && d.persona_display_name.trim().is_empty() {
+        "MindCore Setup"
+    } else {
+        d.persona_display_name.trim()
+    }
+}
+fn draft_env_for_persona_name(
+    app: &AppHandle,
+    d: &SetupDraft,
+    persona_display_name: &str,
+) -> Result<String, String> {
     let identity = identity_path(app)?;
     let token = if d.preserve_database_auth_token {
         active_config_value(app, "DATABASE_AUTH_TOKEN")
@@ -237,7 +248,13 @@ fn draft_env(app: &AppHandle, d: &SetupDraft) -> Result<String, String> {
         groq.map(|value| format!("GROQ_API_KEY={}\n", env_value(&value)))
             .unwrap_or_default()
     );
-    Ok(format!("DATABASE_BACKEND=turso\nDATABASE_URL={}\nDATABASE_AUTH_TOKEN={}\nLLM_PROVIDER={}\nLLM_FALLBACK_PROVIDER=\n{}PERSONA_DISPLAY_NAME={}\nPERSONA_IDENTITY_PATH={}\n",env_value(d.database_url.trim()),env_value(&token),d.llm_provider,keys,env_value(d.persona_display_name.trim()),env_value(&identity.to_string_lossy())))
+    Ok(format!("DATABASE_BACKEND=turso\nDATABASE_URL={}\nDATABASE_AUTH_TOKEN={}\nLLM_PROVIDER={}\nLLM_FALLBACK_PROVIDER=\n{}PERSONA_DISPLAY_NAME={}\nPERSONA_IDENTITY_PATH={}\n",env_value(d.database_url.trim()),env_value(&token),d.llm_provider,keys,env_value(persona_display_name),env_value(&identity.to_string_lossy())))
+}
+fn draft_env(app: &AppHandle, d: &SetupDraft) -> Result<String, String> {
+    draft_env_for_persona_name(app, d, d.persona_display_name.trim())
+}
+fn preflight_draft_env(app: &AppHandle, action: &str, d: &SetupDraft) -> Result<String, String> {
+    draft_env_for_persona_name(app, d, preflight_persona_display_name(action, d))
 }
 fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
     let dir = path
@@ -296,7 +313,7 @@ fn setup_action(app: &AppHandle, action: &str, draft: &SetupDraft) -> Result<Str
         .parent()
         .ok_or_else(|| "Configuration directory is unavailable".to_string())?
         .join(format!(".mindcore-setup-{}.env", std::process::id()));
-    atomic_write(&staging, &draft_env(app, draft)?)?;
+    atomic_write(&staging, &preflight_draft_env(app, action, draft)?)?;
     let output = tauri::async_runtime::block_on(
         sidecar(app)?
             .args(["--setup-action", action, "--config"])
@@ -953,6 +970,23 @@ mod setup_validation_tests {
     }
 
     #[test]
+    fn database_and_llm_preflight_use_a_non_empty_staging_persona_name() {
+        let draft = database_step_draft();
+        assert_eq!(preflight_persona_display_name("database", &draft), "MindCore Setup");
+        assert_eq!(preflight_persona_display_name("llm", &draft), "MindCore Setup");
+        assert_eq!(preflight_persona_display_name("classify", &draft), "");
+        assert_eq!(preflight_persona_display_name("initialize", &draft), "");
+    }
+
+    #[test]
+    fn preflight_keeps_a_real_persona_name_unchanged() {
+        let mut draft = database_step_draft();
+        draft.persona_display_name = "Jarvis".into();
+        assert_eq!(preflight_persona_display_name("database", &draft), "Jarvis");
+        assert_eq!(preflight_persona_display_name("llm", &draft), "Jarvis");
+    }
+
+    #[test]
     fn initialize_still_requires_complete_draft() {
         assert!(validate_setup_action("initialize", &database_step_draft()).is_err());
     }
@@ -967,6 +1001,15 @@ mod setup_validation_tests {
     #[test]
     fn updater_enabled_build_keeps_updater_plugin_registration() {
         assert!(UPDATER_PLUGIN_ENABLED);
+    }
+
+    #[test]
+    fn classify_and_initialize_still_reject_an_empty_persona_name() {
+        let mut draft = database_step_draft();
+        draft.api_key = "test-provider-key".into();
+        draft.preserve_identity = true;
+        assert!(validate_setup_action("classify", &draft).is_err());
+        assert!(validate_setup_action("initialize", &draft).is_err());
     }
 
     #[test]
