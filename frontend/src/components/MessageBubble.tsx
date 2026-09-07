@@ -2,6 +2,7 @@
 
 import type { MessageRead, MessageRole } from "../types/api";
 import { formatKstDateTime, formatKstTime } from "../utils/datetime";
+import { PersonaAvatar } from "./PersonaAvatar";
 
 // role별 표시 이름. user/diana 외에 system/tool도 스펙에 있으므로 표시는 해준다.
 function roleLabel(role: MessageRole, personaDisplayName: string): string {
@@ -20,16 +21,29 @@ function roleLabel(role: MessageRole, personaDisplayName: string): string {
 interface MessageBubbleProps {
   message: MessageRead;
   personaDisplayName: string;
+  personaId: string | null;
+  personaAvatarExtension?: string | null;
+  personaAvatarRevision?: number;
   pending?: boolean; // 전송 중(낙관적 업데이트) 표시
   failed?: boolean; // 전송 실패 표시
 }
 
-export function MessageBubble({ message, personaDisplayName, pending, failed }: MessageBubbleProps) {
+export function MessageBubble({
+  message,
+  personaDisplayName,
+  personaId,
+  personaAvatarExtension,
+  personaAvatarRevision,
+  pending,
+  failed,
+}: MessageBubbleProps) {
   const isUser = message.role === "user";
+  const isPersonaMessage = message.role === "diana";
 
   return (
     <div className={`message-row ${isUser ? "message-row-user" : ""}`}>
-      {!isUser && <span className="message-avatar" aria-label={personaDisplayName}>●</span>}
+      {isPersonaMessage && <PersonaAvatar personaId={personaId} displayName={personaDisplayName} avatarExtension={personaAvatarExtension} revision={personaAvatarRevision} className="message-avatar" />}
+      {!isUser && !isPersonaMessage && <span className="message-avatar message-avatar-neutral" aria-label={roleLabel(message.role, personaDisplayName)}>●</span>}
       <div
         className={`message-bubble ${
           isUser ? "message-bubble-user" : "message-bubble-diana"

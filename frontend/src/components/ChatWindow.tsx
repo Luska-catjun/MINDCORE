@@ -179,6 +179,9 @@ export function ChatWindow({
             key={m.id}
             message={m}
             personaDisplayName={personaDisplayName}
+            personaId={personaId}
+            personaAvatarExtension={personaAvatarExtension}
+            personaAvatarRevision={personaAvatarRevision}
             pending={m._pending}
             failed={m._failed}
           />
