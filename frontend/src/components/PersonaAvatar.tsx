@@ -1,0 +1,48 @@
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+
+export const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
+
+type AvatarPayload = { mime_type: string; bytes: number[] };
+
+export async function avatarFileBytes(file: File): Promise<number[]> {
+  if (file.size === 0 || file.size > MAX_AVATAR_BYTES) {
+    throw new Error("Choose a PNG, JPEG, or WebP image under 2 MB.");
+  }
+  return Array.from(new Uint8Array(await file.arrayBuffer()));
+}
+
+export function PersonaAvatar({
+  personaId,
+  displayName,
+  avatarExtension,
+  className = "persona-avatar",
+}: {
+  personaId: string | null;
+  displayName: string;
+  avatarExtension?: string | null;
+  className?: string;
+}) {
+  const [src, setSrc] = useState<string | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    let objectUrl: string | null = null;
+    setSrc(null);
+    if (!personaId || !avatarExtension) return () => undefined;
+    void invoke<AvatarPayload | null>("read_persona_avatar", { personaId }).then((avatar) => {
+      if (disposed || !avatar) return;
+      objectUrl = URL.createObjectURL(new Blob([new Uint8Array(avatar.bytes)], { type: avatar.mime_type }));
+      setSrc(objectUrl);
+    }).catch(() => {
+      if (!disposed) setSrc(null);
+    });
+    return () => {
+      disposed = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [avatarExtension, personaId]);
+
+  if (src) return <img className={className} src={src} alt={`${displayName} avatar`} />;
+  return <span className={`${className} persona-avatar-fallback`} aria-label={`${displayName} avatar`}>{displayName.trim().slice(0, 1).toUpperCase() || "?"}</span>;
+}

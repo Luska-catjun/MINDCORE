@@ -3,8 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const personas = [
-  { persona_id: "persona-a", display_name: "Jarvis", created_at: 1, last_used_at: 1, active: true },
-  { persona_id: "persona-b", display_name: "Nova", created_at: 2, last_used_at: null, active: false },
+  { persona_id: "persona-a", display_name: "Jarvis", created_at: 1, last_used_at: 1, active: true, avatar_extension: "png" },
+  { persona_id: "persona-b", display_name: "Nova", created_at: 2, last_used_at: null, active: false, avatar_extension: null },
 ];
 const invoke = vi.hoisted(() => vi.fn());
 const apiMock = vi.hoisted(() => ({ health: vi.fn(), me: vi.fn(), listConversations: vi.fn(), createConversation: vi.fn(), listMessages: vi.fn(), login: vi.fn(), logout: vi.fn() }));

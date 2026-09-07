@@ -8,6 +8,7 @@ use std::{
 };
 
 pub const REGISTRY_VERSION: u32 = 1;
+pub const MAX_AVATAR_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PersonaProfile {
@@ -17,6 +18,8 @@ pub struct PersonaProfile {
     pub config_path: String,
     pub created_at: u64,
     pub last_used_at: Option<u64>,
+    #[serde(default)]
+    pub avatar_extension: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -33,6 +36,7 @@ pub struct PersonaSummary {
     pub created_at: u64,
     pub last_used_at: Option<u64>,
     pub active: bool,
+    pub avatar_extension: Option<String>,
 }
 
 pub fn now_epoch_seconds() -> u64 {
@@ -81,6 +85,54 @@ pub fn persona_directory(global_config: &Path, persona_id: &str) -> Result<PathB
         .ok_or_else(|| "MindCore configuration directory is unavailable.".to_string())?
         .join("personas")
         .join(persona_id))
+}
+
+fn avatar_extension_is_valid(extension: &str) -> bool {
+    matches!(extension, "png" | "jpg" | "webp")
+}
+
+fn avatar_format(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(("png", "image/png"))
+    } else if bytes.len() >= 3 && bytes[0..3] == [0xff, 0xd8, 0xff] {
+        Some(("jpg", "image/jpeg"))
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some(("webp", "image/webp"))
+    } else {
+        None
+    }
+}
+
+pub fn avatar_path(global_config: &Path, profile: &PersonaProfile) -> Result<Option<PathBuf>, String> {
+    let Some(extension) = profile.avatar_extension.as_deref() else {
+        return Ok(None);
+    };
+    if !avatar_extension_is_valid(extension) {
+        return Err("The Persona avatar metadata is invalid.".to_string());
+    }
+    Ok(Some(
+        persona_directory(global_config, &profile.persona_id)?.join(format!("avatar.{extension}")),
+    ))
+}
+
+pub fn read_avatar(
+    global_config: &Path,
+    profile: &PersonaProfile,
+) -> Result<Option<(String, Vec<u8>)>, String> {
+    let Some(path) = avatar_path(global_config, profile)? else {
+        return Ok(None);
+    };
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).map_err(|_| "Could not read the Persona avatar.".to_string())?;
+    let Some((extension, mime_type)) = avatar_format(&bytes) else {
+        return Err("The Persona avatar file is unsupported.".to_string());
+    };
+    if bytes.len() > MAX_AVATAR_BYTES || profile.avatar_extension.as_deref() != Some(extension) {
+        return Err("The Persona avatar file is invalid.".to_string());
+    }
+    Ok(Some((mime_type.to_string(), bytes)))
 }
 
 pub fn validate_display_name(name: &str) -> Result<String, String> {
@@ -154,6 +206,10 @@ pub fn profile_config_text(
 }
 
 pub fn secure_atomic_write(path: &Path, text: &str) -> Result<(), String> {
+    secure_atomic_write_bytes(path, text.as_bytes())
+}
+
+pub fn secure_atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let directory = path
         .parent()
         .ok_or_else(|| "Configuration directory is unavailable.".to_string())?;
@@ -170,7 +226,7 @@ pub fn secure_atomic_write(path: &Path, text: &str) -> Result<(), String> {
             .map_err(|_| "Could not protect MindCore configuration.".to_string())?;
     }
     temporary
-        .write_all(text.as_bytes())
+        .write_all(bytes)
         .and_then(|_| temporary.flush())
         .and_then(|_| temporary.as_file().sync_all())
         .map_err(|_| "Could not write MindCore configuration.".to_string())?;
@@ -178,6 +234,79 @@ pub fn secure_atomic_write(path: &Path, text: &str) -> Result<(), String> {
         .persist(path)
         .map(|_| ())
         .map_err(|_| "Could not finalize MindCore configuration.".to_string())
+}
+
+pub fn replace_avatar(
+    global_config: &Path,
+    profile: &mut PersonaProfile,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() > MAX_AVATAR_BYTES {
+        return Err("Choose a PNG, JPEG, or WebP image under 2 MB.".to_string());
+    }
+    let Some((extension, _mime_type)) = avatar_format(bytes) else {
+        return Err("Choose a valid PNG, JPEG, or WebP image.".to_string());
+    };
+    let previous_path = avatar_path(global_config, profile)?;
+    let directory = persona_directory(global_config, &profile.persona_id)?;
+    fs::create_dir_all(&directory)
+        .map_err(|_| "Could not create the Persona avatar directory.".to_string())?;
+    let target = directory.join(format!("avatar.{extension}"));
+    secure_atomic_write_bytes(&target, bytes)?;
+    profile.avatar_extension = Some(extension.to_string());
+    if let Some(previous_path) = previous_path.filter(|path| path != &target) {
+        if previous_path.is_file() {
+            fs::remove_file(previous_path)
+                .map_err(|_| "Could not replace the previous Persona avatar.".to_string())?;
+        }
+    }
+    Ok(())
+}
+
+pub fn remove_avatar(global_config: &Path, profile: &mut PersonaProfile) -> Result<(), String> {
+    let path = avatar_path(global_config, profile)?;
+    if let Some(path) = path {
+        let directory = persona_directory(global_config, &profile.persona_id)?;
+        if !path.starts_with(&directory) {
+            return Err("The Persona avatar is outside its managed directory.".to_string());
+        }
+        if path.is_file() {
+            fs::remove_file(path).map_err(|_| "Could not remove the Persona avatar.".to_string())?;
+        }
+    }
+    profile.avatar_extension = None;
+    Ok(())
+}
+
+pub fn cleanup_managed_persona_files(
+    global_config: &Path,
+    profile: &mut PersonaProfile,
+) -> Result<(), String> {
+    let managed = persona_directory(global_config, &profile.persona_id)?;
+    let config_path = PathBuf::from(&profile.config_path);
+    let identity_path = PathBuf::from(&profile.identity_path);
+    remove_avatar(global_config, profile)?;
+    if !config_path.starts_with(&managed) {
+        return Ok(());
+    }
+    if config_path.exists() {
+        fs::remove_file(&config_path).map_err(|_| {
+            "Persona was removed, but its managed configuration could not be cleaned up."
+                .to_string()
+        })?;
+    }
+    if identity_path.starts_with(&managed) && identity_path.exists() {
+        fs::remove_file(&identity_path).map_err(|_| {
+            "Persona was removed, but its managed identity could not be cleaned up.".to_string()
+        })?;
+    }
+    if managed.is_dir() {
+        fs::remove_dir(&managed).map_err(|_| {
+            "Persona was removed, but its non-empty profile directory was preserved."
+                .to_string()
+        })?;
+    }
+    Ok(())
 }
 
 pub fn load_registry(global_config: &Path) -> Result<Option<PersonaRegistry>, String> {
@@ -210,6 +339,13 @@ pub fn validate_registry(registry: &PersonaRegistry) -> Result<(), String> {
     for persona in &registry.personas {
         validate_display_name(&persona.display_name)?;
         validate_persona_id(&persona.persona_id)?;
+        if persona
+            .avatar_extension
+            .as_deref()
+            .is_some_and(|extension| !avatar_extension_is_valid(extension))
+        {
+            return Err("The Persona avatar metadata is invalid.".to_string());
+        }
         if !ids.insert(persona.persona_id.clone())
             || !names.insert(persona.display_name.to_lowercase())
         {
@@ -271,6 +407,7 @@ pub fn migrate_legacy_config(global_config: &Path) -> Result<Option<PersonaRegis
             config_path: config_path.to_string_lossy().into_owned(),
             created_at,
             last_used_at: Some(created_at),
+            avatar_extension: None,
         }],
     };
     save_registry(global_config, &registry)?;
@@ -295,6 +432,7 @@ pub fn summaries(registry: &PersonaRegistry) -> Vec<PersonaSummary> {
             created_at: persona.created_at,
             last_used_at: persona.last_used_at,
             active: persona.persona_id == registry.active_persona_id,
+            avatar_extension: persona.avatar_extension.clone(),
         })
         .collect()
 }
@@ -324,6 +462,7 @@ pub fn rename_persona(
         created_at: profile.created_at,
         last_used_at: profile.last_used_at,
         active: profile.persona_id == active_id,
+        avatar_extension: profile.avatar_extension.clone(),
     })
 }
 
@@ -344,6 +483,7 @@ pub fn activate_persona(
         created_at: profile.created_at,
         last_used_at: profile.last_used_at,
         active: true,
+        avatar_extension: profile.avatar_extension.clone(),
     })
 }
 
@@ -403,6 +543,36 @@ mod tests {
         path
     }
 
+    fn png_bytes(marker: u8) -> Vec<u8> {
+        [b"\x89PNG\r\n\x1a\n".as_slice(), &[marker]].concat()
+    }
+
+    fn jpeg_bytes(marker: u8) -> Vec<u8> {
+        [b"\xff\xd8\xff".as_slice(), &[marker]].concat()
+    }
+
+    fn webp_bytes(marker: u8) -> Vec<u8> {
+        [b"RIFF\0\0\0\0WEBP".as_slice(), &[marker]].concat()
+    }
+
+    fn managed_profile(root: &Path, persona_id: &str, display_name: &str) -> PersonaProfile {
+        let directory = persona_directory(&root.join("mindcore.env"), persona_id).expect("directory");
+        fs::create_dir_all(&directory).expect("managed directory");
+        let identity_path = directory.join("identity.txt");
+        let config_path = directory.join("persona.env");
+        fs::write(&identity_path, format!("identity-{persona_id}")).expect("identity");
+        fs::write(&config_path, format!("config-{persona_id}")).expect("config");
+        PersonaProfile {
+            persona_id: persona_id.into(),
+            display_name: display_name.into(),
+            identity_path: identity_path.to_string_lossy().into_owned(),
+            config_path: config_path.to_string_lossy().into_owned(),
+            created_at: 1,
+            last_used_at: None,
+            avatar_extension: None,
+        }
+    }
+
     #[test]
     fn legacy_migration_is_idempotent_and_preserves_external_paths() {
         let root = temporary_root("migration");
@@ -450,6 +620,7 @@ mod tests {
             config_path: "config".into(),
             created_at: 1,
             last_used_at: None,
+            avatar_extension: None,
         };
         let mut registry = PersonaRegistry {
             version: REGISTRY_VERSION,
@@ -464,6 +635,76 @@ mod tests {
         });
         assert!(validate_registry(&registry).is_err());
         assert!(persona_directory(Path::new("root/mindcore.env"), "../escape").is_err());
+    }
+
+    #[test]
+    fn legacy_registry_without_avatar_metadata_loads_with_fallback() {
+        let root = temporary_root("legacy-avatar");
+        let config = root.join("mindcore.env");
+        fs::write(
+            registry_path(&config).expect("registry path"),
+            r#"{"version":1,"active_persona_id":"persona-a","personas":[{"persona_id":"persona-a","display_name":"Jarvis","identity_path":"identity","config_path":"config","created_at":1,"last_used_at":null}]}"#,
+        )
+        .expect("legacy registry");
+
+        let registry = load_registry(&config).expect("load").expect("registry");
+        assert_eq!(registry.personas[0].avatar_extension, None);
+        assert_eq!(summaries(&registry)[0].avatar_extension, None);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn avatars_are_persona_isolated_persistent_and_cleaned_up() {
+        let root = temporary_root("avatars");
+        let config = root.join("mindcore.env");
+        let external_source = root.join("external-source.png");
+        let external_bytes = png_bytes(b'A');
+        fs::write(&external_source, &external_bytes).expect("external source");
+        let mut registry = PersonaRegistry {
+            version: REGISTRY_VERSION,
+            active_persona_id: "persona-a".into(),
+            personas: vec![
+                managed_profile(&root, "persona-a", "Jarvis"),
+                managed_profile(&root, "persona-b", "Nova"),
+            ],
+        };
+
+        replace_avatar(&config, &mut registry.personas[0], &external_bytes).expect("A avatar");
+        replace_avatar(&config, &mut registry.personas[1], &webp_bytes(b'B')).expect("B avatar");
+        assert_eq!(fs::read(&external_source).expect("source unchanged"), external_bytes);
+        assert_eq!(read_avatar(&config, &registry.personas[0]).expect("read A").unwrap().0, "image/png");
+        assert_eq!(read_avatar(&config, &registry.personas[1]).expect("read B").unwrap().0, "image/webp");
+        save_registry(&config, &registry).expect("save registry");
+
+        let mut restarted = load_registry(&config).expect("restart").expect("registry");
+        rename_persona(&mut restarted, "persona-a", "JARVIS-2").expect("rename");
+        assert_eq!(restarted.personas[0].avatar_extension.as_deref(), Some("png"));
+        let original_a = avatar_path(&config, &restarted.personas[0]).expect("path").expect("path");
+        replace_avatar(&config, &mut restarted.personas[0], &jpeg_bytes(b'C')).expect("replace A");
+        assert!(!original_a.exists());
+        assert_eq!(read_avatar(&config, &restarted.personas[0]).expect("read replacement").unwrap().0, "image/jpeg");
+        assert_eq!(read_avatar(&config, &restarted.personas[1]).expect("read B after A replacement").unwrap().0, "image/webp");
+
+        remove_avatar(&config, &mut restarted.personas[0]).expect("remove A");
+        assert_eq!(restarted.personas[0].avatar_extension, None);
+        assert_eq!(read_avatar(&config, &restarted.personas[0]).expect("fallback"), None);
+
+        cleanup_managed_persona_files(&config, &mut restarted.personas[1]).expect("delete B files");
+        assert!(!persona_directory(&config, "persona-b").expect("B directory").exists());
+        assert_eq!(fs::read(&external_source).expect("source still unchanged"), external_bytes);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn avatar_rejects_unsupported_and_oversize_input() {
+        let root = temporary_root("avatar-validation");
+        let config = root.join("mindcore.env");
+        let mut profile = managed_profile(&root, "persona-a", "Jarvis");
+        assert!(replace_avatar(&config, &mut profile, b"not-an-image").is_err());
+        let mut oversized = png_bytes(b'X');
+        oversized.resize(MAX_AVATAR_BYTES + 1, b'X');
+        assert!(replace_avatar(&config, &mut profile, &oversized).is_err());
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -510,6 +751,7 @@ mod tests {
                 .into(),
             created_at: 1,
             last_used_at: None,
+            avatar_extension: None,
         };
         let mut registry = PersonaRegistry {
             version: REGISTRY_VERSION,
