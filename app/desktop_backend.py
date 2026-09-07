@@ -23,6 +23,7 @@ RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1
 DESKTOP_SHUTDOWN_CAPABILITY_ENV = "MINDCORE_DESKTOP_SHUTDOWN_CAPABILITY"
 DESKTOP_SHUTDOWN_CAPABILITY_HEADER = "X-MindCore-Desktop-Shutdown"
 DESKTOP_INSTANCE_HEADER = "X-MindCore-Desktop-Instance"
+SETUP_DIAGNOSTIC_PREFIX = "MINDCORE_SETUP_DIAGNOSTIC"
 
 
 def _settings_from(config_path: str):
@@ -31,6 +32,37 @@ def _settings_from(config_path: str):
     os.environ["MINDCORE_ENV_FILE"] = config_path
     get_settings.cache_clear()
     return get_settings()
+
+
+def _setup_failure_diagnostic(action: str, config_path: str, error: Exception) -> str:
+    """Return only non-secret setup metadata for a desktop development terminal."""
+    try:
+        settings = _settings_from(config_path)
+        database_url = settings.database_url or ""
+        database_url_present = bool(database_url)
+        database_url_scheme = database_url.split(":", 1)[0].lower() if "://" in database_url else "invalid"
+        database_token_present = bool(settings.database_auth_token)
+    except Exception:
+        database_url_present = False
+        database_url_scheme = "unavailable"
+        database_token_present = False
+
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        category = "connection"
+    elif isinstance(error, OSError):
+        category = "native_or_network"
+    elif isinstance(error, ValueError):
+        category = "driver_or_configuration"
+    else:
+        category = "setup"
+    error_class = "".join(character for character in type(error).__name__ if character.isalnum() or character in "._")
+    return (
+        f"{SETUP_DIAGNOSTIC_PREFIX} action={action} category={category} "
+        f"exception_class={error_class or 'Unknown'} "
+        f"database_url_present={str(database_url_present).lower()} "
+        f"database_token_present={str(database_token_present).lower()} "
+        f"database_url_scheme={database_url_scheme}"
+    )
 
 
 def _parent_process_is_alive(pid: int) -> bool:
@@ -215,8 +247,9 @@ def main() -> None:
             raise SystemExit("setup config is required")
         try:
             print(asyncio.run(_setup_action(args.setup_action, args.config)))
-        except Exception:
+        except Exception as error:
             # Setup UI intentionally receives a safe generic failure only.
+            print(_setup_failure_diagnostic(args.setup_action, args.config, error), file=sys.stderr)
             print("SETUP_ERROR", file=sys.stderr)
             raise SystemExit(1)
         return

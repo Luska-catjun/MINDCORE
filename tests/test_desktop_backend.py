@@ -13,10 +13,12 @@ from app.config import Settings, get_settings
 from app.desktop_backend import (
     DESKTOP_INSTANCE_HEADER,
     DESKTOP_SHUTDOWN_CAPABILITY_HEADER,
+    SETUP_DIAGNOSTIC_PREFIX,
     _desktop_session_token,
     _ensure_desktop_auth_config,
     _parent_process_is_alive,
     _register_desktop_shutdown_route,
+    _setup_failure_diagnostic,
     _stop_when_parent_exits,
 )
 from app.main import create_app
@@ -52,6 +54,31 @@ class DesktopBackendTests(TestCase):
             _stop_when_parent_exits(server, 999_999, poll_interval=0)
 
         self.assertTrue(server.should_exit)
+
+    def test_setup_failure_diagnostic_is_secret_safe_and_describes_database_inputs(self) -> None:
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "mindcore.env"
+            database_url = "libsql://diagnostic.example.turso.io"
+            database_token = "diagnostic-token-must-not-appear"
+            config.write_text(
+                f"DATABASE_URL={database_url}\nDATABASE_AUTH_TOKEN={database_token}\n",
+                encoding="utf-8",
+            )
+
+            diagnostic = _setup_failure_diagnostic(
+                "database",
+                str(config),
+                ValueError(f"driver rejected {database_url} {database_token}"),
+            )
+
+        self.assertEqual(
+            diagnostic,
+            f"{SETUP_DIAGNOSTIC_PREFIX} action=database category=driver_or_configuration "
+            "exception_class=ValueError database_url_present=true "
+            "database_token_present=true database_url_scheme=libsql",
+        )
+        self.assertNotIn(database_url, diagnostic)
+        self.assertNotIn(database_token, diagnostic)
 
     def _shutdown_client(self):
         settings = Settings(
