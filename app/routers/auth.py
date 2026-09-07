@@ -66,19 +66,29 @@ def is_valid_session_token(settings: Settings, candidate: str) -> bool:
 
 
 def request_credential(request: Request) -> tuple[str, str]:
+    """Return the first supplied credential for compatibility with callers."""
+    return next(iter(request_credentials(request)), ("", "none"))
+
+
+def request_credentials(request: Request) -> tuple[tuple[str, str], ...]:
     cookie = request.cookies.get(SESSION_COOKIE_NAME, "")
-    if cookie:
-        return cookie, "cookie"
     authorization = request.headers.get("authorization", "")
     scheme, _, value = authorization.partition(" ")
+    credentials: list[tuple[str, str]] = []
+    if cookie:
+        credentials.append((cookie, "cookie"))
     if scheme.lower() == "bearer" and value:
-        return value, "bearer"
-    return "", "none"
+        credentials.append((value, "bearer"))
+    return tuple(credentials)
 
 
 def request_is_authenticated(settings: Settings, request: Request) -> tuple[bool, str]:
-    credential, source = request_credential(request)
-    return is_valid_session_token(settings, credential), source
+    fallback_source = "none"
+    for credential, source in request_credentials(request):
+        fallback_source = source
+        if is_valid_session_token(settings, credential):
+            return True, source
+    return False, fallback_source
 
 
 def require_auth_settings(settings: Settings) -> None:
