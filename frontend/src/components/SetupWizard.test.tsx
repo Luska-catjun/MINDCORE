@@ -135,8 +135,8 @@ describe("SetupWizard validation", () => {
           llm_provider: "gemini",
           persona_display_name: "Diana",
           turso_token_configured: true,
-          gemini_key_configured: true,
-          groq_key_configured: false,
+          provider_models: { gemini: "gemini-custom", groq: "groq-custom", anthropic: "claude-custom", xai: "grok-custom", openai: "gpt-custom" },
+          provider_key_configured: { gemini: true, groq: false, anthropic: false, xai: false, openai: false },
         });
       }
       return Promise.resolve("Connected");
@@ -149,5 +149,47 @@ describe("SetupWizard validation", () => {
     await userEvent.click(continueButton());
     expect((screen.getByPlaceholderText("Configured — leave blank to keep") as HTMLInputElement).value).toBe("");
     expectContinueEnabled();
+  });
+
+  it("renders five providers with a separate editable model field", async () => {
+    await enterDatabase();
+    await validateDatabase();
+    await userEvent.click(continueButton());
+    for (const label of ["Gemini", "Groq", "Claude", "Grok", "OpenAI (GPT)"]) expect(screen.getByLabelText(label)).toBeTruthy();
+    expect((screen.getByLabelText("Model") as HTMLInputElement).value).toBe("gemini-3.5-flash-lite");
+  });
+
+  it("preserves provider-specific model and key drafts and preflights the exact selection", async () => {
+    await enterDatabase();
+    await validateDatabase();
+    await userEvent.click(continueButton());
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gemini-custom" } });
+    fireEvent.change(screen.getByPlaceholderText("Gemini API Key"), { target: { value: "gemini-key" } });
+    fireEvent.click(screen.getByLabelText("OpenAI (GPT)"));
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-custom" } });
+    fireEvent.change(screen.getByPlaceholderText("OpenAI (GPT) API Key"), { target: { value: "openai-key" } });
+    await userEvent.click(screen.getByRole("button", { name: "Test Connection" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("run_setup_action", {
+      action: "llm",
+      draft: expect.objectContaining({ llm_provider: "openai", llm_model: "gpt-custom", api_key: "openai-key" }),
+    }));
+    fireEvent.click(screen.getByLabelText("Gemini"));
+    expect((screen.getByLabelText("Model") as HTMLInputElement).value).toBe("gemini-custom");
+    expect((screen.getByPlaceholderText("Gemini API Key") as HTMLInputElement).value).toBe("gemini-key");
+  });
+
+  it("loads the selected provider model during reconfigure without returning its key", async () => {
+    invoke.mockImplementation((name: string) => name === "get_config_metadata" ? Promise.resolve({
+      database_url: "libsql://existing", llm_provider: "anthropic", persona_display_name: "Jarvis", turso_token_configured: true,
+      provider_models: { gemini: "gemini-custom", groq: "groq-custom", anthropic: "claude-custom", xai: "grok-custom", openai: "gpt-custom" },
+      provider_key_configured: { gemini: true, groq: true, anthropic: true, xai: false, openai: false },
+    }) : Promise.resolve("Connected"));
+    render(<SetupWizard onComplete={vi.fn()} reconfigure />);
+    await userEvent.click(screen.getByRole("button", { name: "Edit configuration" }));
+    await waitFor(() => expect((databaseUrl() as HTMLInputElement).value).toBe("libsql://existing"));
+    await userEvent.click(continueButton());
+    expect((screen.getByLabelText("Claude") as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText("Model") as HTMLInputElement).value).toBe("claude-custom");
+    expect((screen.getByPlaceholderText("Configured — leave blank to keep") as HTMLInputElement).value).toBe("");
   });
 });

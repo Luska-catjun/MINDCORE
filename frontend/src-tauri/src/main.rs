@@ -7,6 +7,7 @@ use persona_registry::{PersonaProfile, PersonaRegistry, PersonaSummary};
 use serde::{Deserialize, Serialize};
 use sidecar_lifecycle::{SidecarLifecycle, StartDecision, StopDecision};
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
@@ -29,6 +30,7 @@ const SHUTDOWN_CAPABILITY_HEADER: &str = "X-MindCore-Desktop-Shutdown";
 const DESKTOP_INSTANCE_HEADER: &str = "X-MindCore-Desktop-Instance";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const LLM_PROVIDERS: [&str; 5] = ["gemini", "groq", "anthropic", "xai", "openai"];
 struct Sidecar {
     lifecycle: Arc<Mutex<SidecarLifecycle<CommandChild>>>,
 }
@@ -50,15 +52,22 @@ struct ConfigMetadata {
     llm_provider: String,
     persona_display_name: String,
     turso_token_configured: bool,
-    gemini_key_configured: bool,
-    groq_key_configured: bool,
+    provider_models: BTreeMap<String, String>,
+    provider_key_configured: BTreeMap<String, bool>,
 }
 #[derive(Deserialize)]
 struct SetupDraft {
     database_url: String,
     database_auth_token: String,
     llm_provider: String,
+    llm_model: String,
     api_key: String,
+    #[serde(default)]
+    provider_models: BTreeMap<String, String>,
+    #[serde(default)]
+    provider_api_keys: BTreeMap<String, String>,
+    #[serde(default)]
+    provider_preserve_keys: BTreeMap<String, bool>,
     persona_display_name: String,
     #[serde(default)]
     preserve_database_auth_token: bool,
@@ -173,12 +182,73 @@ fn validate_database_draft(d: &SetupDraft) -> Result<(), String> {
     Ok(())
 }
 fn validate_llm_draft(d: &SetupDraft) -> Result<(), String> {
-    if !matches!(d.llm_provider.as_str(), "gemini" | "groq") {
-        return Err("Choose Gemini or Groq.".into());
+    if !LLM_PROVIDERS.contains(&d.llm_provider.as_str()) {
+        return Err("Choose a supported language model provider.".into());
+    }
+    let model = d.llm_model.trim();
+    if model.is_empty() || model.chars().count() > 200 || model.chars().any(char::is_control) {
+        return Err("Enter a valid model ID of up to 200 characters.".into());
+    }
+    for (provider, model) in &d.provider_models {
+        if !LLM_PROVIDERS.contains(&provider.as_str())
+            || model.trim().is_empty()
+            || model.chars().count() > 200
+            || model.chars().any(char::is_control)
+        {
+            return Err("Provider model configuration is invalid.".into());
+        }
     }
     if !d.preserve_api_key && d.api_key.trim().is_empty() {
         return Err("Complete all required language model fields.".into());
     }
+    Ok(())
+}
+fn provider_key_name(provider: &str) -> Result<&'static str, String> {
+    match provider {
+        "gemini" => Ok("GEMINI_API_KEY"),
+        "groq" => Ok("GROQ_API_KEY"),
+        "anthropic" => Ok("ANTHROPIC_API_KEY"),
+        "xai" => Ok("XAI_API_KEY"),
+        "openai" => Ok("OPENAI_API_KEY"),
+        _ => Err("Unsupported language model provider.".into()),
+    }
+}
+fn provider_model_name(provider: &str) -> Result<&'static str, String> {
+    match provider {
+        "gemini" => Ok("GEMINI_MODEL"),
+        "groq" => Ok("GROQ_MODEL"),
+        "anthropic" => Ok("ANTHROPIC_MODEL"),
+        "xai" => Ok("XAI_MODEL"),
+        "openai" => Ok("OPENAI_MODEL"),
+        _ => Err("Unsupported language model provider.".into()),
+    }
+}
+fn default_provider_model(provider: &str) -> Result<&'static str, String> {
+    match provider {
+        "gemini" => Ok("gemini-3.5-flash-lite"),
+        "groq" => Ok("qwen/qwen3.6-27b"),
+        "anthropic" => Ok("claude-sonnet-5"),
+        "xai" => Ok("grok-4.6"),
+        "openai" => Ok("gpt-5.6-luna"),
+        _ => Err("Unsupported language model provider.".into()),
+    }
+}
+fn update_provider_config_values(
+    values: &mut BTreeMap<String, String>,
+    provider: &str,
+    model: &str,
+    api_key: String,
+) -> Result<(), String> {
+    for candidate in LLM_PROVIDERS {
+        let model_name = provider_model_name(candidate)?;
+        values
+            .entry(model_name.to_string())
+            .or_insert(default_provider_model(candidate)?.to_string());
+    }
+    values.insert("LLM_PROVIDER".into(), provider.into());
+    values.entry("LLM_FALLBACK_PROVIDER".into()).or_default();
+    values.insert(provider_key_name(provider)?.into(), api_key);
+    values.insert(provider_model_name(provider)?.into(), model.trim().into());
     Ok(())
 }
 fn validate_draft(d: &SetupDraft) -> Result<(), String> {
@@ -218,6 +288,10 @@ fn draft_env_for_persona_name(
     persona_display_name: &str,
 ) -> Result<String, String> {
     let identity = identity_path(app)?;
+    let mut values = fs::read_to_string(config_path(app)?)
+        .ok()
+        .map(|text| persona_registry::parse_env(&text))
+        .unwrap_or_default();
     let token = if d.preserve_database_auth_token {
         active_config_value(app, "DATABASE_AUTH_TOKEN")
             .or_else(|| existing_secret(app, "DATABASE_AUTH_TOKEN"))
@@ -225,39 +299,50 @@ fn draft_env_for_persona_name(
     } else {
         d.database_auth_token.trim().to_string()
     };
-    let active_key = if d.llm_provider == "gemini" {
-        "GEMINI_API_KEY"
-    } else {
-        "GROQ_API_KEY"
-    };
+    let active_key = provider_key_name(&d.llm_provider)?;
     let api_key = if d.preserve_api_key {
-        existing_secret(app, active_key)
+        values.get(active_key).filter(|value| !value.is_empty()).cloned()
             .ok_or_else(|| "Stored provider key is unavailable.".to_string())?
     } else {
         d.api_key.trim().to_string()
     };
-    let mut gemini = existing_secret(app, "GEMINI_API_KEY");
-    let mut groq = existing_secret(app, "GROQ_API_KEY");
-    if active_key == "GEMINI_API_KEY" {
-        gemini = Some(api_key)
-    } else {
-        groq = Some(api_key)
-    };
-    let keys = format!(
-        "{}{}",
-        gemini
-            .map(|value| format!("GEMINI_API_KEY={}\n", env_value(&value)))
-            .unwrap_or_default(),
-        groq.map(|value| format!("GROQ_API_KEY={}\n", env_value(&value)))
-            .unwrap_or_default()
-    );
-    Ok(format!("DATABASE_BACKEND=turso\nDATABASE_URL={}\nDATABASE_AUTH_TOKEN={}\nLLM_PROVIDER={}\nLLM_FALLBACK_PROVIDER=\n{}PERSONA_DISPLAY_NAME={}\nPERSONA_IDENTITY_PATH={}\n",env_value(d.database_url.trim()),env_value(&token),d.llm_provider,keys,env_value(persona_display_name),env_value(&identity.to_string_lossy())))
+    values.insert("DATABASE_BACKEND".into(), "turso".into());
+    values.insert("DATABASE_URL".into(), d.database_url.trim().into());
+    values.insert("DATABASE_AUTH_TOKEN".into(), token);
+    update_provider_config_values(&mut values, &d.llm_provider, &d.llm_model, api_key)?;
+    for provider in LLM_PROVIDERS {
+        if let Some(model) = d.provider_models.get(provider) {
+            values.insert(provider_model_name(provider)?.into(), model.trim().into());
+        }
+        if let Some(key) = d.provider_api_keys.get(provider).filter(|key| !key.trim().is_empty()) {
+            values.insert(provider_key_name(provider)?.into(), key.trim().into());
+        } else if d.provider_preserve_keys.get(provider).copied().unwrap_or(false)
+            && !values.contains_key(provider_key_name(provider)?)
+        {
+            return Err("Stored provider key is unavailable.".into());
+        }
+    }
+    values.insert("PERSONA_DISPLAY_NAME".into(), persona_display_name.into());
+    values.insert("PERSONA_IDENTITY_PATH".into(), identity.to_string_lossy().into_owned());
+    Ok(render_env_values(values))
+}
+fn render_env_values(values: BTreeMap<String, String>) -> String {
+    values
+        .into_iter()
+        .map(|(key, value)| format!("{key}={}\n", env_value(&value)))
+        .collect()
+}
+fn disable_preflight_fallback(text: &str) -> String {
+    let mut values = persona_registry::parse_env(text);
+    values.insert("LLM_FALLBACK_PROVIDER".into(), String::new());
+    render_env_values(values)
 }
 fn draft_env(app: &AppHandle, d: &SetupDraft) -> Result<String, String> {
     draft_env_for_persona_name(app, d, d.persona_display_name.trim())
 }
 fn preflight_draft_env(app: &AppHandle, action: &str, d: &SetupDraft) -> Result<String, String> {
     draft_env_for_persona_name(app, d, preflight_persona_display_name(action, d))
+        .map(|text| disable_preflight_fallback(&text))
 }
 fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
     let dir = path
@@ -829,6 +914,20 @@ fn get_config_metadata(app: AppHandle) -> Result<ConfigMetadata, String> {
         .map_err(|_| "MindCore configuration is unavailable.".to_string())?;
     let profile = active_profile(&app)?;
     let profile_values = persona_registry::profile_overrides(&profile)?;
+    let mut provider_models = BTreeMap::new();
+    let mut provider_key_configured = BTreeMap::new();
+    for provider in LLM_PROVIDERS {
+        let model_name = provider_model_name(provider)?;
+        provider_models.insert(
+            provider.to_string(),
+            env_value_from(&text, model_name)
+                .unwrap_or_else(|| default_provider_model(provider).unwrap_or_default().to_string()),
+        );
+        provider_key_configured.insert(
+            provider.to_string(),
+            existing_secret(&app, provider_key_name(provider)?).is_some(),
+        );
+    }
     Ok(ConfigMetadata {
         database_url: profile_values
             .get("DATABASE_URL")
@@ -839,8 +938,8 @@ fn get_config_metadata(app: AppHandle) -> Result<ConfigMetadata, String> {
         turso_token_configured: profile_values
             .get("DATABASE_AUTH_TOKEN")
             .is_some_and(|value| !value.is_empty()),
-        gemini_key_configured: existing_secret(&app, "GEMINI_API_KEY").is_some(),
-        groq_key_configured: existing_secret(&app, "GROQ_API_KEY").is_some(),
+        provider_models,
+        provider_key_configured,
     })
 }
 #[tauri::command]
@@ -1001,7 +1100,11 @@ mod setup_validation_tests {
             database_url: "libsql://example.turso.io".into(),
             database_auth_token: "test-token".into(),
             llm_provider: "gemini".into(),
+            llm_model: "gemini-3.5-flash-lite".into(),
             api_key: String::new(),
+            provider_models: BTreeMap::new(),
+            provider_api_keys: BTreeMap::new(),
+            provider_preserve_keys: BTreeMap::new(),
             persona_display_name: String::new(),
             preserve_database_auth_token: false,
             preserve_api_key: false,
@@ -1034,6 +1137,61 @@ mod setup_validation_tests {
     #[test]
     fn initialize_still_requires_complete_draft() {
         assert!(validate_setup_action("initialize", &database_step_draft()).is_err());
+    }
+
+    #[test]
+    fn all_provider_ids_accept_arbitrary_valid_models_but_not_model_ids_as_provider() {
+        for provider in LLM_PROVIDERS {
+            let mut draft = database_step_draft();
+            draft.llm_provider = provider.into();
+            draft.llm_model = format!("{provider}-future-custom-model");
+            draft.api_key = "test-provider-key".into();
+            assert!(validate_setup_action("llm", &draft).is_ok(), "{provider}");
+        }
+        let mut invalid = database_step_draft();
+        invalid.llm_provider = "gemini-2.5-pro".into();
+        invalid.api_key = "test-provider-key".into();
+        assert!(validate_setup_action("llm", &invalid).is_err());
+        invalid.llm_provider = "gemini".into();
+        invalid.llm_model = "bad\nmodel".into();
+        assert!(validate_setup_action("llm", &invalid).is_err());
+    }
+
+    #[test]
+    fn desktop_provider_defaults_match_backend_contract() {
+        assert_eq!(default_provider_model("gemini").unwrap(), "gemini-3.5-flash-lite");
+        assert_eq!(default_provider_model("groq").unwrap(), "qwen/qwen3.6-27b");
+        assert_eq!(default_provider_model("anthropic").unwrap(), "claude-sonnet-5");
+        assert_eq!(default_provider_model("xai").unwrap(), "grok-4.6");
+        assert_eq!(default_provider_model("openai").unwrap(), "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn provider_save_preserves_unrelated_provider_settings() {
+        let mut values = BTreeMap::from([
+            ("GROQ_API_KEY".into(), "existing-groq-key".into()),
+            ("GROQ_MODEL".into(), "groq-custom".into()),
+            ("XAI_API_BASE_URL".into(), "https://custom.xai.test/v1".into()),
+            ("AUTH_SIGNING_SECRET".into(), "existing-auth-secret".into()),
+        ]);
+        update_provider_config_values(&mut values, "openai", "gpt-custom", "new-openai-key".into()).unwrap();
+        assert_eq!(values.get("LLM_PROVIDER").map(String::as_str), Some("openai"));
+        assert_eq!(values.get("OPENAI_MODEL").map(String::as_str), Some("gpt-custom"));
+        assert_eq!(values.get("GROQ_MODEL").map(String::as_str), Some("groq-custom"));
+        assert_eq!(values.get("GROQ_API_KEY").map(String::as_str), Some("existing-groq-key"));
+        assert_eq!(values.get("XAI_API_BASE_URL").map(String::as_str), Some("https://custom.xai.test/v1"));
+        assert_eq!(values.get("AUTH_SIGNING_SECRET").map(String::as_str), Some("existing-auth-secret"));
+    }
+
+    #[test]
+    fn provider_preflight_cannot_succeed_through_a_configured_fallback() {
+        let staged = disable_preflight_fallback(
+            "LLM_PROVIDER=\"openai\"\nLLM_FALLBACK_PROVIDER=\"gemini\"\nOPENAI_MODEL=\"gpt-custom\"\n",
+        );
+        let values = persona_registry::parse_env(&staged);
+        assert_eq!(values.get("LLM_PROVIDER").map(String::as_str), Some("openai"));
+        assert_eq!(values.get("OPENAI_MODEL").map(String::as_str), Some("gpt-custom"));
+        assert_eq!(values.get("LLM_FALLBACK_PROVIDER").map(String::as_str), Some(""));
     }
 
     #[test]

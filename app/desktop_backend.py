@@ -36,18 +36,26 @@ def _settings_from(config_path: str):
 
 def _setup_failure_diagnostic(action: str, config_path: str, error: Exception) -> str:
     """Return only non-secret setup metadata for a desktop development terminal."""
+    llm_provider = "unavailable"
+    llm_key_present = False
     try:
         settings = _settings_from(config_path)
         database_url = settings.database_url or ""
         database_url_present = bool(database_url)
         database_url_scheme = database_url.split(":", 1)[0].lower() if "://" in database_url else "invalid"
         database_token_present = bool(settings.database_auth_token)
+        llm_provider = settings.llm_provider
+        llm_key_present = bool(getattr(settings, f"{llm_provider}_api_key", None))
     except Exception:
         database_url_present = False
         database_url_scheme = "unavailable"
         database_token_present = False
 
-    if isinstance(error, (TimeoutError, ConnectionError)):
+    from app.services.llm_errors import LLMError
+
+    if isinstance(error, LLMError):
+        category = error.category
+    elif isinstance(error, (TimeoutError, ConnectionError)):
         category = "connection"
     elif isinstance(error, OSError):
         category = "native_or_network"
@@ -61,7 +69,8 @@ def _setup_failure_diagnostic(action: str, config_path: str, error: Exception) -
         f"exception_class={error_class or 'Unknown'} "
         f"database_url_present={str(database_url_present).lower()} "
         f"database_token_present={str(database_token_present).lower()} "
-        f"database_url_scheme={database_url_scheme}"
+        f"database_url_scheme={database_url_scheme} "
+        f"llm_provider={llm_provider} llm_key_present={str(llm_key_present).lower()}"
     )
 
 

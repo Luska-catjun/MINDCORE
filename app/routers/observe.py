@@ -539,17 +539,16 @@ async def observe_intentions(limit: int = Query(default=50, ge=1, le=100), pool:
 @router.get("/debug")
 async def observe_debug(request: Request) -> dict[str, Any]:
     settings: Settings = request.app.state.settings
+    from app.services.llm import provider_model
+
     diagnostics = snapshot()
     attention = get_last_attention_snapshot()
     return {
         "app_env": settings.environment,
         "primary_llm_provider": settings.llm_provider,
         "fallback_provider": settings.llm_fallback_provider,
-        "active_model": settings.groq_model if settings.llm_provider.lower() == "groq" else settings.gemini_model,
-        "fallback_model": (
-            settings.groq_model if settings.llm_fallback_provider == "groq"
-            else settings.gemini_model if settings.llm_fallback_provider == "gemini" else None
-        ),
+        "active_model": provider_model(settings, settings.llm_provider),
+        "fallback_model": provider_model(settings, settings.llm_fallback_provider) if settings.llm_fallback_provider else None,
         "diana_timezone": settings.diana_timezone,
         "identity_prompt_chars": len(request.app.state.diana_identity_prompt),
         "attention": {

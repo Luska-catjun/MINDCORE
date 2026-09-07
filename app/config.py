@@ -56,6 +56,21 @@ class Settings(BaseSettings):
     groq_api_base_url: str = "https://api.groq.com/openai/v1"
     groq_timeout_seconds: float = Field(default=45.0, gt=0)
     groq_max_retries: int = Field(default=2, ge=0, le=5)
+    anthropic_api_key: str | None = None
+    anthropic_model: str = "claude-sonnet-5"
+    anthropic_api_base_url: str = "https://api.anthropic.com/v1"
+    anthropic_timeout_seconds: float = Field(default=45.0, gt=0)
+    anthropic_max_retries: int = Field(default=1, ge=0, le=5)
+    xai_api_key: str | None = None
+    xai_model: str = "grok-4.6"
+    xai_api_base_url: str = "https://api.x.ai/v1"
+    xai_timeout_seconds: float = Field(default=45.0, gt=0)
+    xai_max_retries: int = Field(default=1, ge=0, le=5)
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-5.6-luna"
+    openai_api_base_url: str = "https://api.openai.com/v1"
+    openai_timeout_seconds: float = Field(default=45.0, gt=0)
+    openai_max_retries: int = Field(default=1, ge=0, le=5)
     cors_origins: List[str] = [
         "http://localhost:3000",
         "http://localhost:5173",
@@ -77,6 +92,38 @@ class Settings(BaseSettings):
         normalized = value.lower()
         if normalized not in {"minimal", "low", "medium", "high"}:
             raise ValueError("GEMINI_THINKING_LEVEL must be minimal, low, medium, or high.")
+        return normalized
+
+    @field_validator("llm_provider")
+    @classmethod
+    def validate_llm_provider(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"gemini", "groq", "anthropic", "xai", "openai"}:
+            raise ValueError("LLM_PROVIDER must be gemini, groq, anthropic, xai, or openai.")
+        return normalized
+
+    @field_validator("llm_fallback_provider", mode="before")
+    @classmethod
+    def validate_llm_fallback_provider(cls, value: object) -> str | None:
+        if value is None or not str(value).strip():
+            return None
+        normalized = str(value).strip().lower()
+        if normalized not in {"gemini", "groq", "anthropic", "xai", "openai"}:
+            raise ValueError("LLM_FALLBACK_PROVIDER must name a supported provider.")
+        return normalized
+
+    @field_validator(
+        "gemini_model",
+        "groq_model",
+        "anthropic_model",
+        "xai_model",
+        "openai_model",
+    )
+    @classmethod
+    def validate_model_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or len(normalized) > 200 or any(ord(char) < 32 or ord(char) == 127 for char in normalized):
+            raise ValueError("Provider model IDs must be 1-200 characters without control characters.")
         return normalized
 
     @field_validator("diana_timezone")

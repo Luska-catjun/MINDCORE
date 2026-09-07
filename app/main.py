@@ -52,10 +52,17 @@ def build_lifespan(
         configured_providers = {settings.llm_provider.lower()}
         if settings.llm_fallback_provider:
             configured_providers.add(settings.llm_fallback_provider.lower())
-        if "groq" in configured_providers and not settings.groq_api_key:
-            missing.append("GROQ_API_KEY")
-        if "gemini" in configured_providers and not settings.gemini_api_key:
-            missing.append("GEMINI_API_KEY")
+        provider_keys = {
+            "gemini": ("GEMINI_API_KEY", settings.gemini_api_key),
+            "groq": ("GROQ_API_KEY", settings.groq_api_key),
+            "anthropic": ("ANTHROPIC_API_KEY", settings.anthropic_api_key),
+            "xai": ("XAI_API_KEY", settings.xai_api_key),
+            "openai": ("OPENAI_API_KEY", settings.openai_api_key),
+        }
+        for provider in configured_providers:
+            setting = provider_keys.get(provider)
+            if setting and not setting[1]:
+                missing.append(setting[0])
         if missing:
             raise RuntimeError(f"Missing required production settings: {', '.join(missing)}")
     app.state.settings = settings
