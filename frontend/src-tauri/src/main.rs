@@ -260,6 +260,35 @@ fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
     }
     fs::rename(tmp, path).map_err(|_| "Could not finalize MindCore configuration.".to_string())
 }
+#[cfg(debug_assertions)]
+fn print_setup_failure_diagnostic(action: &str, exit_code: Option<i32>, stderr: &[u8]) {
+    // The sidecar emits this line from a fixed, secret-free formatter. Do not
+    // print arbitrary stderr: driver errors can echo a URL or other input.
+    let stderr = String::from_utf8_lossy(stderr);
+    let diagnostic = stderr
+        .lines()
+        .find(|line| line.starts_with("MINDCORE_SETUP_DIAGNOSTIC "));
+    if let Some(diagnostic) = diagnostic {
+        eprintln!(
+            "[MINDCORE_SETUP_DIAGNOSTIC] action={} sidecar_exit_code={} {}",
+            action,
+            exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+            diagnostic
+                .strip_prefix("MINDCORE_SETUP_DIAGNOSTIC ")
+                .unwrap_or_default(),
+        );
+    } else {
+        eprintln!(
+            "[MINDCORE_SETUP_DIAGNOSTIC] action={} sidecar_exit_code={} diagnostic=unavailable",
+            action,
+            exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_string()),
+        );
+    }
+}
 fn setup_action(app: &AppHandle, action: &str, draft: &SetupDraft) -> Result<String, String> {
     validate_setup_action(action, draft)?;
     let config = config_path(app)?;
@@ -280,6 +309,8 @@ fn setup_action(app: &AppHandle, action: &str, draft: &SetupDraft) -> Result<Str
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
+        #[cfg(debug_assertions)]
+        print_setup_failure_diagnostic(action, output.status.code(), &output.stderr);
         Err("Setup validation failed. Check the values and try again.".into())
     }
 }
