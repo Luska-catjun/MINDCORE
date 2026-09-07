@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 import stat
 from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -20,6 +21,7 @@ from app.desktop_backend import (
     _parent_process_is_alive,
     _register_desktop_shutdown_route,
     _setup_failure_diagnostic,
+    _setup_action,
     _stop_when_parent_exits,
 )
 from app.main import create_app
@@ -77,7 +79,8 @@ class DesktopBackendTests(TestCase):
             f"{SETUP_DIAGNOSTIC_PREFIX} action=database category=driver_or_configuration "
             "exception_class=ValueError database_url_present=true "
             "database_token_present=true database_url_scheme=libsql "
-            "llm_provider=gemini llm_key_present=false",
+            "llm_provider=gemini llm_key_present=false "
+            "validation_field=unavailable validation_type=unavailable",
         )
         self.assertNotIn(database_url, diagnostic)
         self.assertNotIn(database_token, diagnostic)
@@ -101,6 +104,53 @@ class DesktopBackendTests(TestCase):
         self.assertIn("llm_key_present=true", diagnostic)
         self.assertNotIn(secret, diagnostic)
         self.assertNotIn("raw provider failure", diagnostic)
+        self.assertIn("validation_field=unavailable", diagnostic)
+        self.assertIn("validation_type=unavailable", diagnostic)
+
+    def test_settings_validation_diagnostic_reports_only_safe_field_and_type(self) -> None:
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "mindcore.env"
+            secret = "secret-must-not-appear"
+            config.write_text(
+                f'DATABASE_URL="libsql://private.example"\nDATABASE_AUTH_TOKEN="{secret}"\n'
+                'PERSONA_DISPLAY_NAME="MindCore Setup"\nANTHROPIC_MODEL=""\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValidationError) as caught:
+                Settings(_env_file=config)
+            diagnostic = _setup_failure_diagnostic("database", str(config), caught.exception)
+
+        self.assertIn("validation_field=anthropic_model", diagnostic)
+        self.assertIn("validation_type=value_error", diagnostic)
+        self.assertNotIn(secret, diagnostic)
+        self.assertNotIn("private.example", diagnostic)
+
+    def test_database_preflight_minimal_settings_reaches_database_connection(self) -> None:
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "mindcore.env"
+            config.write_text(
+                'DATABASE_BACKEND="turso"\n'
+                'DATABASE_URL="file::memory:"\n'
+                'DATABASE_AUTH_TOKEN="test-token"\n'
+                'PERSONA_DISPLAY_NAME="MindCore Setup"\n',
+                encoding="utf-8",
+            )
+            connection = AsyncMock()
+            connection.fetchval.return_value = 1
+            acquired = AsyncMock()
+            acquired.__aenter__.return_value = connection
+            pool = MagicMock()
+            pool.acquire.return_value = acquired
+            with (
+                patch("app.database.connection.create_pool", AsyncMock(return_value=pool)) as create_pool,
+                patch("app.database.connection.close_pool", AsyncMock()) as close_pool,
+            ):
+                result = asyncio.run(_setup_action("database", str(config)))
+
+        self.assertEqual(result, "DATABASE_CONNECTED")
+        create_pool.assert_awaited_once()
+        connection.fetchval.assert_awaited_once_with("SELECT 1")
+        close_pool.assert_awaited_once_with(pool)
 
     def test_preflight_persona_placeholder_passes_settings_validation_but_blank_does_not(self) -> None:
         with TemporaryDirectory() as directory:
