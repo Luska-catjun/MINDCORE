@@ -16,14 +16,18 @@ export function PersonaAvatar({
   personaId,
   displayName,
   avatarExtension,
-  className = "persona-avatar",
+  revision = 0,
+  className,
 }: {
   personaId: string | null;
   displayName: string;
   avatarExtension?: string | null;
+  /** Bumped when the managed avatar file is replaced without changing its extension. */
+  revision?: number;
   className?: string;
 }) {
   const [src, setSrc] = useState<string | null>(null);
+  const avatarClassName = ["persona-avatar", className].filter(Boolean).join(" ");
 
   useEffect(() => {
     let disposed = false;
@@ -41,8 +45,8 @@ export function PersonaAvatar({
       disposed = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [avatarExtension, personaId]);
+  }, [avatarExtension, personaId, revision]);
 
-  if (src) return <img className={className} src={src} alt={`${displayName} avatar`} />;
-  return <span className={`${className} persona-avatar-fallback`} aria-label={`${displayName} avatar`}>{displayName.trim().slice(0, 1).toUpperCase() || "?"}</span>;
+  if (src) return <img className={avatarClassName} src={src} alt={`${displayName} avatar`} />;
+  return <span className={`${avatarClassName} persona-avatar-fallback`} aria-label={`${displayName} avatar`}>{displayName.trim().slice(0, 1).toUpperCase() || "?"}</span>;
 }

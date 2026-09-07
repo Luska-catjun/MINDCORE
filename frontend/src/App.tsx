@@ -36,6 +36,7 @@ function App() {
   const [personaDisplayName, setPersonaDisplayName] = useState(DEFAULT_PERSONA_DISPLAY_NAME);
   const [activePersonaId, setActivePersonaId] = useState<string | null>(null);
   const [personas, setPersonas] = useState<PersonaSummary[]>([]);
+  const [avatarRevision, setAvatarRevision] = useState(0);
   const [personaManagerMode, setPersonaManagerMode] = useState<"add" | "manage" | null>(null);
   const [mainConversationId, setMainConversationId] = useState<string | null>(null);
   // Chat is conditionally unmounted while an Observation view is open. Keep
@@ -104,6 +105,7 @@ function App() {
     const result = await invoke<PersonaSummary[]>("list_personas");
     const loaded = Array.isArray(result) ? result : [];
     setPersonas(loaded);
+    setAvatarRevision((revision) => revision + 1);
     const active = loaded.find((persona) => persona.active);
     if (active) {
       setActivePersonaId(active.persona_id);
@@ -416,7 +418,7 @@ function App() {
 
       <main className="main-area">
         <div className="session-toolbar">
-          {isDesktopRuntime() && <><label className="persona-selector"><PersonaAvatar personaId={activePersona?.persona_id ?? activePersonaId} displayName={activePersona?.display_name ?? personaDisplayName} avatarExtension={activePersona?.avatar_extension} className="persona-avatar persona-avatar-small" />Persona<select aria-label="Current Persona" value={activePersonaId ?? ""} onChange={(event) => void switchPersona(event.target.value)}>{personas.map((persona) => <option key={persona.persona_id} value={persona.persona_id}>{persona.display_name}</option>)}</select></label><button type="button" onClick={() => setPersonaManagerMode("add")}>+ Add Persona</button><button type="button" onClick={() => setPersonaManagerMode("manage")}>Manage Personas</button><button type="button" onClick={() => void invoke("open_configuration_folder")}>Open Configuration</button><button type="button" onClick={() => void invoke("open_identity_file")}>Open Identity File</button><button type="button" onClick={() => { void invoke("stop_mindcore_backend").finally(() => { setReconfiguring(true); setSetupState("needed"); }); }}>Reconfigure Active Persona</button></>}
+          {isDesktopRuntime() && <><label className="persona-selector"><PersonaAvatar personaId={activePersona?.persona_id ?? activePersonaId} displayName={activePersona?.display_name ?? personaDisplayName} avatarExtension={activePersona?.avatar_extension} revision={avatarRevision} className="persona-avatar-small" />Persona<select aria-label="Current Persona" value={activePersonaId ?? ""} onChange={(event) => void switchPersona(event.target.value)}>{personas.map((persona) => <option key={persona.persona_id} value={persona.persona_id}>{persona.display_name}</option>)}</select></label><button type="button" onClick={() => setPersonaManagerMode("add")}>+ Add Persona</button><button type="button" onClick={() => setPersonaManagerMode("manage")}>Manage Personas</button><button type="button" onClick={() => void invoke("open_configuration_folder")}>Open Configuration</button><button type="button" onClick={() => void invoke("open_identity_file")}>Open Identity File</button><button type="button" onClick={() => { void invoke("stop_mindcore_backend").finally(() => { setReconfiguring(true); setSetupState("needed"); }); }}>Reconfigure Active Persona</button></>}
           {!isDesktopRuntime() && <><span>Private access</span><button type="button" onClick={handleLogout}>Log out</button></>}
         </div>
         {backendStatus === "error" && (
@@ -429,6 +431,7 @@ function App() {
           <ChatWindow
             personaDisplayName={personaDisplayName}
             personaAvatarExtension={activePersona?.avatar_extension}
+            personaAvatarRevision={avatarRevision}
             personaId={activePersonaId}
             conversationId={mainConversationId}
             loadingConversation={conversationLoading}
@@ -452,7 +455,7 @@ function App() {
           />
         )}
       </main>
-      {personaManagerMode && <PersonaManager mode={personaManagerMode} personas={personas} onClose={() => setPersonaManagerMode(null)} onChanged={handlePersonasChanged} />}
+      {personaManagerMode && <PersonaManager mode={personaManagerMode} personas={personas} avatarRevision={avatarRevision} onClose={() => setPersonaManagerMode(null)} onChanged={handlePersonasChanged} />}
     </div>
   );
 }
