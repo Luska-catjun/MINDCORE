@@ -70,7 +70,7 @@ button { color: inherit; }
 .empty-state { margin: auto; color: var(--faint); font-size: 14px; text-align: center; }
 .message-row { display: flex; gap: 12px; padding: 18px 0; border-bottom: 1px solid var(--line); }
 .message-row-user { justify-content: flex-start; padding-left: 18%; }
-.message-avatar { width: 24px; height: 24px; flex: 0 0 auto; object-fit: cover; border-radius: 50%; border: 1px solid var(--line-strong); }
+.message-avatar { flex:0 0 24px; width:24px; min-width:24px; max-width:24px; height:24px; min-height:24px; max-height:24px; box-sizing:border-box; object-fit:cover; overflow:hidden; border-radius:50%; border:1px solid var(--line-strong); }.message-avatar-neutral { display:grid; place-items:center; color:var(--faint); background:var(--panel); }
 .message-bubble { max-width: 760px; min-width: 0; padding: 0; word-break: break-word; white-space: pre-wrap; }
 .message-bubble-user { padding-left: 14px; border-left: 2px solid var(--user-mark); }.message-bubble-diana { border-left: 2px solid var(--accent); padding-left: 14px; }
 .message-bubble-failed { border-left-color: var(--danger); opacity: .65; }
