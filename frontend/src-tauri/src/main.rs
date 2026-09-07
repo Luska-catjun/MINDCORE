@@ -34,6 +34,11 @@ struct Sidecar {
 }
 struct PersonaRegistryLock(Mutex<()>);
 #[derive(Serialize)]
+struct PersonaAvatarPayload {
+    mime_type: String,
+    bytes: Vec<u8>,
+}
+#[derive(Serialize)]
 struct SetupStatus {
     configured: bool,
     config_path: String,
@@ -646,6 +651,7 @@ fn create_persona(
         config_path: profile_path.to_string_lossy().into_owned(),
         created_at,
         last_used_at: None,
+        avatar_extension: None,
     };
     registry.personas.push(profile.clone());
     if let Err(error) = persona_registry::save_registry(&config, &registry) {
@@ -658,7 +664,69 @@ fn create_persona(
         created_at: profile.created_at,
         last_used_at: profile.last_used_at,
         active: false,
+        avatar_extension: None,
     })
+}
+
+#[tauri::command]
+fn read_persona_avatar(
+    app: AppHandle,
+    persona_id: String,
+) -> Result<Option<PersonaAvatarPayload>, String> {
+    let state = app.state::<PersonaRegistryLock>();
+    let _guard = state.0.lock().expect("persona registry lock");
+    let config = config_path(&app)?;
+    let registry = registry(&app)?.ok_or_else(|| "MindCore setup is incomplete.".to_string())?;
+    let profile = registry
+        .personas
+        .iter()
+        .find(|profile| profile.persona_id == persona_id)
+        .ok_or_else(|| "Persona was not found.".to_string())?;
+    Ok(persona_registry::read_avatar(&config, profile)?.map(|(mime_type, bytes)| {
+        PersonaAvatarPayload { mime_type, bytes }
+    }))
+}
+
+#[tauri::command]
+fn set_persona_avatar(
+    app: AppHandle,
+    persona_id: String,
+    bytes: Vec<u8>,
+) -> Result<PersonaSummary, String> {
+    let state = app.state::<PersonaRegistryLock>();
+    let _guard = state.0.lock().expect("persona registry lock");
+    let config = config_path(&app)?;
+    let mut registry = registry(&app)?.ok_or_else(|| "MindCore setup is incomplete.".to_string())?;
+    let profile = registry
+        .personas
+        .iter_mut()
+        .find(|profile| profile.persona_id == persona_id)
+        .ok_or_else(|| "Persona was not found.".to_string())?;
+    persona_registry::replace_avatar(&config, profile, &bytes)?;
+    persona_registry::save_registry(&config, &registry)?;
+    persona_registry::summaries(&registry)
+        .into_iter()
+        .find(|persona| persona.persona_id == persona_id)
+        .ok_or_else(|| "Persona was not found.".to_string())
+}
+
+#[tauri::command]
+fn remove_persona_avatar(app: AppHandle, persona_id: String) -> Result<PersonaSummary, String> {
+    let state = app.state::<PersonaRegistryLock>();
+    let _guard = state.0.lock().expect("persona registry lock");
+    let config = config_path(&app)?;
+    let mut registry = registry(&app)?.ok_or_else(|| "MindCore setup is incomplete.".to_string())?;
+    let profile = registry
+        .personas
+        .iter_mut()
+        .find(|profile| profile.persona_id == persona_id)
+        .ok_or_else(|| "Persona was not found.".to_string())?;
+    persona_registry::remove_avatar(&config, profile)?;
+    persona_registry::save_registry(&config, &registry)?;
+    persona_registry::summaries(&registry)
+        .into_iter()
+        .find(|persona| persona.persona_id == persona_id)
+        .ok_or_else(|| "Persona was not found.".to_string())
 }
 
 #[tauri::command]
@@ -740,31 +808,10 @@ fn delete_persona(app: AppHandle, persona_id: String, confirmation: String) -> R
     let config = config_path(&app)?;
     let mut registry =
         registry(&app)?.ok_or_else(|| "MindCore setup is incomplete.".to_string())?;
-    let profile =
+    let mut profile =
         persona_registry::remove_inactive_persona(&mut registry, &persona_id, &confirmation)?;
     persona_registry::save_registry(&config, &registry)?;
-    let managed = persona_registry::persona_directory(&config, &profile.persona_id)?;
-    let config_path = Path::new(&profile.config_path);
-    let identity_path = Path::new(&profile.identity_path);
-    if config_path.starts_with(&managed) {
-        if config_path.exists() {
-            fs::remove_file(config_path).map_err(|_| {
-                "Persona was removed, but its managed configuration could not be cleaned up."
-                    .to_string()
-            })?;
-        }
-        if identity_path.starts_with(&managed) && identity_path.exists() {
-            fs::remove_file(identity_path).map_err(|_| {
-                "Persona was removed, but its managed identity could not be cleaned up.".to_string()
-            })?;
-        }
-        if managed.is_dir() {
-            fs::remove_dir(&managed).map_err(|_| {
-                "Persona was removed, but its non-empty profile directory was preserved."
-                    .to_string()
-            })?;
-        }
-    }
+    persona_registry::cleanup_managed_persona_files(&config, &mut profile)?;
     Ok(())
 }
 
@@ -1047,6 +1094,9 @@ fn main() {
             list_personas,
             get_active_persona,
             create_persona,
+            read_persona_avatar,
+            set_persona_avatar,
+            remove_persona_avatar,
             update_persona,
             switch_active_persona,
             delete_persona

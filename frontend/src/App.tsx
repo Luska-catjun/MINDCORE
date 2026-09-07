@@ -20,6 +20,7 @@ import "./buildRevision";
 import { chatDebug } from "./chatDebug";
 import { DEFAULT_PERSONA_DISPLAY_NAME } from "./assets";
 import { PersonaManager, type PersonaSummary } from "./components/PersonaManager";
+import { PersonaAvatar } from "./components/PersonaAvatar";
 import "./styles.css";
 
 const SOURCE_DEVICE = "web";
@@ -370,6 +371,7 @@ function App() {
   );
 
   const currentHistory = mainConversationId ? chatHistory[mainConversationId] : undefined;
+  const activePersona = personas.find((persona) => persona.persona_id === activePersonaId) ?? null;
 
   useEffect(() => {
     if (!mainConversationId) return;
@@ -414,7 +416,7 @@ function App() {
 
       <main className="main-area">
         <div className="session-toolbar">
-          {isDesktopRuntime() && <><label className="persona-selector">Persona<select aria-label="Current Persona" value={activePersonaId ?? ""} onChange={(event) => void switchPersona(event.target.value)}>{personas.map((persona) => <option key={persona.persona_id} value={persona.persona_id}>{persona.display_name}</option>)}</select></label><button type="button" onClick={() => setPersonaManagerMode("add")}>+ Add Persona</button><button type="button" onClick={() => setPersonaManagerMode("manage")}>Manage Personas</button><button type="button" onClick={() => void invoke("open_configuration_folder")}>Open Configuration</button><button type="button" onClick={() => void invoke("open_identity_file")}>Open Identity File</button><button type="button" onClick={() => { void invoke("stop_mindcore_backend").finally(() => { setReconfiguring(true); setSetupState("needed"); }); }}>Reconfigure Active Persona</button></>}
+          {isDesktopRuntime() && <><label className="persona-selector"><PersonaAvatar personaId={activePersona?.persona_id ?? activePersonaId} displayName={activePersona?.display_name ?? personaDisplayName} avatarExtension={activePersona?.avatar_extension} className="persona-avatar persona-avatar-small" />Persona<select aria-label="Current Persona" value={activePersonaId ?? ""} onChange={(event) => void switchPersona(event.target.value)}>{personas.map((persona) => <option key={persona.persona_id} value={persona.persona_id}>{persona.display_name}</option>)}</select></label><button type="button" onClick={() => setPersonaManagerMode("add")}>+ Add Persona</button><button type="button" onClick={() => setPersonaManagerMode("manage")}>Manage Personas</button><button type="button" onClick={() => void invoke("open_configuration_folder")}>Open Configuration</button><button type="button" onClick={() => void invoke("open_identity_file")}>Open Identity File</button><button type="button" onClick={() => { void invoke("stop_mindcore_backend").finally(() => { setReconfiguring(true); setSetupState("needed"); }); }}>Reconfigure Active Persona</button></>}
           {!isDesktopRuntime() && <><span>Private access</span><button type="button" onClick={handleLogout}>Log out</button></>}
         </div>
         {backendStatus === "error" && (
@@ -426,6 +428,8 @@ function App() {
         {activeView === "chat" ? (
           <ChatWindow
             personaDisplayName={personaDisplayName}
+            personaAvatarExtension={activePersona?.avatar_extension}
+            personaId={activePersonaId}
             conversationId={mainConversationId}
             loadingConversation={conversationLoading}
             onToggleSidebar={() => setSidebarOpen((open) => !open)}

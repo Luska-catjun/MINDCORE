@@ -7,9 +7,12 @@ import type { ChatResponse } from "../types/api";
 import { chatDebug } from "../chatDebug";
 import { MessageBubble } from "./MessageBubble";
 import { MessageInput } from "./MessageInput";
+import { PersonaAvatar } from "./PersonaAvatar";
 
 interface ChatWindowProps {
   personaDisplayName: string;
+  personaId: string | null;
+  personaAvatarExtension?: string | null;
   conversationId: string | null;
   loadingConversation: boolean;
   onToggleSidebar: () => void;
@@ -26,6 +29,8 @@ interface ChatWindowProps {
 
 export function ChatWindow({
   personaDisplayName,
+  personaId,
+  personaAvatarExtension,
   conversationId,
   loadingConversation,
   onToggleSidebar,
@@ -146,7 +151,7 @@ export function ChatWindow({
     <div className="chat-window">
       <div className="chat-header">
         <button className="navigation-toggle chat-navigation-toggle" type="button" onClick={onToggleSidebar}>Menu</button>
-        <span className="header-avatar" aria-label={personaDisplayName}>●</span>
+        <PersonaAvatar personaId={personaId} displayName={personaDisplayName} avatarExtension={personaAvatarExtension} className="header-avatar" />
         <div className="chat-header-copy"><span className="chat-header-title">{personaDisplayName}</span><span className="chat-header-subtitle">Continuous record</span></div>
         <span className="chat-header-spacer" />
       </div>
