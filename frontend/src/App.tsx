@@ -19,10 +19,12 @@ import { invoke } from "@tauri-apps/api/core";
 import "./buildRevision";
 import { chatDebug } from "./chatDebug";
 import { DEFAULT_PERSONA_DISPLAY_NAME } from "./assets";
+import { PersonaManager, type PersonaSummary } from "./components/PersonaManager";
 import "./styles.css";
 
 const SOURCE_DEVICE = "web";
-const MAIN_CONVERSATION_STORAGE_KEY = "diana-main-conversation-id";
+const LEGACY_MAIN_CONVERSATION_STORAGE_KEY = "diana-main-conversation-id";
+const MAIN_CONVERSATION_STORAGE_KEY = "mindcore-main-conversation-id";
 const DEFAULT_CONVERSATION_TITLE = "MindCore conversation";
 
 type BackendStatus = "checking" | "connected" | "error";
@@ -31,6 +33,9 @@ type SetupState = "checking" | "needed" | "configured";
 
 function App() {
   const [personaDisplayName, setPersonaDisplayName] = useState(DEFAULT_PERSONA_DISPLAY_NAME);
+  const [activePersonaId, setActivePersonaId] = useState<string | null>(null);
+  const [personas, setPersonas] = useState<PersonaSummary[]>([]);
+  const [personaManagerMode, setPersonaManagerMode] = useState<"add" | "manage" | null>(null);
   const [mainConversationId, setMainConversationId] = useState<string | null>(null);
   // Chat is conditionally unmounted while an Observation view is open. Keep
   // its per-conversation history above that view boundary so returning to Chat
@@ -59,38 +64,61 @@ function App() {
     setPendingSends({});
     setSidebarOpen(false);
     setPersonaDisplayName(DEFAULT_PERSONA_DISPLAY_NAME);
+    setActivePersonaId(null);
   }, []);
 
-  const loadMainConversation = useCallback(async () => {
+  const loadMainConversation = useCallback(async (expectedGeneration: number) => {
     setConversationLoading(true);
     try {
       const conversations = await api.listConversations(200);
-      const storedId = window.localStorage.getItem(MAIN_CONVERSATION_STORAGE_KEY);
+      if (expectedGeneration !== sessionGenerationRef.current) return;
+      const storageKey = `${MAIN_CONVERSATION_STORAGE_KEY}:${activePersonaId ?? "web"}`;
+      const storedId = window.localStorage.getItem(storageKey)
+        ?? window.localStorage.getItem(LEGACY_MAIN_CONVERSATION_STORAGE_KEY);
       const storedConversation = storedId
         ? conversations.find((conversation) => conversation.id === storedId)
         : undefined;
       const conversation = storedConversation ?? conversations[0] ?? await api.createConversation({
-      title: DEFAULT_CONVERSATION_TITLE,
+        title: DEFAULT_CONVERSATION_TITLE,
         source_device: SOURCE_DEVICE,
       });
 
-      window.localStorage.setItem(MAIN_CONVERSATION_STORAGE_KEY, conversation.id);
+      if (expectedGeneration !== sessionGenerationRef.current) return;
+      window.localStorage.setItem(storageKey, conversation.id);
       setMainConversationId(conversation.id);
     } catch (error) {
+      if (expectedGeneration !== sessionGenerationRef.current) return;
       setGlobalError(
         error instanceof ApiError
           ? error.message
           : "MindCore 대화를 준비하는 중 오류가 발생했습니다."
       );
     } finally {
-      setConversationLoading(false);
+      if (expectedGeneration === sessionGenerationRef.current) setConversationLoading(false);
     }
+  }, [activePersonaId]);
+
+  const refreshPersonas = useCallback(async () => {
+    if (!isDesktopRuntime()) return [];
+    const result = await invoke<PersonaSummary[]>("list_personas");
+    const loaded = Array.isArray(result) ? result : [];
+    setPersonas(loaded);
+    const active = loaded.find((persona) => persona.active);
+    if (active) {
+      setActivePersonaId(active.persona_id);
+      setPersonaDisplayName(active.display_name);
+    }
+    return loaded;
   }, []);
 
   useEffect(() => {
     if (!isDesktopRuntime()) return;
     void invoke<{ configured: boolean }>("get_setup_status").then((status) => setSetupState(status.configured ? "configured" : "needed")).catch(() => setSetupState("needed"));
   }, []);
+
+  useEffect(() => {
+    if (setupState === "configured" && isDesktopRuntime()) void refreshPersonas().catch(() => setGlobalError("Could not load Personas."));
+  }, [refreshPersonas, setupState]);
 
   useEffect(() => {
     if (setupState !== "configured") return;
@@ -137,14 +165,18 @@ function App() {
 
   useEffect(() => {
     if (backendStatus !== "connected") return;
+    const expectedGeneration = sessionGenerationRef.current;
     setDesktopSessionError(false);
     const authenticate = isDesktopRuntime()
       ? invoke<string>("get_desktop_session").then((token) => { storeDesktopSession(token); return api.me(); })
       : api.me();
     authenticate.then((session) => {
+      if (expectedGeneration !== sessionGenerationRef.current) return;
+      setActivePersonaId(session.persona_id || null);
       setPersonaDisplayName(session.persona_display_name || DEFAULT_PERSONA_DISPLAY_NAME);
       setAuthStatus("authenticated");
     }).catch((error) => {
+      if (expectedGeneration !== sessionGenerationRef.current) return;
       if (isDesktopRuntime()) {
         setDesktopSessionError(true);
         setAuthStatus("unauthenticated");
@@ -159,7 +191,7 @@ function App() {
 
   useEffect(() => {
     if (authStatus === "authenticated") {
-      void loadMainConversation();
+      void loadMainConversation(sessionGenerationRef.current);
     }
   }, [authStatus, loadMainConversation]);
 
@@ -167,6 +199,7 @@ function App() {
     setLoginError(null);
     try {
       const session = await api.login(password);
+      setActivePersonaId(session.persona_id || null);
       setPersonaDisplayName(session.persona_display_name || DEFAULT_PERSONA_DISPLAY_NAME);
       setAuthStatus("authenticated");
     } catch (error) {
@@ -192,6 +225,44 @@ function App() {
   const handleViewChange = (view: WorkspaceView) => {
     setActiveView(view);
   };
+
+  const switchPersona = useCallback(async (personaId: string) => {
+    if (!isDesktopRuntime() || personaId === activePersonaId) return;
+    setBackendStatus("checking");
+    setAuthStatus("checking");
+    setGlobalError(null);
+    sessionGenerationRef.current += 1;
+    setMainConversationId(null);
+    setChatHistory({});
+    setPendingSends({});
+    setActiveView("chat");
+    try {
+      const active = await invoke<PersonaSummary>("switch_active_persona", { personaId });
+      setActivePersonaId(active.persona_id);
+      setPersonaDisplayName(active.display_name);
+    } catch {
+      setGlobalError("Persona switch failed. The previous Persona remains active.");
+    } finally {
+      setStartupAttempt((value) => value + 1);
+    }
+  }, [activePersonaId]);
+
+  const handlePersonasChanged = useCallback(async (switchTo?: string) => {
+    const loaded = await refreshPersonas();
+    if (switchTo && switchTo !== activePersonaId) {
+      await switchPersona(switchTo);
+    } else if (switchTo === activePersonaId) {
+      setBackendStatus("checking");
+      setAuthStatus("checking");
+      sessionGenerationRef.current += 1;
+      setMainConversationId(null);
+      setChatHistory({});
+      setPendingSends({});
+      setStartupAttempt((value) => value + 1);
+    } else {
+      setPersonas(loaded);
+    }
+  }, [activePersonaId, refreshPersonas, switchPersona]);
 
   const handleMessagesChange = useCallback(
     (conversationId: string, updater: (messages: LocalMessage[]) => LocalMessage[], event = "app_cache") => {
@@ -343,7 +414,7 @@ function App() {
 
       <main className="main-area">
         <div className="session-toolbar">
-          {isDesktopRuntime() && <><button type="button" onClick={() => void invoke("open_configuration_folder")}>Open Configuration</button><button type="button" onClick={() => void invoke("open_identity_file")}>Open Identity File</button><button type="button" onClick={() => { void invoke("stop_mindcore_backend").finally(() => { setReconfiguring(true); setSetupState("needed"); }); }}>Reconfigure MindCore</button></>}
+          {isDesktopRuntime() && <><label className="persona-selector">Persona<select aria-label="Current Persona" value={activePersonaId ?? ""} onChange={(event) => void switchPersona(event.target.value)}>{personas.map((persona) => <option key={persona.persona_id} value={persona.persona_id}>{persona.display_name}</option>)}</select></label><button type="button" onClick={() => setPersonaManagerMode("add")}>+ Add Persona</button><button type="button" onClick={() => setPersonaManagerMode("manage")}>Manage Personas</button><button type="button" onClick={() => void invoke("open_configuration_folder")}>Open Configuration</button><button type="button" onClick={() => void invoke("open_identity_file")}>Open Identity File</button><button type="button" onClick={() => { void invoke("stop_mindcore_backend").finally(() => { setReconfiguring(true); setSetupState("needed"); }); }}>Reconfigure Active Persona</button></>}
           {!isDesktopRuntime() && <><span>Private access</span><button type="button" onClick={handleLogout}>Log out</button></>}
         </div>
         {backendStatus === "error" && (
@@ -370,12 +441,14 @@ function App() {
           />
         ) : (
           <WorkspacePanel
+            key={activePersonaId ?? "web"}
             view={activeView}
             backendStatus={backendStatus}
             onToggleSidebar={() => setSidebarOpen((open) => !open)}
           />
         )}
       </main>
+      {personaManagerMode && <PersonaManager mode={personaManagerMode} personas={personas} onClose={() => setPersonaManagerMode(null)} onChanged={handlePersonasChanged} />}
     </div>
   );
 }
