@@ -38,6 +38,7 @@ def _setup_failure_diagnostic(action: str, config_path: str, error: Exception) -
     """Return only non-secret setup metadata for a desktop development terminal."""
     llm_provider = "unavailable"
     llm_key_present = False
+    settings_error: Exception | None = None
     try:
         settings = _settings_from(config_path)
         database_url = settings.database_url or ""
@@ -46,12 +47,33 @@ def _setup_failure_diagnostic(action: str, config_path: str, error: Exception) -
         database_token_present = bool(settings.database_auth_token)
         llm_provider = settings.llm_provider
         llm_key_present = bool(getattr(settings, f"{llm_provider}_api_key", None))
-    except Exception:
+    except Exception as exc:
+        settings_error = exc
         database_url_present = False
         database_url_scheme = "unavailable"
         database_token_present = False
 
     from app.services.llm_errors import LLMError
+    from pydantic import ValidationError
+
+    validation_field = "unavailable"
+    validation_type = "unavailable"
+    validation_error = error if isinstance(error, ValidationError) else settings_error
+    if isinstance(validation_error, ValidationError):
+        details = validation_error.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )
+        if details:
+            location = ".".join(str(part) for part in details[0].get("loc", ()))
+            error_type = str(details[0].get("type", ""))
+            validation_field = "".join(
+                character for character in location if character.isalnum() or character in "._"
+            ) or "unavailable"
+            validation_type = "".join(
+                character for character in error_type if character.isalnum() or character in "._"
+            ) or "unavailable"
 
     if isinstance(error, LLMError):
         category = error.category
@@ -70,7 +92,8 @@ def _setup_failure_diagnostic(action: str, config_path: str, error: Exception) -
         f"database_url_present={str(database_url_present).lower()} "
         f"database_token_present={str(database_token_present).lower()} "
         f"database_url_scheme={database_url_scheme} "
-        f"llm_provider={llm_provider} llm_key_present={str(llm_key_present).lower()}"
+        f"llm_provider={llm_provider} llm_key_present={str(llm_key_present).lower()} "
+        f"validation_field={validation_field} validation_type={validation_type}"
     )
 
 

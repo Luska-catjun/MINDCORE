@@ -44,6 +44,26 @@ describe("SetupWizard validation", () => {
     expectContinueDisabled();
   });
 
+  it("uses the fresh database draft before Persona and LLM setup are complete", async () => {
+    await enterDatabase();
+    fireEvent.change(databaseUrl(), { target: { value: "libsql://db" } });
+    fireEvent.change(databaseToken(), { target: { value: "token-a" } });
+    await userEvent.click(screen.getByRole("button", { name: "Test Connection" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("run_setup_action", {
+      action: "database",
+      draft: expect.objectContaining({
+        persona_display_name: "",
+        llm_provider: "gemini",
+        llm_model: "gemini-3.5-flash-lite",
+        provider_models: expect.objectContaining({
+          gemini: "gemini-3.5-flash-lite",
+          anthropic: "claude-sonnet-5",
+          openai: "gpt-5.6-luna",
+        }),
+      }),
+    }));
+  });
+
   it("preserves database values through LLM Back navigation", async () => {
     await enterDatabase();
     await validateDatabase();

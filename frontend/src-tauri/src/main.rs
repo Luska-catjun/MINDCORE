@@ -189,6 +189,12 @@ fn validate_llm_draft(d: &SetupDraft) -> Result<(), String> {
     if model.is_empty() || model.chars().count() > 200 || model.chars().any(char::is_control) {
         return Err("Enter a valid model ID of up to 200 characters.".into());
     }
+    if !d.preserve_api_key && d.api_key.trim().is_empty() {
+        return Err("Complete all required language model fields.".into());
+    }
+    Ok(())
+}
+fn validate_all_provider_models(d: &SetupDraft) -> Result<(), String> {
     for (provider, model) in &d.provider_models {
         if !LLM_PROVIDERS.contains(&provider.as_str())
             || model.trim().is_empty()
@@ -197,9 +203,6 @@ fn validate_llm_draft(d: &SetupDraft) -> Result<(), String> {
         {
             return Err("Provider model configuration is invalid.".into());
         }
-    }
-    if !d.preserve_api_key && d.api_key.trim().is_empty() {
-        return Err("Complete all required language model fields.".into());
     }
     Ok(())
 }
@@ -241,9 +244,15 @@ fn update_provider_config_values(
 ) -> Result<(), String> {
     for candidate in LLM_PROVIDERS {
         let model_name = provider_model_name(candidate)?;
-        values
-            .entry(model_name.to_string())
-            .or_insert(default_provider_model(candidate)?.to_string());
+        if values
+            .get(model_name)
+            .is_none_or(|configured| configured.trim().is_empty())
+        {
+            values.insert(
+                model_name.to_string(),
+                default_provider_model(candidate)?.to_string(),
+            );
+        }
     }
     values.insert("LLM_PROVIDER".into(), provider.into());
     values.entry("LLM_FALLBACK_PROVIDER".into()).or_default();
@@ -257,7 +266,8 @@ fn validate_draft(d: &SetupDraft) -> Result<(), String> {
         return Err("Choose a Persona name of up to 80 characters.".into());
     }
     validate_database_draft(d)?;
-    validate_llm_draft(d)
+    validate_llm_draft(d)?;
+    validate_all_provider_models(d)
 }
 fn validate_setup_action(action: &str, d: &SetupDraft) -> Result<(), String> {
     match action {
@@ -332,17 +342,49 @@ fn render_env_values(values: BTreeMap<String, String>) -> String {
         .map(|(key, value)| format!("{key}={}\n", env_value(&value)))
         .collect()
 }
-fn disable_preflight_fallback(text: &str) -> String {
-    let mut values = persona_registry::parse_env(text);
-    values.insert("LLM_FALLBACK_PROVIDER".into(), String::new());
-    render_env_values(values)
+fn preflight_env_for_action(action: &str, text: &str) -> Result<String, String> {
+    let values = persona_registry::parse_env(text);
+    let mut staged = BTreeMap::new();
+    match action {
+        "database" => {
+            for key in [
+                "DATABASE_BACKEND",
+                "DATABASE_URL",
+                "DATABASE_AUTH_TOKEN",
+                "PERSONA_DISPLAY_NAME",
+            ] {
+                if let Some(value) = values.get(key) {
+                    staged.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        "llm" => {
+            let provider = values
+                .get("LLM_PROVIDER")
+                .ok_or_else(|| "Language model provider is unavailable.".to_string())?;
+            let prefix = format!("{}_", provider.to_uppercase());
+            staged.insert("LLM_PROVIDER".into(), provider.clone());
+            staged.insert("LLM_FALLBACK_PROVIDER".into(), String::new());
+            for (key, value) in &values {
+                if key.starts_with(&prefix) {
+                    staged.insert(key.clone(), value.clone());
+                }
+            }
+            if let Some(value) = values.get("PERSONA_DISPLAY_NAME") {
+                staged.insert("PERSONA_DISPLAY_NAME".into(), value.clone());
+            }
+        }
+        "classify" | "initialize" => return Ok(render_env_values(values)),
+        _ => return Err("Unsupported setup action.".into()),
+    }
+    Ok(render_env_values(staged))
 }
 fn draft_env(app: &AppHandle, d: &SetupDraft) -> Result<String, String> {
     draft_env_for_persona_name(app, d, d.persona_display_name.trim())
 }
 fn preflight_draft_env(app: &AppHandle, action: &str, d: &SetupDraft) -> Result<String, String> {
-    draft_env_for_persona_name(app, d, preflight_persona_display_name(action, d))
-        .map(|text| disable_preflight_fallback(&text))
+    let full = draft_env_for_persona_name(app, d, preflight_persona_display_name(action, d))?;
+    preflight_env_for_action(action, &full)
 }
 fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
     let dir = path
@@ -1171,6 +1213,7 @@ mod setup_validation_tests {
         let mut values = BTreeMap::from([
             ("GROQ_API_KEY".into(), "existing-groq-key".into()),
             ("GROQ_MODEL".into(), "groq-custom".into()),
+            ("ANTHROPIC_MODEL".into(), String::new()),
             ("XAI_API_BASE_URL".into(), "https://custom.xai.test/v1".into()),
             ("AUTH_SIGNING_SECRET".into(), "existing-auth-secret".into()),
         ]);
@@ -1179,19 +1222,61 @@ mod setup_validation_tests {
         assert_eq!(values.get("OPENAI_MODEL").map(String::as_str), Some("gpt-custom"));
         assert_eq!(values.get("GROQ_MODEL").map(String::as_str), Some("groq-custom"));
         assert_eq!(values.get("GROQ_API_KEY").map(String::as_str), Some("existing-groq-key"));
+        assert_eq!(values.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-sonnet-5"));
         assert_eq!(values.get("XAI_API_BASE_URL").map(String::as_str), Some("https://custom.xai.test/v1"));
         assert_eq!(values.get("AUTH_SIGNING_SECRET").map(String::as_str), Some("existing-auth-secret"));
     }
 
     #[test]
     fn provider_preflight_cannot_succeed_through_a_configured_fallback() {
-        let staged = disable_preflight_fallback(
+        let staged = preflight_env_for_action(
+            "llm",
             "LLM_PROVIDER=\"openai\"\nLLM_FALLBACK_PROVIDER=\"gemini\"\nOPENAI_MODEL=\"gpt-custom\"\n",
-        );
+        )
+        .unwrap();
         let values = persona_registry::parse_env(&staged);
         assert_eq!(values.get("LLM_PROVIDER").map(String::as_str), Some("openai"));
         assert_eq!(values.get("OPENAI_MODEL").map(String::as_str), Some("gpt-custom"));
         assert_eq!(values.get("LLM_FALLBACK_PROVIDER").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn database_preflight_excludes_unrelated_invalid_provider_settings() {
+        let staged = preflight_env_for_action(
+            "database",
+            "DATABASE_BACKEND=\"turso\"\nDATABASE_URL=\"libsql://example\"\nDATABASE_AUTH_TOKEN=\"secret\"\nPERSONA_DISPLAY_NAME=\"MindCore Setup\"\nANTHROPIC_MODEL=\"\"\nOPENAI_TIMEOUT_SECONDS=\"\"\n",
+        )
+        .unwrap();
+        let values = persona_registry::parse_env(&staged);
+        assert_eq!(values.get("DATABASE_BACKEND").map(String::as_str), Some("turso"));
+        assert_eq!(values.get("PERSONA_DISPLAY_NAME").map(String::as_str), Some("MindCore Setup"));
+        assert!(!values.contains_key("ANTHROPIC_MODEL"));
+        assert!(!values.contains_key("OPENAI_TIMEOUT_SECONDS"));
+    }
+
+    #[test]
+    fn llm_preflight_keeps_only_the_selected_provider_configuration() {
+        let staged = preflight_env_for_action(
+            "llm",
+            "LLM_PROVIDER=\"anthropic\"\nANTHROPIC_MODEL=\"claude-custom\"\nANTHROPIC_API_KEY=\"selected-key\"\nANTHROPIC_TIMEOUT_SECONDS=\"12\"\nOPENAI_MODEL=\"\"\nGEMINI_API_KEY=\"unrelated-key\"\nPERSONA_DISPLAY_NAME=\"MindCore Setup\"\n",
+        )
+        .unwrap();
+        let values = persona_registry::parse_env(&staged);
+        assert_eq!(values.get("LLM_PROVIDER").map(String::as_str), Some("anthropic"));
+        assert_eq!(values.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-custom"));
+        assert_eq!(values.get("ANTHROPIC_TIMEOUT_SECONDS").map(String::as_str), Some("12"));
+        assert!(!values.contains_key("OPENAI_MODEL"));
+        assert!(!values.contains_key("GEMINI_API_KEY"));
+    }
+
+    #[test]
+    fn final_validation_remains_strict_for_all_provider_models() {
+        let mut draft = database_step_draft();
+        draft.persona_display_name = "Jarvis".into();
+        draft.api_key = "test-provider-key".into();
+        draft.provider_models.insert("anthropic".into(), String::new());
+        assert!(validate_setup_action("llm", &draft).is_ok());
+        assert!(validate_setup_action("initialize", &draft).is_err());
     }
 
     #[test]
