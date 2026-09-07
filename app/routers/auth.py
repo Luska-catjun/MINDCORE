@@ -121,6 +121,7 @@ async def login(payload: Login, request: Request, response: Response) -> dict[st
     )
     result: dict[str, bool | str] = {
         "authenticated": True,
+        "persona_id": settings.persona_id or "",
         "persona_display_name": settings.persona_display_name,
     }
     if payload.include_access_token:
@@ -159,5 +160,6 @@ async def me(request: Request) -> dict[str, bool | str]:
     logger.info("[AUTH] authentication success path=/auth/me credential=%s", source)
     return {
         "authenticated": True,
+        "persona_id": settings.persona_id or "",
         "persona_display_name": settings.persona_display_name,
     }

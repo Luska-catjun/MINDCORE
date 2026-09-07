@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     # Public product defaults are intentionally persona-neutral. A private
     # developer profile can opt into a different identity file without making
     # that identity part of the desktop bundle.
+    persona_id: str | None = None
     persona_display_name: str = "Persona"
     persona_identity_path: str | None = None
     environment: str = Field(
