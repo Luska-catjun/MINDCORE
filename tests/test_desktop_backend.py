@@ -76,10 +76,31 @@ class DesktopBackendTests(TestCase):
             diagnostic,
             f"{SETUP_DIAGNOSTIC_PREFIX} action=database category=driver_or_configuration "
             "exception_class=ValueError database_url_present=true "
-            "database_token_present=true database_url_scheme=libsql",
+            "database_token_present=true database_url_scheme=libsql "
+            "llm_provider=gemini llm_key_present=false",
         )
         self.assertNotIn(database_url, diagnostic)
         self.assertNotIn(database_token, diagnostic)
+
+    def test_llm_setup_diagnostic_reports_only_safe_provider_metadata(self) -> None:
+        from app.services.llm_errors import LLMError
+
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "mindcore.env"
+            secret = "provider-secret-must-not-appear"
+            config.write_text(
+                f"LLM_PROVIDER=openai\nOPENAI_API_KEY={secret}\nOPENAI_MODEL=gpt-custom\n",
+                encoding="utf-8",
+            )
+            diagnostic = _setup_failure_diagnostic(
+                "llm", str(config), LLMError("raw provider failure", category="authentication")
+            )
+
+        self.assertIn("category=authentication", diagnostic)
+        self.assertIn("llm_provider=openai", diagnostic)
+        self.assertIn("llm_key_present=true", diagnostic)
+        self.assertNotIn(secret, diagnostic)
+        self.assertNotIn("raw provider failure", diagnostic)
 
     def test_preflight_persona_placeholder_passes_settings_validation_but_blank_does_not(self) -> None:
         with TemporaryDirectory() as directory:

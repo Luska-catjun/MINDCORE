@@ -4,16 +4,23 @@ from app.config import Settings
 from app.services.llm_errors import LLMError
 from app.services.runtime_diagnostics import record_fallback_event
 
-SUPPORTED_PROVIDERS = {"gemini", "groq"}
+SUPPORTED_PROVIDERS = {"gemini", "groq", "anthropic", "xai", "openai"}
 FALLBACK_CATEGORIES = {
     "quota_or_rate_limit",
     "timeout",
     "network",
     "gemini_server",
     "groq_server",
+    "anthropic_server",
+    "xai_server",
+    "openai_server",
 }
 
 logger = logging.getLogger("diana.llm")
+
+
+def provider_model(settings: Settings, provider: str) -> str:
+    return str(getattr(settings, f"{provider}_model"))
 
 
 def _provider(settings: Settings) -> str:
@@ -48,22 +55,22 @@ async def _generate_with_provider(
     dynamic_context: str | None = None,
     identity_prompt: str | None = None,
 ) -> str:
-    if provider == "groq":
-        from app.services import groq
-
-        if request_kind == "main":
-            return await groq.generate_reply(
-                settings, args[0], dynamic_context=dynamic_context, identity_prompt=identity_prompt
-            )
-        return await groq.generate_memory_candidate(settings, args[0], args[1])
-
-    from app.services import gemini
+    if provider == "gemini":
+        from app.services import gemini as adapter
+    elif provider == "groq":
+        from app.services import groq as adapter
+    elif provider == "anthropic":
+        from app.services import anthropic as adapter
+    elif provider == "xai":
+        from app.services import xai as adapter
+    else:
+        from app.services import openai as adapter
 
     if request_kind == "main":
-        return await gemini.generate_reply(
+        return await adapter.generate_reply(
             settings, args[0], dynamic_context=dynamic_context, identity_prompt=identity_prompt
         )
-    return await gemini.generate_memory_candidate(settings, args[0], args[1])
+    return await adapter.generate_memory_candidate(settings, args[0], args[1])
 
 
 async def _generate_with_fallback(
