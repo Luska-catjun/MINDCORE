@@ -80,7 +80,7 @@ def build_lifespan(
 def create_app(*, settings_override: Settings | None = None, db_pool_factory: Callable[[Settings], object] | None = None) -> FastAPI:
     configure_diana_logging()
     settings = settings_override or get_settings()
-    app = FastAPI(title=settings.app_name, version="0.1.2", lifespan=build_lifespan(settings_override, db_pool_factory))
+    app = FastAPI(title=settings.app_name, version="0.1.3", lifespan=build_lifespan(settings_override, db_pool_factory))
 
     app.include_router(health.router)
     app.include_router(auth.router)
