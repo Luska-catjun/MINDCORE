@@ -12,10 +12,14 @@ async function generateConfig(environment) {
   const directory = await mkdtemp(join(tmpdir(), "mindcore-updater-config-"));
   const output = join(directory, "tauri.updater.conf.json");
   try {
+    // CI runs its whole job with the updater disabled. Each fixture must
+    // choose its own updater mode instead of inheriting that job setting.
+    const childEnv = { ...process.env };
+    delete childEnv.MINDCORE_UPDATER_DISABLED;
     const result = spawnSync(process.execPath, [script], {
       cwd: root,
       encoding: "utf8",
-      env: { ...process.env, ...environment, MINDCORE_UPDATER_CONFIG_PATH: output },
+      env: { ...childEnv, ...environment, MINDCORE_UPDATER_CONFIG_PATH: output },
     });
     assert.equal(result.status, 0, result.stderr);
     return JSON.parse(await readFile(output, "utf8"));
