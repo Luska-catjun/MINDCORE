@@ -543,6 +543,25 @@ mod tests {
         path
     }
 
+    #[test]
+    fn global_user_display_name_is_not_copied_into_persona_profile() {
+        let source = BTreeMap::from([
+            ("DATABASE_URL".into(), "libsql://persona-a".into()),
+            ("DATABASE_AUTH_TOKEN".into(), "token".into()),
+            ("USER_DISPLAY_NAME".into(), "Luska".into()),
+        ]);
+        let text = profile_config_text(
+            "persona-a",
+            "Jarvis",
+            Path::new("/managed/identity.txt"),
+            &source,
+        );
+
+        assert!(text.contains("PERSONA_DISPLAY_NAME=\"Jarvis\""));
+        assert!(text.contains("DATABASE_URL=\"libsql://persona-a\""));
+        assert!(!text.contains("USER_DISPLAY_NAME"));
+    }
+
     fn png_bytes(marker: u8) -> Vec<u8> {
         [b"\x89PNG\r\n\x1a\n".as_slice(), &[marker]].concat()
     }
@@ -733,7 +752,8 @@ mod tests {
     fn rename_switch_restart_and_confirmed_delete_preserve_isolation() {
         let root = temporary_root("lifecycle");
         let config = root.join("mindcore.env");
-        fs::write(&config, "LLM_PROVIDER=gemini\n").expect("global config");
+        let global_config = "LLM_PROVIDER=gemini\nUSER_DISPLAY_NAME=Luska\n";
+        fs::write(&config, global_config).expect("global config");
         let database_a = root.join("a.db");
         let database_b = root.join("b.db");
         fs::write(&database_a, "A_ONLY_DATABASE").expect("database A");
@@ -764,11 +784,13 @@ mod tests {
         assert!(rename_persona(&mut registry, "persona-b", "jarvis prime").is_err());
         activate_persona(&mut registry, "persona-b").expect("activate B");
         save_registry(&config, &registry).expect("save");
+        assert_eq!(fs::read_to_string(&config).expect("global user remains"), global_config);
         let mut restarted = load_registry(&config).expect("load").expect("registry");
         assert_eq!(restarted.active_persona_id, "persona-b");
         assert!(remove_inactive_persona(&mut restarted, "persona-a", "wrong").is_err());
         remove_inactive_persona(&mut restarted, "persona-a", "DELETE JARVIS PRIME")
             .expect("confirmed delete");
+        assert_eq!(fs::read_to_string(&config).expect("global user remains"), global_config);
         assert_eq!(
             fs::read_to_string(&database_a).expect("database A"),
             "A_ONLY_DATABASE"

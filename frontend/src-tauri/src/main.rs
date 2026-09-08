@@ -52,6 +52,7 @@ struct SetupStatus {
 struct ConfigMetadata {
     database_url: String,
     llm_provider: String,
+    user_display_name: String,
     persona_display_name: String,
     turso_token_configured: bool,
     provider_models: BTreeMap<String, String>,
@@ -70,6 +71,8 @@ struct SetupDraft {
     provider_api_keys: BTreeMap<String, String>,
     #[serde(default)]
     provider_preserve_keys: BTreeMap<String, bool>,
+    #[serde(default = "default_user_display_name")]
+    user_display_name: String,
     persona_display_name: String,
     #[serde(default)]
     preserve_database_auth_token: bool,
@@ -77,6 +80,10 @@ struct SetupDraft {
     preserve_api_key: bool,
     #[serde(default)]
     preserve_identity: bool,
+}
+
+fn default_user_display_name() -> String {
+    "User".into()
 }
 #[derive(Deserialize)]
 struct PersonaCreateDraft {
@@ -168,6 +175,9 @@ fn existing_secret(app: &AppHandle, key: &str) -> Option<String> {
     fs::read_to_string(config_path(app).ok()?)
         .ok()
         .and_then(|text| env_value_from(&text, key))
+}
+fn configured_user_display_name(text: &str) -> String {
+    env_value_from(text, "USER_DISPLAY_NAME").unwrap_or_else(default_user_display_name)
 }
 fn active_config_value(app: &AppHandle, key: &str) -> Option<String> {
     active_profile(app)
@@ -263,6 +273,13 @@ fn update_provider_config_values(
     Ok(())
 }
 fn validate_draft(d: &SetupDraft) -> Result<(), String> {
+    let user_name = d.user_display_name.trim();
+    if user_name.is_empty()
+        || user_name.chars().count() > 80
+        || user_name.chars().any(char::is_control)
+    {
+        return Err("Choose your display name using up to 80 characters.".into());
+    }
     let name = d.persona_display_name.trim();
     if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
         return Err("Choose a Persona name of up to 80 characters.".into());
@@ -335,6 +352,10 @@ fn draft_env_for_persona_name(
         }
     }
     values.insert("PERSONA_DISPLAY_NAME".into(), persona_display_name.into());
+    values.insert(
+        "USER_DISPLAY_NAME".into(),
+        d.user_display_name.trim().into(),
+    );
     values.insert("PERSONA_IDENTITY_PATH".into(), identity.to_string_lossy().into_owned());
     Ok(render_env_values(values))
 }
@@ -978,6 +999,7 @@ fn get_config_metadata(app: AppHandle) -> Result<ConfigMetadata, String> {
             .cloned()
             .unwrap_or_default(),
         llm_provider: env_value_from(&text, "LLM_PROVIDER").unwrap_or_else(|| "gemini".into()),
+        user_display_name: configured_user_display_name(&text),
         persona_display_name: profile.display_name,
         turso_token_configured: profile_values
             .get("DATABASE_AUTH_TOKEN")
@@ -1149,6 +1171,7 @@ mod setup_validation_tests {
             provider_models: BTreeMap::new(),
             provider_api_keys: BTreeMap::new(),
             provider_preserve_keys: BTreeMap::new(),
+            user_display_name: String::new(),
             persona_display_name: String::new(),
             preserve_database_auth_token: false,
             preserve_api_key: false,
@@ -1159,6 +1182,30 @@ mod setup_validation_tests {
     #[test]
     fn database_preflight_does_not_require_later_wizard_steps() {
         assert!(validate_setup_action("database", &database_step_draft()).is_ok());
+    }
+
+    #[test]
+    fn full_setup_requires_a_valid_user_name_but_preflight_does_not() {
+        let mut draft = database_step_draft();
+        draft.persona_display_name = "Jarvis".into();
+        draft.api_key = "test-provider-key".into();
+        assert!(validate_setup_action("database", &draft).is_ok());
+        assert!(validate_setup_action("llm", &draft).is_ok());
+        assert!(validate_setup_action("initialize", &draft).is_err());
+
+        draft.user_display_name = "Luska".into();
+        assert!(validate_setup_action("initialize", &draft).is_ok());
+        draft.user_display_name = "bad\nname".into();
+        assert!(validate_setup_action("initialize", &draft).is_err());
+    }
+
+    #[test]
+    fn legacy_global_config_defaults_user_name_without_rewrite() {
+        assert_eq!(configured_user_display_name("LLM_PROVIDER=gemini\n"), "User");
+        assert_eq!(
+            configured_user_display_name("USER_DISPLAY_NAME=\"Luska\"\n"),
+            "Luska"
+        );
     }
 
     #[test]
@@ -1230,6 +1277,7 @@ mod setup_validation_tests {
             ("ANTHROPIC_MODEL".into(), String::new()),
             ("XAI_API_BASE_URL".into(), "https://custom.xai.test/v1".into()),
             ("AUTH_SIGNING_SECRET".into(), "existing-auth-secret".into()),
+            ("USER_DISPLAY_NAME".into(), "Luska".into()),
         ]);
         update_provider_config_values(&mut values, "openai", "gpt-custom", "new-openai-key".into()).unwrap();
         assert_eq!(values.get("LLM_PROVIDER").map(String::as_str), Some("openai"));
@@ -1239,6 +1287,7 @@ mod setup_validation_tests {
         assert_eq!(values.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-sonnet-5"));
         assert_eq!(values.get("XAI_API_BASE_URL").map(String::as_str), Some("https://custom.xai.test/v1"));
         assert_eq!(values.get("AUTH_SIGNING_SECRET").map(String::as_str), Some("existing-auth-secret"));
+        assert_eq!(values.get("USER_DISPLAY_NAME").map(String::as_str), Some("Luska"));
     }
 
     #[test]

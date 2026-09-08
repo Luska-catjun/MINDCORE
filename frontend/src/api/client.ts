@@ -235,17 +235,17 @@ export const api = {
 
   getState: (): Promise<DianaStateRead> => request("/state"),
 
-  me: (): Promise<{ authenticated: boolean; persona_id: string; persona_display_name: string }> =>
+  me: (): Promise<{ authenticated: boolean; persona_id: string; persona_display_name: string; user_display_name: string }> =>
     request("/auth/me", { suppressAuthFailure: true }),
 
-  login: async (password: string): Promise<{ authenticated: boolean; persona_id: string; persona_display_name: string }> => {
+  login: async (password: string): Promise<{ authenticated: boolean; persona_id: string; persona_display_name: string; user_display_name: string }> => {
     clearBearerSession();
     // Render commonly serves the static frontend and API from distinct
     // origins.  Cookies still remain enabled, but immediately retaining the
     // short-lived bearer fallback prevents a SameSite/privacy policy from
     // turning the very next /auth/me request into credential=none.
     const requestBearerFallback = apiIsCrossOrigin();
-    const loginResult = await request<{ authenticated: boolean; persona_id: string; persona_display_name: string; access_token?: string }>("/auth/login", {
+    const loginResult = await request<{ authenticated: boolean; persona_id: string; persona_display_name: string; user_display_name: string; access_token?: string }>("/auth/login", {
       method: "POST",
       body: JSON.stringify({ password, include_access_token: requestBearerFallback }),
       suppressAuthFailure: true,
@@ -259,7 +259,7 @@ export const api = {
     }
 
     try {
-      return await request<{ authenticated: boolean; persona_id: string; persona_display_name: string }>("/auth/me", { suppressAuthFailure: true });
+      return await request<{ authenticated: boolean; persona_id: string; persona_display_name: string; user_display_name: string }>("/auth/me", { suppressAuthFailure: true });
     } catch (error) {
       if (!(error instanceof ApiError) || (error.status !== 401 && error.status !== 403)) {
         throw error;
@@ -268,7 +268,7 @@ export const api = {
 
     // Safari can block the backend's cross-site HttpOnly cookie. Retry only
     // then, and retain the signed fallback credential for this browser tab.
-    const fallback = await request<{ authenticated: boolean; persona_id: string; persona_display_name: string; access_token?: string }>("/auth/login", {
+    const fallback = await request<{ authenticated: boolean; persona_id: string; persona_display_name: string; user_display_name: string; access_token?: string }>("/auth/login", {
       method: "POST",
       body: JSON.stringify({ password, include_access_token: true }),
       suppressAuthFailure: true,
@@ -277,7 +277,7 @@ export const api = {
       throw new ApiError(503, "인증 세션을 만들지 못했습니다.");
     }
     storeBearerSession(fallback.access_token);
-    return await request<{ authenticated: boolean; persona_id: string; persona_display_name: string }>("/auth/me", { suppressAuthFailure: true });
+    return await request<{ authenticated: boolean; persona_id: string; persona_display_name: string; user_display_name: string }>("/auth/me", { suppressAuthFailure: true });
   },
 
   logout: async (): Promise<{ authenticated: boolean }> => {

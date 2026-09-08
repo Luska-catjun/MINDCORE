@@ -11,6 +11,7 @@ import { PersonaAvatar } from "./PersonaAvatar";
 
 interface ChatWindowProps {
   personaDisplayName: string;
+  userDisplayName: string;
   personaId: string | null;
   personaAvatarExtension?: string | null;
   personaAvatarRevision?: number;
@@ -30,6 +31,7 @@ interface ChatWindowProps {
 
 export function ChatWindow({
   personaDisplayName,
+  userDisplayName,
   personaId,
   personaAvatarExtension,
   personaAvatarRevision,
@@ -179,6 +181,7 @@ export function ChatWindow({
             key={m.id}
             message={m}
             personaDisplayName={personaDisplayName}
+            userDisplayName={userDisplayName}
             personaId={personaId}
             personaAvatarExtension={personaAvatarExtension}
             personaAvatarRevision={personaAvatarRevision}

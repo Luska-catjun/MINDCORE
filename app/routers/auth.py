@@ -133,6 +133,7 @@ async def login(payload: Login, request: Request, response: Response) -> dict[st
         "authenticated": True,
         "persona_id": settings.persona_id or "",
         "persona_display_name": settings.persona_display_name,
+        "user_display_name": settings.user_display_name,
     }
     if payload.include_access_token:
         # This is requested only after a cookie-authenticated check fails, for
@@ -172,4 +173,5 @@ async def me(request: Request) -> dict[str, bool | str]:
         "authenticated": True,
         "persona_id": settings.persona_id or "",
         "persona_display_name": settings.persona_display_name,
+        "user_display_name": settings.user_display_name,
     }

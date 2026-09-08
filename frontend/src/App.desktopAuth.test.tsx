@@ -8,7 +8,7 @@ const storeDesktopSession = vi.hoisted(() => vi.fn());
 vi.mock("./api/client", () => ({ api: apiMock, ApiError: class ApiError extends Error {}, setAuthFailureHandler: vi.fn(), storeDesktopSession, isDesktopRuntime: () => true }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("./components/Sidebar", () => ({ Sidebar: () => <div>Sidebar</div> }));
-vi.mock("./components/ChatWindow", () => ({ ChatWindow: ({ personaDisplayName }: { personaDisplayName: string }) => <><div>Main Chat</div><div>{personaDisplayName}</div></> }));
+vi.mock("./components/ChatWindow", () => ({ ChatWindow: ({ personaDisplayName, userDisplayName }: { personaDisplayName: string; userDisplayName: string }) => <><div>Main Chat</div><div>{personaDisplayName}</div><div>{userDisplayName}</div></> }));
 vi.mock("./components/DesktopUpdater", () => ({ DesktopUpdater: () => null }));
 
 import App from "./App";
@@ -19,13 +19,14 @@ describe("desktop authentication", () => {
       ? Promise.resolve({ configured: true })
       : Promise.resolve("desktop-session"));
     apiMock.health.mockResolvedValue({ status: "ok" });
-    apiMock.me.mockResolvedValue({ authenticated: true, persona_display_name: "Jarvis" });
+    apiMock.me.mockResolvedValue({ authenticated: true, persona_display_name: "Jarvis", user_display_name: "Luska" });
     apiMock.listConversations.mockResolvedValue([]);
     apiMock.createConversation.mockResolvedValue({ id: "main" });
 
     render(<App />);
     expect(await screen.findByText("Main Chat")).toBeTruthy();
     expect(screen.getByText("Jarvis")).toBeTruthy();
+    expect(screen.getByText("Luska")).toBeTruthy();
     expect(storeDesktopSession).toHaveBeenCalledWith("desktop-session");
     expect(screen.queryByLabelText("Private access password")).toBeNull();
     expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();

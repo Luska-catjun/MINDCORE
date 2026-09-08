@@ -12,6 +12,7 @@ const databaseToken = () => screen.getByPlaceholderText("Turso Auth Token");
 const continueButton = () => screen.getByRole("button", { name: "Continue" }) as HTMLButtonElement;
 const expectContinueDisabled = () => expect(continueButton().disabled).toBe(true);
 const expectContinueEnabled = () => expect(continueButton().disabled).toBe(false);
+const providerModels = { gemini: "gemini-3.5-flash-lite", groq: "qwen/qwen3.6-27b", anthropic: "claude-sonnet-5", xai: "grok-4.6", openai: "gpt-5.6-luna" };
 
 describe("SetupWizard validation", () => {
   beforeEach(() => {
@@ -52,6 +53,7 @@ describe("SetupWizard validation", () => {
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("run_setup_action", {
       action: "database",
       draft: expect.objectContaining({
+        user_display_name: "",
         persona_display_name: "",
         llm_provider: "gemini",
         llm_model: "gemini-3.5-flash-lite",
@@ -103,12 +105,14 @@ describe("SetupWizard validation", () => {
     await userEvent.click(continueButton());
     await screen.findByRole("heading", { name: "Persona Setup" });
     fireEvent.change(screen.getByPlaceholderText("Persona name"), { target: { value: "Diana" } });
+    fireEvent.change(screen.getByPlaceholderText("Your display name"), { target: { value: "Luska" } });
     await waitFor(expectContinueEnabled);
     await userEvent.click(continueButton());
     await screen.findByRole("heading", { name: "Review / Initialize" });
 
     await userEvent.click(screen.getByRole("button", { name: "Back" }));
     expect((screen.getByPlaceholderText("Persona name") as HTMLInputElement).value).toBe("Diana");
+    expect((screen.getByPlaceholderText("Your display name") as HTMLInputElement).value).toBe("Luska");
     await userEvent.click(screen.getByRole("button", { name: "Back" }));
     expect((screen.getByPlaceholderText("Gemini API Key") as HTMLInputElement).value).toBe("key-a");
     await userEvent.click(screen.getByRole("button", { name: "Back" }));
@@ -127,6 +131,7 @@ describe("SetupWizard validation", () => {
     await userEvent.click(continueButton());
     await screen.findByRole("heading", { name: "Persona Setup" });
     expectContinueDisabled();
+    fireEvent.change(screen.getByPlaceholderText("Your display name"), { target: { value: "Luska" } });
     fireEvent.change(screen.getByPlaceholderText("Persona name"), { target: { value: "새 페르소나" } });
     await waitFor(expectContinueEnabled);
     fireEvent.change(screen.getByPlaceholderText("Persona name"), { target: { value: "bad\u0000name" } });
@@ -153,6 +158,7 @@ describe("SetupWizard validation", () => {
         return Promise.resolve({
           database_url: "libsql://existing",
           llm_provider: "gemini",
+          user_display_name: "Luska",
           persona_display_name: "Diana",
           turso_token_configured: true,
           provider_models: { gemini: "gemini-custom", groq: "groq-custom", anthropic: "claude-custom", xai: "grok-custom", openai: "gpt-custom" },
@@ -200,7 +206,7 @@ describe("SetupWizard validation", () => {
 
   it("loads the selected provider model during reconfigure without returning its key", async () => {
     invoke.mockImplementation((name: string) => name === "get_config_metadata" ? Promise.resolve({
-      database_url: "libsql://existing", llm_provider: "anthropic", persona_display_name: "Jarvis", turso_token_configured: true,
+      database_url: "libsql://existing", llm_provider: "anthropic", user_display_name: "Luska", persona_display_name: "Jarvis", turso_token_configured: true,
       provider_models: { gemini: "gemini-custom", groq: "groq-custom", anthropic: "claude-custom", xai: "grok-custom", openai: "gpt-custom" },
       provider_key_configured: { gemini: true, groq: true, anthropic: true, xai: false, openai: false },
     }) : Promise.resolve("Connected"));
@@ -211,5 +217,23 @@ describe("SetupWizard validation", () => {
     expect((screen.getByLabelText("Claude") as HTMLInputElement).checked).toBe(true);
     expect((screen.getByLabelText("Model") as HTMLInputElement).value).toBe("claude-custom");
     expect((screen.getByPlaceholderText("Configured — leave blank to keep") as HTMLInputElement).value).toBe("");
+  });
+
+  it("loads and reviews separate global User and Persona names during reconfigure", async () => {
+    invoke.mockImplementation((name: string) => name === "get_config_metadata" ? Promise.resolve({
+      database_url: "libsql://existing", llm_provider: "gemini", user_display_name: "Luska", persona_display_name: "Jarvis", turso_token_configured: true,
+      provider_models: providerModels,
+      provider_key_configured: { gemini: true, groq: false, anthropic: false, xai: false, openai: false },
+    }) : Promise.resolve("Connected"));
+    render(<SetupWizard onComplete={vi.fn()} reconfigure />);
+    await userEvent.click(screen.getByRole("button", { name: "Edit configuration" }));
+    await waitFor(() => expect((databaseUrl() as HTMLInputElement).value).toBe("libsql://existing"));
+    await userEvent.click(continueButton());
+    await userEvent.click(continueButton());
+    expect((screen.getByPlaceholderText("Your display name") as HTMLInputElement).value).toBe("Luska");
+    expect((screen.getByPlaceholderText("Persona name") as HTMLInputElement).value).toBe("Jarvis");
+    await userEvent.click(continueButton());
+    expect(screen.getByText("User: Luska")).toBeTruthy();
+    expect(screen.getByText("Persona: Jarvis")).toBeTruthy();
   });
 });

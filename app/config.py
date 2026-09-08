@@ -1,5 +1,6 @@
 from functools import lru_cache
 import json
+import unicodedata
 from typing import List
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -14,6 +15,7 @@ class Settings(BaseSettings):
     # that identity part of the desktop bundle.
     persona_id: str | None = None
     persona_display_name: str = "Persona"
+    user_display_name: str = "User"
     persona_identity_path: str | None = None
     environment: str = Field(
         default="local",
@@ -141,6 +143,14 @@ class Settings(BaseSettings):
         normalized = value.strip()
         if not normalized or len(normalized) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in normalized):
             raise ValueError("PERSONA_DISPLAY_NAME must be 1-80 characters without control characters.")
+        return normalized
+
+    @field_validator("user_display_name")
+    @classmethod
+    def validate_user_display_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or len(normalized) > 80 or any(unicodedata.category(char) == "Cc" for char in normalized):
+            raise ValueError("USER_DISPLAY_NAME must be 1-80 characters without control characters.")
         return normalized
 
     @property

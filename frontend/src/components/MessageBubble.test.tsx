@@ -20,6 +20,7 @@ const message = (role: "diana" | "user" | "system" | "tool") => ({
 
 const avatarProps = {
   personaDisplayName: "Jarvis",
+  userDisplayName: "Luska",
   personaId: "persona-a",
   personaAvatarExtension: "png",
   personaAvatarRevision: 1,
@@ -56,7 +57,7 @@ describe("MessageBubble Persona avatars", () => {
     const { rerender } = render(<MessageBubble message={message("diana")} {...avatarProps} />);
     await screen.findByAltText("Jarvis avatar");
 
-    rerender(<MessageBubble message={message("diana")} personaDisplayName="Nova" personaId="persona-b" personaAvatarExtension="webp" personaAvatarRevision={1} />);
+    rerender(<MessageBubble message={message("diana")} userDisplayName="Luska" personaDisplayName="Nova" personaId="persona-b" personaAvatarExtension="webp" personaAvatarRevision={1} />);
     await screen.findByAltText("Nova avatar");
     expect(invoke).toHaveBeenLastCalledWith("read_persona_avatar", { personaId: "persona-b" });
     expect(screen.queryByAltText("Jarvis avatar")).toBeNull();
@@ -65,6 +66,7 @@ describe("MessageBubble Persona avatars", () => {
   it("does not use a Persona avatar for user, system, or tool messages", () => {
     const { rerender } = render(<MessageBubble message={message("user")} {...avatarProps} />);
     expect(screen.queryByLabelText("Jarvis avatar")).toBeNull();
+    expect(screen.getByText("Luska")).toBeTruthy();
     expect(invoke).not.toHaveBeenCalled();
 
     rerender(<MessageBubble message={message("system")} {...avatarProps} />);

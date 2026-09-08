@@ -18,7 +18,7 @@ import { DesktopUpdater } from "./components/DesktopUpdater";
 import { invoke } from "@tauri-apps/api/core";
 import "./buildRevision";
 import { chatDebug } from "./chatDebug";
-import { DEFAULT_PERSONA_DISPLAY_NAME } from "./assets";
+import { DEFAULT_PERSONA_DISPLAY_NAME, DEFAULT_USER_DISPLAY_NAME } from "./assets";
 import { PersonaManager, type PersonaSummary } from "./components/PersonaManager";
 import { PersonaAvatar } from "./components/PersonaAvatar";
 import "./styles.css";
@@ -34,6 +34,7 @@ type SetupState = "checking" | "needed" | "configured";
 
 function App() {
   const [personaDisplayName, setPersonaDisplayName] = useState(DEFAULT_PERSONA_DISPLAY_NAME);
+  const [userDisplayName, setUserDisplayName] = useState(DEFAULT_USER_DISPLAY_NAME);
   const [activePersonaId, setActivePersonaId] = useState<string | null>(null);
   const [personas, setPersonas] = useState<PersonaSummary[]>([]);
   const [avatarRevision, setAvatarRevision] = useState(0);
@@ -66,6 +67,7 @@ function App() {
     setPendingSends({});
     setSidebarOpen(false);
     setPersonaDisplayName(DEFAULT_PERSONA_DISPLAY_NAME);
+    setUserDisplayName(DEFAULT_USER_DISPLAY_NAME);
     setActivePersonaId(null);
   }, []);
 
@@ -177,6 +179,7 @@ function App() {
       if (expectedGeneration !== sessionGenerationRef.current) return;
       setActivePersonaId(session.persona_id || null);
       setPersonaDisplayName(session.persona_display_name || DEFAULT_PERSONA_DISPLAY_NAME);
+      setUserDisplayName(session.user_display_name || DEFAULT_USER_DISPLAY_NAME);
       setAuthStatus("authenticated");
     }).catch((error) => {
       if (expectedGeneration !== sessionGenerationRef.current) return;
@@ -204,6 +207,7 @@ function App() {
       const session = await api.login(password);
       setActivePersonaId(session.persona_id || null);
       setPersonaDisplayName(session.persona_display_name || DEFAULT_PERSONA_DISPLAY_NAME);
+      setUserDisplayName(session.user_display_name || DEFAULT_USER_DISPLAY_NAME);
       setAuthStatus("authenticated");
     } catch (error) {
       setLoginError(error instanceof ApiError ? error.message : "Sign in failed.");
@@ -441,6 +445,7 @@ function App() {
         {activeView === "chat" ? (
           <ChatWindow
             personaDisplayName={personaDisplayName}
+            userDisplayName={userDisplayName}
             personaAvatarExtension={activePersona?.avatar_extension}
             personaAvatarRevision={avatarRevision}
             personaId={activePersonaId}

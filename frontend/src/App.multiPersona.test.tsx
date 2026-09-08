@@ -23,6 +23,7 @@ vi.mock("./components/ChatWindow", () => ({
     chatHarness.props = props;
     return <div>
       <span>{props.personaDisplayName}</span>
+      <span data-testid="user-display-name">{props.userDisplayName}</span>
       <span data-testid="message-count">{props.messages.length}</span>
       <button type="button" onClick={() => {
         chatHarness.send = props.onSendStarted(props.conversationId, {
@@ -54,7 +55,7 @@ describe("multi-Persona desktop isolation", () => {
       return Promise.resolve();
     });
     apiMock.health.mockResolvedValue({ status: "ok" });
-    apiMock.me.mockImplementation(() => Promise.resolve({ authenticated: true, persona_id: active.persona_id, persona_display_name: active.display_name }));
+    apiMock.me.mockImplementation(() => Promise.resolve({ authenticated: true, persona_id: active.persona_id, persona_display_name: active.display_name, user_display_name: "Luska" }));
     apiMock.listConversations.mockResolvedValue([]);
     apiMock.createConversation.mockImplementation(() => Promise.resolve({ id: `conversation-${active.persona_id}` }));
   });
@@ -98,6 +99,20 @@ describe("multi-Persona desktop isolation", () => {
       (screen.getByLabelText("Current Persona") as HTMLSelectElement).value,
     ).toBe("persona-a"));
     expect(screen.getByText("Persona switch failed. The previous Persona remains active.")).toBeTruthy();
+  });
+
+  it("keeps the global user display name while switching Personas", async () => {
+    render(<App />);
+    await waitFor(() => expect(chatHarness.props?.personaDisplayName).toBe("Jarvis"));
+    expect(screen.getByTestId("user-display-name").textContent).toBe("Luska");
+
+    await userEvent.selectOptions(screen.getByLabelText("Current Persona"), "persona-b");
+    await waitFor(() => expect(chatHarness.props?.personaDisplayName).toBe("Nova"));
+    expect(screen.getByTestId("user-display-name").textContent).toBe("Luska");
+
+    await userEvent.selectOptions(screen.getByLabelText("Current Persona"), "persona-a");
+    await waitFor(() => expect(chatHarness.props?.personaDisplayName).toBe("Jarvis"));
+    expect(screen.getByTestId("user-display-name").textContent).toBe("Luska");
   });
 
   it("discards a late conversation lookup from the previous Persona", async () => {

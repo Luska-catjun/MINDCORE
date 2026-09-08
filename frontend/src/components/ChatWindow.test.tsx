@@ -14,6 +14,7 @@ import { ChatWindow } from "./ChatWindow";
 
 const props = {
   personaDisplayName: "Jarvis",
+  userDisplayName: "Luska",
   personaId: "persona-a",
   personaAvatarExtension: "png",
   conversationId: "conversation-a",
