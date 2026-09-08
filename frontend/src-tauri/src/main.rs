@@ -99,37 +99,9 @@ struct PersonaUpdateDraft {
 // Tauri resolves the target-triple source binary configured in `externalBin`
 // to this packaged runtime name (and supplies `.exe` on Windows).
 fn sidecar(app: &AppHandle) -> Result<tauri_plugin_shell::process::Command, String> {
-    // Tauri's relative sidecar resolver normally starts beside the running
-    // executable. In a macOS release bundle, make that bundle boundary
-    // explicit instead: Finder/LaunchServices has no contract to preserve a
-    // terminal cwd or PATH. This is intentionally release-only so `tauri dev`
-    // continues using Tauri's target-directory resolver.
-    #[cfg(all(target_os = "macos", not(debug_assertions)))]
-    {
-        let resource_dir = app
-            .path()
-            .resource_dir()
-            .map_err(|_| "MindCore application resources are unavailable.".to_string())?;
-        let path = macos_packaged_sidecar_path(&resource_dir)?;
-        return Ok(app.shell().command(path));
-    }
-
-    #[cfg(not(all(target_os = "macos", not(debug_assertions))))]
     app.shell()
         .sidecar("mindcore-backend")
         .map_err(|_| "MindCore sidecar is unavailable for this platform.".into())
-}
-
-#[cfg(any(test, all(target_os = "macos", not(debug_assertions))))]
-fn macos_packaged_sidecar_path(resource_dir: &Path) -> Result<PathBuf, String> {
-    let contents_dir = resource_dir
-        .parent()
-        .ok_or_else(|| "MindCore application resources are unavailable.".to_string())?;
-    let sidecar = contents_dir.join("MacOS").join("mindcore-backend");
-    if !sidecar.is_file() {
-        return Err("MindCore sidecar is unavailable for this platform.".into());
-    }
-    Ok(sidecar)
 }
 fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
     if let Some(p) = std::env::var_os("MINDCORE_ENV_FILE") {
@@ -1188,34 +1160,6 @@ fn stop_sidecar(app: &AppHandle) {
 #[cfg(test)]
 mod setup_validation_tests {
     use super::*;
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn packaged_macos_sidecar_is_resolved_from_the_app_bundle() {
-        let root = tempfile::tempdir().expect("temporary bundle root");
-        let resources = root.path().join("Contents").join("Resources");
-        let sidecar = root
-            .path()
-            .join("Contents")
-            .join("MacOS")
-            .join("mindcore-backend");
-        std::fs::create_dir_all(sidecar.parent().expect("sidecar parent"))
-            .expect("bundle executable directory");
-        std::fs::create_dir_all(&resources).expect("bundle resource directory");
-        std::fs::write(&sidecar, b"smoke sidecar").expect("bundled sidecar");
-
-        assert_eq!(macos_packaged_sidecar_path(&resources).unwrap(), sidecar);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn packaged_macos_sidecar_requires_a_bundled_executable() {
-        let root = tempfile::tempdir().expect("temporary bundle root");
-        let resources = root.path().join("Contents").join("Resources");
-        std::fs::create_dir_all(&resources).expect("bundle resource directory");
-
-        assert!(macos_packaged_sidecar_path(&resources).is_err());
-    }
 
     fn database_step_draft() -> SetupDraft {
         SetupDraft {
