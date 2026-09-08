@@ -67,6 +67,9 @@ jobs:
       - name: Run frontend tests
         working-directory: frontend
         run: npm test -- --run
+      - name: Test updater build configurations
+        working-directory: frontend
+        run: npm run test:updater-config
       - name: Lint frontend
         working-directory: frontend
         run: npm run lint

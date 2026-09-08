@@ -15,6 +15,8 @@ const SHUTDOWN_CAPABILITY_HEADER: &str = "X-MindCore-Desktop-Shutdown";
 const DESKTOP_INSTANCE_HEADER: &str = "X-MindCore-Desktop-Instance";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const UPDATER_PLUGIN_ENABLED: bool = !cfg!(mindcore_updater_disabled);
 struct Sidecar { lifecycle: Arc<Mutex<SidecarLifecycle<CommandChild>>> }
 #[derive(Serialize)] struct SetupStatus { configured: bool, config_path: String, identity_path: String }
 #[derive(Serialize)] struct ConfigMetadata { database_url: String, llm_provider: String, persona_display_name: String, turso_token_configured: bool, gemini_key_configured: bool, groq_key_configured: bool }
@@ -85,6 +87,18 @@ mod setup_validation_tests {
         assert!(validate_setup_action("initialize", &database_step_draft()).is_err());
     }
 
+    #[cfg(mindcore_updater_disabled)]
+    #[test]
+    fn updater_disabled_build_skips_updater_plugin_registration() {
+        assert!(!UPDATER_PLUGIN_ENABLED);
+    }
+
+    #[cfg(not(mindcore_updater_disabled))]
+    #[test]
+    fn updater_enabled_build_keeps_updater_plugin_registration() {
+        assert!(UPDATER_PLUGIN_ENABLED);
+    }
+
     #[test]
     fn lifecycle_capability_is_sent_in_a_header_not_the_url() {
         let capability = "test-capability";
@@ -115,4 +129,4 @@ mod setup_validation_tests {
         ));
     }
 }
-fn main(){let app=tauri::Builder::default().plugin(tauri_plugin_shell::init()).plugin(tauri_plugin_process::init()).plugin(tauri_plugin_updater::Builder::new().build()).invoke_handler(tauri::generate_handler![get_setup_status,get_config_metadata,run_setup_action,generic_identity_template,save_mindcore_config,start_mindcore_backend,get_desktop_session,stop_mindcore_backend,open_configuration_folder,open_identity_file]).setup(|app|{app.manage(Sidecar{lifecycle:Arc::new(Mutex::new(SidecarLifecycle::new()))});if config_is_complete(&app.handle())?{let _=start_sidecar(&app.handle());}Ok(())}).build(tauri::generate_context!()).expect("error while building MindCore desktop application");app.run(|app,event|{if matches!(event,RunEvent::ExitRequested{..}|RunEvent::Exit){stop_sidecar(app);}})}
+fn main(){let app=tauri::Builder::default().plugin(tauri_plugin_shell::init()).plugin(tauri_plugin_process::init());#[cfg(not(mindcore_updater_disabled))]let app=app.plugin(tauri_plugin_updater::Builder::new().build());let app=app.invoke_handler(tauri::generate_handler![get_setup_status,get_config_metadata,run_setup_action,generic_identity_template,save_mindcore_config,start_mindcore_backend,get_desktop_session,stop_mindcore_backend,open_configuration_folder,open_identity_file]).setup(|app|{app.manage(Sidecar{lifecycle:Arc::new(Mutex::new(SidecarLifecycle::new()))});if config_is_complete(&app.handle())?{let _=start_sidecar(&app.handle());}Ok(())}).build(tauri::generate_context!()).expect("error while building MindCore desktop application");app.run(|app,event|{if matches!(event,RunEvent::ExitRequested{..}|RunEvent::Exit){stop_sidecar(app);}})}

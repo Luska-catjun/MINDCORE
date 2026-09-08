@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "test": "vitest run",
+    "test:updater-config": "node --test ../desktop/write-updater-config.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "desktop:sidecar:build": "node ../desktop/run-sidecar-build.mjs",

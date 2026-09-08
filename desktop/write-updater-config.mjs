@@ -2,7 +2,9 @@ import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 const desktopRoot = resolve(import.meta.dirname, "../frontend/src-tauri");
-const output = resolve(desktopRoot, "tauri.updater.conf.json");
+const output = process.env.MINDCORE_UPDATER_CONFIG_PATH
+  ? resolve(process.env.MINDCORE_UPDATER_CONFIG_PATH)
+  : resolve(desktopRoot, "tauri.updater.conf.json");
 
 // This public development key verifies only local/mock releases. Production
 // builds must override it through CI with MINDCORE_UPDATER_PUBKEY; the private
