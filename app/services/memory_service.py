@@ -33,6 +33,12 @@ MEMORY_DECAY_RATE_PER_DAY = 0.002
 MEMORY_DECAY_IMPORTANCE_PROTECTION = 0.80
 MEMORY_MIN_EFFECTIVE_STRENGTH = 0.10
 MEMORY_EXTRACTION_MIN_CHARS = 24
+# ``0.35`` is the established floor for a candidate Episode.  A Memory has a
+# narrower ownership contract than an Episode, so it must not be promoted with
+# less durable evidence than the surrounding lifecycle already requires.
+MEMORY_MIN_IMPORTANCE = 0.35
+MEMORY_SEMANTIC_DEDUPLICATION_THRESHOLD = 0.75
+MEMORY_SURFACE_DEDUPLICATION_THRESHOLD = 0.80
 _WORD_RE = re.compile(r"[0-9A-Za-z가-힣]{2,}")
 _STOP_WORDS = {
     "나는", "내가", "너는", "오늘", "그냥", "정말", "조금", "같아", "그런", "이런",
@@ -81,6 +87,12 @@ _PREFERENCE_CLAIM = re.compile(r"(?:사용자|나는|난|저는|제가).{0,80}(?
 _RELATIONSHIP_CLAIM = re.compile(r"(?:사용자).{0,80}(?:믿|신뢰|의지|친하)")
 _WORLD_FACT = re.compile(r"(?:로\s*(?:만들어져|이루어져)|에서\s*끓어|(?:의\s*)?종류(?:야|이다))\s*[.!?]?$", re.IGNORECASE)
 _PAST_EVENT = re.compile(r"(?:했|갔|왔|먹었|마셨|봤|읽었|들었|보냈|운영|만났|올랐|놀았|다녀왔)", re.IGNORECASE)
+_UNCERTAIN_MEMORY = re.compile(
+    r"(?:^|\s)(?:아마(?:도)?|어쩌면|잘은\s*모르지만|잘\s*모르겠)|것\s*같(?:아|아요|다)|(?:인|일)\s*듯",
+    re.IGNORECASE,
+)
+_KOREAN_PARTICLE_SUFFIX = re.compile(r"(?:으로|에서|에게|이랑|들과|하고|와|과|은|는|이|가|을|를|의|에|로)$")
+_KOREAN_PAST_SUFFIX = re.compile(r"(?:했(?:어|다|지)?|었(?:어|다|지)?|았(?:어|다|지)?)$")
 
 
 async def attach_episode_provenance(
@@ -137,11 +149,16 @@ def classify_memory_ownership(user_content: str, *, diana_content: str = "") -> 
 
     personal_fact = bool(_PERSONAL_FACT.search(user_content))
     event = any(marker in normalized for marker in _EVENT_MARKERS) and bool(_PAST_EVENT.search(normalized))
+    uncertain = bool(_UNCERTAIN_MEMORY.search(normalized))
     if personal_fact:
         owners.append("personal_fact")
+        if uncertain:
+            return MemoryOwnership(tuple(dict.fromkeys(owners)), False, None, "uncertain_personal_fact")
         return MemoryOwnership(tuple(dict.fromkeys(owners)), True, "user_fact", "personal_fact")
     if event:
         owners.append("episode")
+        if uncertain:
+            return MemoryOwnership(tuple(dict.fromkeys(owners)), False, None, "uncertain_event")
         meaningful = len(normalized) >= MEMORY_EXTRACTION_MIN_CHARS or any(
             marker in normalized for marker in _MEANINGFUL_EVENT_MARKERS
         )
@@ -220,11 +237,38 @@ def _memory_relevance(query: str, memory: str) -> int:
 
 
 def _memory_similarity(left: str, right: str) -> float:
+    """Return the existing conservative surface-token Jaccard score."""
     left_keywords = _keywords(left)
     right_keywords = _keywords(right)
     if not left_keywords or not right_keywords:
         return 0.0
     return len(left_keywords & right_keywords) / len(left_keywords | right_keywords)
+
+
+def _memory_semantic_similarity(left: str, right: str) -> float:
+    """Compare canonical event terms while preserving the surface fallback.
+
+    Korean postpositions and past-tense endings make an otherwise identical
+    event look different to raw token Jaccard.  This remains deliberately
+    lexical (not an embedding or an extra LLM call), and is used only for
+    Memory upsert deduplication.
+    """
+    semantic_left = _memory_semantic_terms(left)
+    semantic_right = _memory_semantic_terms(right)
+    if not semantic_left or not semantic_right:
+        return 0.0
+    return len(semantic_left & semantic_right) / len(semantic_left | semantic_right)
+
+
+def _memory_semantic_terms(text: str) -> set[str]:
+    """Normalize only transparent Korean morphology for duplicate detection."""
+    terms: set[str] = set()
+    for raw_word in re.findall(r"[0-9A-Za-z가-힣]+", text.casefold()):
+        word = _KOREAN_PARTICLE_SUFFIX.sub("", raw_word)
+        word = _KOREAN_PAST_SUFFIX.sub("", word)
+        if word:
+            terms.add(word)
+    return terms
 
 
 def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
@@ -462,6 +506,12 @@ async def extract_and_store_memory(
         if candidate is None:
             logger.info("MEMORY_OWNERSHIP candidate=true owner=%s memory_created=false reason=non_memory_representation", ",".join(ownership.owners))
             return None
+        if candidate.importance < MEMORY_MIN_IMPORTANCE:
+            logger.info(
+                "MEMORY_OWNERSHIP candidate=true owner=%s memory_created=false reason=below_durable_importance",
+                ",".join(ownership.owners),
+            )
+            return None
         logger.info("MEMORY_OWNERSHIP candidate=true owner=%s memory_created=true reason=%s", ",".join(ownership.owners), ownership.reason)
         return await upsert_memory(
             pool,
@@ -502,7 +552,12 @@ async def upsert_memory(
             (
                 record
                 for record in existing
-                if _memory_similarity(candidate.content, record["content"]) >= 0.8
+                if (
+                    _memory_semantic_similarity(candidate.content, record["content"])
+                    >= MEMORY_SEMANTIC_DEDUPLICATION_THRESHOLD
+                    or _memory_similarity(candidate.content, record["content"])
+                    >= MEMORY_SURFACE_DEDUPLICATION_THRESHOLD
+                )
             ),
             None,
         )

@@ -92,6 +92,13 @@ class KnowledgeAcquisitionV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["reinforcement_count"], 2)
         self.assertGreaterEqual(float(row["confidence"]), .95)
 
+    async def test_hedged_claim_and_user_display_name_do_not_become_knowledge(self) -> None:
+        self.assertEqual(await self._acquire("고래는 포유류일 거야."), [])
+        self.assertEqual(await self._acquire("내 이름은 User야."), [])
+        self.assertEqual(await self._acquire("내 생일은 5월 3일이야."), [])
+        async with self.pool.acquire() as connection:
+            self.assertEqual(await connection.fetchval("select count(*) from diana_knowledge"), 0)
+
     async def test_story_content_stays_story_knowledge_not_general_concept(self) -> None:
         stored = await self._acquire("빨간 모자라는 아이가 숲에 갔어.")
         self.assertEqual(len(stored), 1)
@@ -99,6 +106,22 @@ class KnowledgeAcquisitionV2Tests(unittest.IsolatedAsyncioTestCase):
         async with self.pool.acquire() as connection:
             self.assertEqual(await connection.fetchval("select count(*) from diana_knowledge_facts"), 1)
             self.assertEqual(await connection.fetchval("select count(*) from diana_knowledge where knowledge_type='concept'"), 0)
+
+    async def test_obvious_story_contradiction_retains_existing_fact_and_marks_it(self) -> None:
+        conversation_id = uuid4()
+        await acquire_user_knowledge(
+            self.pool, user_text="빨간 모자라는 아이가 숲에 갔어.", user_message_id=uuid4(),
+            source_episode_id=None, episode_is_grounded=True, conversation_id=conversation_id,
+        )
+        await acquire_user_knowledge(
+            self.pool, user_text="빨간 모자는 숲에 안 갔어.", user_message_id=uuid4(),
+            source_episode_id=None, episode_is_grounded=True, conversation_id=conversation_id,
+        )
+        async with self.pool.acquire() as connection:
+            facts = await connection.fetch("select fact_text, contradiction_count from diana_knowledge_facts")
+        self.assertEqual(len(facts), 1)
+        self.assertIn("숲에 갔어", facts[0]["fact_text"])
+        self.assertEqual(facts[0]["contradiction_count"], 1)
 
     def test_explicit_teaching_score_is_higher_than_nonknowledge_ownership_forms(self) -> None:
         teaching = detect_subjects("물은 수소와 산소로 이루어져 있어.")

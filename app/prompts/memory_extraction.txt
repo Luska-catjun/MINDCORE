@@ -10,6 +10,6 @@ Return JSON only, with exactly these fields:
 
 Store only a user-specific stable fact or a meaningful lived/shared event. A Memory is not the canonical store for preferences, relationship state, goals, decisions, or world/story knowledge.
 Never store a bare claim such as "the user likes X", "the user trusts the persona", "the user wants to do X next", "they decided X", or "X is Y". For a mixed event and preference, store only the event form (for example, "Today the user ate mint-chocolate ice cream and said it tasted good"), never the preference claim itself.
-Do not store the assistant's guesses, implications, possibilities, jokes, roleplay, temporary moods, casual reactions, or unsupported claims.
+Do not store the assistant's guesses, implications, possibilities, jokes, roleplay, temporary moods, casual reactions, or unsupported claims. Do not store an uncertain user statement either (for example, "아마", "것 같아", or "인 듯").
 If there is no durable fact to retain, return {"should_store": false, "memory": "", "memory_type": "user_fact", "importance": 0}.
-Write any stored memory as a concise Korean factual sentence. Keep importance between 0 and 1.
+Write any stored memory as a concise Korean factual sentence. Keep importance between 0 and 1. Return should_store=false instead of assigning a retained Memory an importance below 0.35.

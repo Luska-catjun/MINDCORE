@@ -9,13 +9,18 @@ from uuid import uuid4
 
 from app.config import Settings
 from app.services.memory_service import (
+    MEMORY_MIN_IMPORTANCE,
     MemoryCandidate,
+    _memory_semantic_similarity,
     classify_memory_ownership,
     extract_and_store_memory,
     is_retrievable_memory,
     retrieve_relevant_memories,
     should_extract_memory,
+    upsert_memory,
 )
+from app.database.turso import TursoConnection
+import libsql
 
 
 class MemoryOwnershipClassificationTests(TestCase):
@@ -77,6 +82,14 @@ class MemoryOwnershipClassificationTests(TestCase):
         self.assertEqual(decision.memory_type, "user_fact")
         self.assertIn("personal_fact", decision.owners)
 
+    def test_uncertain_personal_fact_and_transient_turns_do_not_open_memory_extraction(self) -> None:
+        for text in ("내 생일은 5월 3일인 것 같아.", "ㅋㅋㅋ", "지금 게임 켰어."):
+            with self.subTest(text=text):
+                self.assertFalse(should_extract_memory(text))
+
+    def test_user_display_name_is_not_a_memory_owner(self) -> None:
+        self.assertFalse(should_extract_memory("내 이름은 User야."))
+
     def test_mixed_event_keeps_preference_and_event_as_distinct_owners(self) -> None:
         decision = classify_memory_ownership("오늘 친구랑 공포게임 했는데 역시 난 공포게임은 별로야.")
         self.assertTrue(decision.memory_eligible)
@@ -127,6 +140,30 @@ class MemoryOwnershipExtractionTests(IsolatedAsyncioTestCase):
         self.assertEqual(result, stored)
         self.assertEqual(upsert.await_args.args[1].memory_type, "shared_event")
 
+    async def test_stable_personal_fact_can_store_but_low_importance_candidate_cannot(self) -> None:
+        stable_payload = '{"should_store":true,"memory":"사용자의 생일은 5월 3일이다.","memory_type":"user_fact","importance":0.35}'
+        stored = {"memory_id": uuid4(), "memory_type": "user_fact"}
+        with patch("app.services.memory_service.generate_memory_candidate", new=AsyncMock(return_value=stable_payload)), patch(
+            "app.services.memory_service.upsert_memory", new=AsyncMock(return_value=stored)
+        ) as upsert:
+            result = await extract_and_store_memory(
+                None, Settings(), user_content="내 생일은 5월 3일이야.", diana_content="알겠어.",
+                conversation_id=uuid4(), source_message_id=uuid4(),
+            )
+        self.assertEqual(result, stored)
+        self.assertEqual(upsert.await_args.args[1].importance, MEMORY_MIN_IMPORTANCE)
+
+        low_importance = '{"should_store":true,"memory":"사용자의 생일은 5월 3일이다.","memory_type":"user_fact","importance":0.34}'
+        with patch("app.services.memory_service.generate_memory_candidate", new=AsyncMock(return_value=low_importance)), patch(
+            "app.services.memory_service.upsert_memory", new=AsyncMock()
+        ) as rejected:
+            result = await extract_and_store_memory(
+                None, Settings(), user_content="내 생일은 5월 3일이야.", diana_content="알겠어.",
+                conversation_id=uuid4(), source_message_id=uuid4(),
+            )
+        self.assertIsNone(result)
+        rejected.assert_not_awaited()
+
 
 class _ReadOnlyConnection:
     def __init__(self, rows): self.rows = rows
@@ -139,6 +176,15 @@ class _ReadOnlyPool:
     async def acquire(self): yield self.connection
 
 
+class _MemoryWritePool:
+    def __init__(self) -> None:
+        self.connection = TursoConnection(libsql.connect(":memory:"))
+
+    @asynccontextmanager
+    async def acquire(self):
+        yield self.connection
+
+
 class MemoryOwnershipRetrievalTests(IsolatedAsyncioTestCase):
     async def test_retrieval_filters_legacy_wrong_owner_before_context_builder(self) -> None:
         now = datetime.now(timezone.utc)
@@ -148,3 +194,38 @@ class MemoryOwnershipRetrievalTests(IsolatedAsyncioTestCase):
         ]
         memories = await retrieve_relevant_memories(_ReadOnlyPool(rows), "축제에서 뭐 했지?")
         self.assertEqual([memory["memory_type"] for memory in memories], ["shared_event"])
+
+
+class MemorySemanticDeduplicationTests(IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.pool = _MemoryWritePool()
+        async with self.pool.acquire() as connection:
+            await connection.execute(
+                """create table memories (
+                    memory_id text primary key, content text not null, normalized_content text unique not null,
+                    memory_type text not null, importance real not null, recall_frequency integer not null,
+                    memory_strength real not null, last_recalled_at text, source_conversation_id text,
+                    source_message_id text, created_at text not null, updated_at text not null
+                )"""
+            )
+
+    async def test_semantic_event_rephrase_updates_one_durable_memory(self) -> None:
+        first = MemoryCandidate("오늘 학교 축제에서 친구들과 게임 부스를 운영했다.", "shared_event", .7)
+        repeat = MemoryCandidate("오늘 친구들과 학교 축제 게임 부스를 운영했어.", "shared_event", .8)
+        self.assertGreaterEqual(_memory_semantic_similarity(first.content, repeat.content), .75)
+        first_source = uuid4()
+        row = await upsert_memory(self.pool, first, source_conversation_id=uuid4(), source_message_id=first_source)
+        repeated = await upsert_memory(self.pool, repeat, source_conversation_id=uuid4(), source_message_id=uuid4())
+        self.assertEqual(repeated["memory_id"], row["memory_id"])
+        async with self.pool.acquire() as connection:
+            self.assertEqual(await connection.fetchval("select count(*) from memories"), 1)
+            self.assertEqual(await connection.fetchval("select source_message_id from memories where memory_id=$1", row["memory_id"]), first_source)
+
+    async def test_distinct_event_details_do_not_false_merge(self) -> None:
+        sea = MemoryCandidate("어제 가족이랑 여행 가서 바다를 봤어.", "shared_event", .7)
+        mountain = MemoryCandidate("어제 가족이랑 여행 가서 산을 봤어.", "shared_event", .7)
+        self.assertLess(_memory_semantic_similarity(sea.content, mountain.content), .75)
+        await upsert_memory(self.pool, sea, source_conversation_id=uuid4(), source_message_id=uuid4())
+        await upsert_memory(self.pool, mountain, source_conversation_id=uuid4(), source_message_id=uuid4())
+        async with self.pool.acquire() as connection:
+            self.assertEqual(await connection.fetchval("select count(*) from memories"), 2)

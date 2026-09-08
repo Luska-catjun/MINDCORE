@@ -30,7 +30,17 @@ _EXPLANATION_REQUEST = re.compile(rf"(?P<subject>{_SUBJECT_CHARS}?)\s*(?:이|가
 _SELECTION_FOLLOWUP = re.compile(rf"왜\s+(?P<subject>{_SUBJECT_CHARS}?)(?:을|를)?\s*(?:골랐|선택했|더 궁금해|더 끌려)", re.IGNORECASE)
 _TEACHING = re.compile(rf"^\s*(?P<subject>{_SUBJECT_CHARS}?)(?:은|는|이|가)\s+(?P<summary>.{{3,260}}?)(?:야|이야|이다|입니다|라는?\s*(?:거야|것이야))\s*[.!?]?$", re.IGNORECASE)
 _TEACHING_PREFIX = re.compile(r"^\s*(?:참고로|알아둘\s*점은|알아두면\s*좋은\s*건)\s+", re.IGNORECASE)
-_UNCERTAIN_TEACHING = re.compile(r"^\s*(?:아마|어쩌면|잘은\s*모르지만)", re.IGNORECASE)
+# Uncertainty can occur after the subject (``고래는 포유류일 거야``), not
+# only at the beginning of a sentence.  Knowledge is durable evidence, so a
+# hedged inference remains a non-promotion until the user teaches it plainly.
+_UNCERTAIN_TEACHING = re.compile(
+    r"(?:^\s*(?:아마(?:도)?|어쩌면|잘은\s*모르지만)|것\s*같(?:아|아요|다)|(?:인|일)\s*거(?:야|예요|다)?|(?:라고|라)\s*들었)",
+    re.IGNORECASE,
+)
+_USER_PROFILE_SUBJECT = re.compile(
+    r"^(?:(?:내|나의|저의|제)\s*)(?:이름|별명|닉네임|생일|학교|직장|사는\s*곳|살고\s*있는\s*곳|가족|고향|전공|학년)$",
+    re.IGNORECASE,
+)
 _DECLARATIVE_TEACHING = re.compile(rf"^\s*(?P<subject>{_SUBJECT_CHARS}?)(?:은|는|이|가)\s+(?P<summary>.{{3,260}}?)\s*[.!?]?$", re.IGNORECASE)
 _FACTUAL_PREDICATE = re.compile(
     r"(?:로\s*이루어져\s*(?:있어|있다|있습니다)|로\s*만들어져\s*(?:있어|있다|있습니다)|"
@@ -95,6 +105,11 @@ def normalize_subject(value: str) -> tuple[str, str] | None:
     return key, canonical
 
 
+def _is_user_profile_subject(value: str) -> bool:
+    """Keep global user-profile fields out of the cognition knowledge store."""
+    return bool(_USER_PROFILE_SUBJECT.fullmatch(" ".join(value.strip().split())))
+
+
 def normalize_query_subject(value: str) -> tuple[str, str] | None:
     """Remove a query's generic object word without treating ordinary nouns as subjects."""
     cleaned = _QUERY_SUBJECT_SUFFIX.sub("", value.strip())
@@ -119,14 +134,14 @@ def detect_subjects(user_text: str) -> list[SubjectCandidate]:
     if teaching:
         normalized = normalize_subject(teaching.group("subject"))
         summary = " ".join(teaching.group("summary").strip().split())
-        if normalized and summary:
+        if normalized and summary and not _is_user_profile_subject(normalized[1]):
             candidates.append(SubjectCandidate(*normalized, kind="teaching", summary=summary, score=EXPLICIT_TEACHING_SCORE))
     if not candidates and not _UNCERTAIN_TEACHING.search(normalized_text):
         declarative = _DECLARATIVE_TEACHING.search(normalized_text)
         if declarative:
             normalized = normalize_subject(declarative.group("subject"))
             summary = " ".join(declarative.group("summary").strip().split())
-            if normalized and summary and _FACTUAL_PREDICATE.search(summary):
+            if normalized and summary and _FACTUAL_PREDICATE.search(summary) and not _is_user_profile_subject(normalized[1]):
                 candidates.append(SubjectCandidate(*normalized, kind="teaching", summary=summary, score=EXPLICIT_TEACHING_SCORE))
     question = _QUESTION.search(user_text)
     if question:
