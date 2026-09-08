@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invoke = vi.hoisted(() => vi.fn());
@@ -28,6 +28,16 @@ describe("PersonaAvatar", () => {
     expect(image.className).toContain("persona-avatar");
   });
 
+  it("revokes a failed image URL and returns to the initial fallback", async () => {
+    invoke.mockResolvedValue({ mime_type: "image/png", bytes: [137, 80, 78, 71] });
+    render(<PersonaAvatar personaId="persona-a" displayName="Jarvis" avatarExtension="png" />);
+
+    fireEvent.error(await screen.findByAltText("Jarvis avatar"));
+
+    expect((await screen.findByLabelText("Jarvis avatar")).textContent).toBe("J");
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:persona-avatar");
+  });
+
   it("reloads a replacement avatar with the same extension when its revision changes", async () => {
     let imageNumber = 0;
     Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => `blob:persona-avatar-${++imageNumber}`) });
@@ -43,5 +53,19 @@ describe("PersonaAvatar", () => {
     await waitFor(() => expect(screen.getByAltText("Jarvis avatar").getAttribute("src")).toBe("blob:persona-avatar-2"));
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:persona-avatar-1");
     expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("cleans up the previous Persona URL before rendering a switched Persona", async () => {
+    let imageNumber = 0;
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => `blob:persona-avatar-${++imageNumber}`) });
+    invoke.mockResolvedValue({ mime_type: "image/png", bytes: [137, 80, 78, 71] });
+    const { rerender } = render(<PersonaAvatar personaId="persona-a" displayName="Jarvis" avatarExtension="png" />);
+    await screen.findByAltText("Jarvis avatar");
+
+    rerender(<PersonaAvatar personaId="persona-b" displayName="Nova" avatarExtension="png" />);
+
+    await waitFor(() => expect(screen.getByAltText("Nova avatar").getAttribute("src")).toBe("blob:persona-avatar-2"));
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:persona-avatar-1");
+    expect(invoke).toHaveBeenLastCalledWith("read_persona_avatar", { personaId: "persona-b" });
   });
 });

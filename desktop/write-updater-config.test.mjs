@@ -47,3 +47,13 @@ test("updater-enabled config retains the configured updater contract", async () 
   });
   assert.equal(config.bundle.createUpdaterArtifacts, true);
 });
+
+test("desktop CSP permits managed avatar blob URLs without broad image access", async () => {
+  const config = JSON.parse(await readFile(join(root, "frontend", "src-tauri", "tauri.conf.json"), "utf8"));
+  const imageDirective = config.app.security.csp
+    .split(";")
+    .map((directive) => directive.trim())
+    .find((directive) => directive.startsWith("img-src "));
+  assert.ok(imageDirective?.split(/\s+/).includes("blob:"));
+  assert.equal(imageDirective?.split(/\s+/).includes("*"), false);
+});
