@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { api, ApiError } from "../api/client";
 import type { ObserveDebug, ObserveEmotion, ObserveGoalsNeeds, ObservePreferences, ObserveRelationship, ObserveStats, ObserveWorldModel, ObservationList, ObservedDecision, ObservedEpisode, ObservedIntention, ObservedKnowledge, ObservedMemory, ObservedMessage, ObservedNarrative, ObservedSelfModel } from "../types/api";
 import type { WorkspaceView } from "./Sidebar";
@@ -31,6 +32,56 @@ function MemoryWorkspace({ data, refresh }: { data: ObservationList<ObservedMemo
   useEffect(()=>setItems(data.items),[data.items]); const changeSort = async (next: typeof sort) => { setSort(next); setLoading(true); try { setItems((await api.observeMemory(next)).items); } finally { setLoading(false); } };
   return <section className="workspace-content"><Heading title="Memory" latency={data.query_latency_ms} /><div className="workspace-toolbar"><span>{data.total} long-term memories</span><div className="filter-buttons">{(["recent", "strongest", "most_recalled"] as const).map((item) => <button key={item} onClick={() => void changeSort(item)} className={sort === item ? "active" : ""}>{item.replace("_", " ")}</button>)}</div></div>{loading ? <p className="workspace-muted">Loading memories…</p> : items.length === 0 ? <p className="workspace-muted">No long-term memories yet.</p> : <div className="observation-list">{items.map((item) => <article className="observation-card" key={item.id}><p className="card-content">{item.content}</p><CorrectionControls value={item.content} onSave={(value)=>api.correctMemory(item.id,value)} onDelete={()=>api.deleteMemory(item.id)} refresh={refresh}/><dl className="card-metrics"><Metric label="Importance" value={number(item.importance)} /><Metric label="Strength" value={number(item.memory_strength)} /><Metric label="Effective" value={number(item.effective_strength)} /><Metric label="Recall" value={String(item.recall_frequency)} /></dl><p className="card-meta">Created {date(item.created_at)} · Episode {shortId(item.source_episode_id)}</p></article>)}</div>}</section>;
 }
+function MessageDeleteDialog({
+  message,
+  deleting,
+  error,
+  onCancel,
+  onConfirm,
+}: {
+  message: ObservedMessage;
+  deleting: boolean;
+  error: string | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const cancelRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    cancelRef.current?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !deleting) {
+        event.preventDefault();
+        onCancel();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [deleting, onCancel]);
+
+  return createPortal(
+    <div className="message-delete-overlay" role="presentation">
+      <div
+        className="message-delete-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="message-delete-title"
+        aria-describedby="message-delete-description"
+      >
+        <h2 id="message-delete-title">Delete this message?</h2>
+        <p id="message-delete-description">Long-term cognition records will follow their existing provenance policy.</p>
+        <p className="card-meta">{message.role} · Message {shortId(message.id)} · {date(message.created_at)}</p>
+        {error ? <p className="message-delete-error" role="alert">{error}</p> : null}
+        <div className="message-delete-actions">
+          <button ref={cancelRef} type="button" disabled={deleting} onClick={onCancel}>Cancel</button>
+          <button type="button" disabled={deleting} onClick={onConfirm}>{deleting ? "Deleting…" : error ? "Retry Delete" : "Delete Message"}</button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
 function MessagesWorkspace({ data, onDeleted }: { data: ObservationList<ObservedMessage>; onDeleted?: (conversationId: string, messageId: string) => void }) {
   const [items, setItems] = useState(data.items);
   const [pending, setPending] = useState<ObservedMessage | null>(null);
@@ -58,13 +109,14 @@ function MessagesWorkspace({ data, onDeleted }: { data: ObservationList<Observed
             : undefined,
         });
       }
-      setError("Message could not be deleted. Nothing was changed.");
+      const detail = reason instanceof ApiError ? reason.message : null;
+      setError(detail ? `Message could not be deleted: ${detail}` : "Message could not be deleted. Nothing was changed.");
     } finally {
       setDeleting(false);
     }
   };
 
-  return <section className="workspace-content"><Heading title="Messages" latency={data.query_latency_ms}/><div className="observation-list">{items.map(item=><article className="observation-card" key={item.id}><div className="card-title"><b>{item.role}</b><button type="button" disabled={deleting} onClick={()=>{setPending(item);setError(null);}}>Delete</button></div><p className="card-content">{item.content}</p><p className="card-meta">Conversation {shortId(item.conversation_id)} · Message {shortId(item.id)} · {date(item.created_at)}</p></article>)}</div>{pending&&<div className="correction-dialog" role="dialog" aria-label="Confirm message deletion"><p>Delete this durable message? Long-term cognition records will follow their existing provenance policy.</p><p className="card-meta">{pending.role} · Message {shortId(pending.id)} · {date(pending.created_at)}</p><div><button type="button" disabled={deleting} onClick={()=>{setPending(null);setError(null);}}>Cancel</button><button type="button" disabled={deleting} onClick={()=>void remove(pending)}>{deleting?"Deleting…":"Delete Message"}</button></div>{error&&<p className="workspace-muted" role="alert">{error} <button type="button" disabled={deleting} onClick={()=>void remove(pending)}>Retry</button></p>}</div>}</section>;
+  return <section className="workspace-content"><Heading title="Messages" latency={data.query_latency_ms}/><div className="observation-list">{items.map(item=><article className="observation-card" key={item.id}><div className="card-title"><b>{item.role}</b><button type="button" disabled={deleting || pending !== null} onClick={()=>{setPending(item);setError(null);}}>Delete</button></div><p className="card-content">{item.content}</p><p className="card-meta">Conversation {shortId(item.conversation_id)} · Message {shortId(item.id)} · {date(item.created_at)}</p></article>)}</div>{pending ? <MessageDeleteDialog message={pending} deleting={deleting} error={error} onCancel={()=>{setPending(null);setError(null);}} onConfirm={()=>void remove(pending)} /> : null}</section>;
 }
 
 function EmotionWorkspace({ data }: { data: ObserveEmotion }) {

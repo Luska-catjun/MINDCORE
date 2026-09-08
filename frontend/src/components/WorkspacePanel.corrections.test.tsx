@@ -10,10 +10,19 @@ const apiMock = vi.hoisted(() => ({
   observeNarratives: vi.fn(), correctNarrative: vi.fn(), deleteNarrative: vi.fn(),
   observeSelfModel: vi.fn(), correctSelfModel: vi.fn(), deleteSelfModel: vi.fn(),
 }));
+const ApiErrorMock = vi.hoisted(() => class ApiError extends Error {
+  status: number;
+  detail: unknown;
+  constructor(status: number, message: string, detail?: unknown) {
+    super(message);
+    this.status = status;
+    this.detail = detail;
+  }
+});
 
 vi.mock("../api/client", () => ({
   api: apiMock,
-  ApiError: class ApiError extends Error {},
+  ApiError: ApiErrorMock,
 }));
 
 import { WorkspacePanel } from "./WorkspacePanel";
@@ -108,12 +117,37 @@ describe("Observation corrections", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Delete" }));
     expect(apiMock.deleteMessage).not.toHaveBeenCalled();
-    expect(screen.getByRole("dialog", { name: "Confirm message deletion" })).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "Delete this message?" })).toBeTruthy();
 
     await userEvent.click(screen.getByRole("button", { name: "Delete Message" }));
     await waitFor(() => expect(apiMock.deleteMessage).toHaveBeenCalledWith("message-1"));
     expect(screen.queryByText("Message to delete")).toBeNull();
     expect(deleted).toHaveBeenCalledWith("conversation-1", "message-1");
+  });
+
+  it("renders a long-list Message confirmation as a viewport modal, not after the list", async () => {
+    const messages = Array.from({ length: 80 }, (_, index) => ({
+      ...message,
+      id: `message-${index + 1}`,
+      content: `Message ${index + 1}`,
+    }));
+    apiMock.observeMessages.mockResolvedValueOnce({
+      items: messages,
+      total: messages.length,
+      limit: 100,
+      offset: 0,
+      query_latency_ms: 1,
+    });
+
+    render(<WorkspacePanel view="messages" backendStatus="connected" onToggleSidebar={noop} />);
+    await screen.findByText("Message 1");
+    await userEvent.click(screen.getAllByRole("button", { name: "Delete" })[0]);
+
+    const dialog = screen.getByRole("dialog", { name: "Delete this message?" });
+    expect(dialog.classList.contains("message-delete-modal")).toBe(true);
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(dialog.parentElement?.classList.contains("message-delete-overlay")).toBe(true);
+    expect(dialog.parentElement?.parentElement).toBe(document.body);
   });
 
   it("does not call the Message delete API when confirmation is cancelled", async () => {
@@ -123,7 +157,7 @@ describe("Observation corrections", () => {
     await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
     expect(apiMock.deleteMessage).not.toHaveBeenCalled();
-    expect(screen.queryByRole("dialog", { name: "Confirm message deletion" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Delete this message?" })).toBeNull();
     expect(screen.getByText("Message to delete")).toBeTruthy();
   });
 
@@ -136,8 +170,57 @@ describe("Observation corrections", () => {
 
     expect((await screen.findByRole("alert")).textContent).toContain("Message could not be deleted");
     expect(screen.getByText("Message to delete")).toBeTruthy();
-    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await userEvent.click(screen.getByRole("button", { name: "Retry Delete" }));
     await waitFor(() => expect(apiMock.deleteMessage).toHaveBeenCalledTimes(2));
     expect(screen.queryByText("Message to delete")).toBeNull();
+  });
+
+  it.each([404, 409])("keeps a Message and exposes an HTTP %s delete failure", async (status) => {
+    apiMock.deleteMessage.mockRejectedValueOnce(new ApiErrorMock(status, `Request failed (${status})`));
+    render(<WorkspacePanel view="messages" backendStatus="connected" onToggleSidebar={noop} />);
+    await screen.findByText("Message to delete");
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await userEvent.click(screen.getByRole("button", { name: "Delete Message" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain(`Request failed (${status})`);
+    expect(screen.getByText("Message to delete")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry Delete" })).toBeTruthy();
+  });
+
+  it("cancels the Message dialog with Escape without calling the API", async () => {
+    render(<WorkspacePanel view="messages" backendStatus="connected" onToggleSidebar={noop} />);
+    await screen.findByText("Message to delete");
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await userEvent.keyboard("{Escape}");
+
+    expect(apiMock.deleteMessage).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Delete this message?" })).toBeNull();
+  });
+
+  it("locks the selected Message while its delete request is in flight", async () => {
+    let resolveDelete!: (value: { id: string; deleted: boolean }) => void;
+    apiMock.deleteMessage.mockImplementationOnce(() => new Promise((resolve) => { resolveDelete = resolve; }));
+    render(<WorkspacePanel view="messages" backendStatus="connected" onToggleSidebar={noop} />);
+    await screen.findByText("Message to delete");
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await userEvent.click(screen.getByRole("button", { name: "Delete Message" }));
+
+    expect(apiMock.deleteMessage).toHaveBeenCalledTimes(1);
+    expect((screen.getByRole("button", { name: "Deleting…" }) as HTMLButtonElement).disabled).toBe(true);
+    resolveDelete({ id: "message-1", deleted: true });
+    await waitFor(() => expect(screen.queryByText("Message to delete")).toBeNull());
+  });
+
+  it("does not mix multiple Message selections while a confirmation is open", async () => {
+    const second = { ...message, id: "message-2", content: "Second message" };
+    apiMock.observeMessages.mockResolvedValueOnce({ items: [message, second], total: 2, limit: 100, offset: 0, query_latency_ms: 1 });
+    render(<WorkspacePanel view="messages" backendStatus="connected" onToggleSidebar={noop} />);
+    await screen.findByText("Second message");
+    await userEvent.click(screen.getAllByRole("button", { name: "Delete" })[0]);
+
+    expect(screen.getByRole("heading", { name: "Delete this message?" })).toBeTruthy();
+    for (const button of screen.getAllByRole("button", { name: "Delete" })) {
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+    }
   });
 });
