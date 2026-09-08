@@ -14,6 +14,7 @@ from app.config import Settings
 from app.database.turso import TursoConnection
 from app.services.gemini import _call_gemini_sync
 from app.services.memory_service import build_dynamic_context, retrieve_relevant_memories
+from app.services.mindcore.knowledge import check_epistemic_state
 from app.services.prompt_loader import load_persona_identity_prompt
 
 
@@ -60,13 +61,28 @@ class MultiPersonaIsolationTests(unittest.TestCase):
                 marker,
                 now,
             )
+            await connection.execute(
+                """create table diana_knowledge (
+                    knowledge_id text primary key, subject_key text unique, canonical_name text,
+                    knowledge_type text, summary text, confidence real, status text,
+                    source_episode_id text, reinforcement_count integer, last_reinforced_at text
+                )"""
+            )
+            await connection.execute(
+                """insert into diana_knowledge (
+                    knowledge_id, subject_key, canonical_name, knowledge_type, summary,
+                    confidence, status, source_episode_id, reinforcement_count, last_reinforced_at
+                ) values ($1, $2, $3, 'concept', $4, .85, 'introduced', null, 1, $5)""",
+                f"{marker}-knowledge", f"{marker[0].casefold()}_topic", f"{marker[0]} topic", f"{marker}_KNOWLEDGE", now,
+            )
 
     def _provider_payload(
         self,
         settings: Settings,
         memories: list[dict],
+        knowledge_context: str | None = None,
     ) -> str:
-        context = build_dynamic_context([], memories)
+        context = "\n\n".join(part for part in (build_dynamic_context([], memories), knowledge_context) if part) or None
         identity = load_persona_identity_prompt(settings)
         with patch("app.services.gemini._request_gemini_sync", return_value="ok") as request:
             self.assertEqual(
@@ -106,17 +122,23 @@ class MultiPersonaIsolationTests(unittest.TestCase):
             )
             memories_a = asyncio.run(retrieve_relevant_memories(pool_a, "A_ONLY_MEMORY"))
             memories_b = asyncio.run(retrieve_relevant_memories(pool_b, "B_ONLY_MEMORY"))
-            payload_a = self._provider_payload(settings_a, memories_a)
-            payload_b = self._provider_payload(settings_b, memories_b)
+            _items_a, knowledge_a = asyncio.run(check_epistemic_state(pool_a, "A topic은 뭐야?"))
+            _items_b, knowledge_b = asyncio.run(check_epistemic_state(pool_b, "B topic은 뭐야?"))
+            payload_a = self._provider_payload(settings_a, memories_a, knowledge_a)
+            payload_b = self._provider_payload(settings_b, memories_b, knowledge_b)
 
             self.assertIn("Jarvis", payload_a)
             self.assertIn("A_ONLY_MEMORY", payload_a)
+            self.assertIn("A_ONLY_MEMORY_KNOWLEDGE", payload_a)
             self.assertNotIn("Nova", payload_a)
             self.assertNotIn("B_ONLY_MEMORY", payload_a)
+            self.assertNotIn("B_ONLY_MEMORY_KNOWLEDGE", payload_a)
             self.assertIn("Nova", payload_b)
             self.assertIn("B_ONLY_MEMORY", payload_b)
+            self.assertIn("B_ONLY_MEMORY_KNOWLEDGE", payload_b)
             self.assertNotIn("Jarvis", payload_b)
             self.assertNotIn("A_ONLY_MEMORY", payload_b)
+            self.assertNotIn("A_ONLY_MEMORY_KNOWLEDGE", payload_b)
 
             # A fresh pool is equivalent to backend restart hydration for this
             # durable boundary; no process-local cache is needed to recover A.
