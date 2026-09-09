@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from app.database.normalization import normalize_json_object
+from app.services.error_safety import safe_error_type
 from app.services.runtime_diagnostics import record_narrative_update
 from app.services.mindcore.snapshot_scope import CognitiveSnapshotScope, resolve_snapshot_scope
 
@@ -212,7 +213,7 @@ async def hydrate_narrative_snapshot(
                    order by updated_at desc limit 200"""
             )
     except Exception as exc:
-        logger.warning("Narrative snapshot hydration skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+        logger.warning("Narrative snapshot hydration skipped error_type=%s", safe_error_type(exc))
         return cell.read()
     cell.publish_replace(expected_epoch, _snapshot_rows([dict(row) for row in rows]))
     return cell.read()

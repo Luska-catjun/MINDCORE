@@ -4,6 +4,7 @@ from typing import Any
 
 from app.config import Settings
 from app.services.llm_errors import LLMError
+from app.services.error_safety import safe_error_type
 from app.services.prompt_loader import (
     PromptLoadError,
     load_persona_identity_prompt,
@@ -50,7 +51,7 @@ def _create_client(settings: Settings) -> Any:
             category="configuration",
             model=settings.groq_model,
             api_base_url=settings.groq_api_base_url,
-        ) from exc
+        ) from None
 
     return AsyncGroq(
         api_key=settings.groq_api_key,
@@ -105,13 +106,11 @@ async def _create_completion(
                         latency_ms=(time.perf_counter() - started_at) * 1000, success=False,
                         error_category=category)
         logger.error(
-            "Groq API error category=%s status=%s model=%s api_base_url=%s error_type=%s error=%s",
+            "Groq API error provider=groq category=%s status=%s model=%s error_type=%s",
             category,
             status_code,
             settings.groq_model,
-            settings.groq_api_base_url,
-            type(exc).__name__,
-            str(exc),
+            safe_error_type(exc),
         )
         raise GroqError(
             "Groq API request failed." if status_code else "Groq API connection failed.",
@@ -119,7 +118,7 @@ async def _create_completion(
             status_code=status_code,
             model=settings.groq_model,
             api_base_url=settings.groq_api_base_url,
-        ) from exc
+        ) from None
     finally:
         await client.close()
 
@@ -167,7 +166,7 @@ async def generate_reply(
                 category="prompt_configuration",
                 model=settings.groq_model,
                 api_base_url=settings.groq_api_base_url,
-            ) from exc
+            ) from None
 
     return await _create_completion(
         settings,
@@ -191,7 +190,7 @@ async def generate_memory_candidate(settings: Settings, user_content: str, diana
             category="prompt_configuration",
             model=settings.groq_model,
             api_base_url=settings.groq_api_base_url,
-        ) from exc
+        ) from None
 
     return await _create_completion(
         settings,

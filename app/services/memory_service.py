@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from app.config import Settings
+from app.services.error_safety import safe_error_type
 from app.services.llm import generate_memory_candidate
 from app.services.mindcore.decisions import detect_decision
 from app.services.mindcore.knowledge import detect_story_facts, detect_subjects
@@ -395,9 +396,8 @@ async def reinforce_recalled_memories(pool: asyncpg.Pool, memories: list[dict[st
             )
     except Exception as exc:
         logger.warning(
-            "Memory recall weight update skipped error_type=%s error=%s",
-            type(exc).__name__,
-            str(exc),
+            "Memory recall weight update skipped error_type=%s",
+            safe_error_type(exc),
         )
 
 
@@ -521,9 +521,8 @@ async def extract_and_store_memory(
         )
     except Exception as exc:
         logger.warning(
-            "Long-term memory extraction skipped error_type=%s error=%s",
-            type(exc).__name__,
-            str(exc),
+            "Long-term memory extraction skipped error_type=%s",
+            safe_error_type(exc),
         )
         return None
 

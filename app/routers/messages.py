@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from app.database.connection import get_pool
 from app.schemas.messages import MessageCreate, MessageRead
 from app.services import repository
+from app.services.error_safety import safe_database_diagnostic
 
 router = APIRouter(prefix="/messages", tags=["messages"])
 logger = logging.getLogger("diana.messages")
@@ -20,11 +21,6 @@ def _database_error_code(exc: Exception) -> str | int | None:
     )
 
 
-def _safe_error_message(exc: Exception) -> str:
-    """Keep operational logs useful without leaking a database URL or token."""
-    return " ".join(str(exc).split())[:300]
-
-
 @router.post("", response_model=MessageRead, status_code=status.HTTP_201_CREATED)
 async def create_message(payload: MessageCreate, pool: asyncpg.Pool = Depends(get_pool)) -> dict:
     return await repository.create_message(pool, payload)
@@ -35,12 +31,13 @@ async def delete_message(message_id: UUID, pool: asyncpg.Pool = Depends(get_pool
     try:
         deleted = await repository.delete_message(pool, message_id)
     except Exception as exc:
+        diagnostic = safe_database_diagnostic(exc)
         logger.error(
-            "MESSAGE_DELETE_DB_ERROR message_id=%s error_type=%s error_code=%s error=%s",
+            "MESSAGE_DELETE_DB_ERROR message_id=%s category=%s error_type=%s error_code=%s",
             message_id,
-            type(exc).__name__,
+            diagnostic.category,
+            diagnostic.error_type,
             _database_error_code(exc),
-            _safe_error_message(exc),
         )
         raise HTTPException(
             status_code=409,

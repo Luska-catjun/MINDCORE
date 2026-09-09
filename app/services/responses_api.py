@@ -79,7 +79,7 @@ def _identity(settings: Settings, config: ResponsesProvider, identity_prompt: st
         return load_persona_identity_prompt(settings)
     except PromptLoadError as exc:
         raise LLMError(str(exc), category="prompt_configuration", model=config.model,
-                       api_base_url=config.api_base_url) from exc
+                       api_base_url=config.api_base_url) from None
 
 
 def _memory_prompt(config: ResponsesProvider) -> str:
@@ -91,7 +91,7 @@ def _memory_prompt(config: ResponsesProvider) -> str:
             category="prompt_configuration",
             model=config.model,
             api_base_url=config.api_base_url,
-        ) from exc
+        ) from None
 
 
 async def generate_reply_for(provider: str, settings: Settings, user_message: str, *, dynamic_context: str | None = None, identity_prompt: str | None = None) -> str:

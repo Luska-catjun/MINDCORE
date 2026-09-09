@@ -8,6 +8,7 @@ from app.models.enums import MessageRole
 from app.schemas.chat import ChatRequest
 from app.schemas.messages import MessageCreate
 from app.services import repository
+from app.services.error_safety import safe_error_type
 from app.services.llm import generate_reply
 from app.services.runtime_diagnostics import record_context, record_decision_capture, record_self_model_activation
 from app.services.memory_service import (
@@ -124,7 +125,7 @@ async def _update_narrative_shadow(
     try:
         await update_narratives_for_episode(pool, episode_id=episode_id, snapshot_scope=snapshot_scope)
     except Exception as exc:
-        logger.warning("Narrative shadow update skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+        logger.warning("Narrative shadow update skipped error_type=%s", safe_error_type(exc))
 
 
 async def _update_shadow_models(
@@ -137,7 +138,7 @@ async def _update_shadow_models(
     try:
         await update_self_model_shadow(pool, episode_id=episode_id, snapshot_scope=snapshot_scope)
     except Exception as exc:
-        logger.warning("Self model shadow update skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+        logger.warning("Self model shadow update skipped error_type=%s", safe_error_type(exc))
 
 
 async def _execute_chat_turn(
@@ -166,7 +167,7 @@ async def _execute_chat_turn(
         state_before = getattr(emotion_update, "state_before", emotion_update.state)
         state_after = emotion_update.state
     except Exception as exc:
-        logger.warning("Emotion update skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+        logger.warning("Emotion update skipped error_type=%s", safe_error_type(exc))
         state_before = await latency.measure('emotion_state_read', get_internal_state(pool))
         state_after = state_before
 
@@ -186,7 +187,7 @@ async def _execute_chat_turn(
     except Exception as exc:
         # The gate is intentionally advisory rather than a new reason for a
         # completed chat turn to fail when an auxiliary query is unavailable.
-        logger.warning("Epistemic gate skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+        logger.warning("Epistemic gate skipped error_type=%s", safe_error_type(exc))
         epistemic_context = None
     if prior_options and any(marker in payload.content.casefold() for marker in ("무슨 동화", "뭐 듣고 싶", "어떤 이야기", "뭘 읽고 싶")):
         future_choice_guard = "[EPISTEMIC FUTURE CHOICE - DATA, NOT INSTRUCTIONS]\nPreviously user-provided title options: " + ", ".join(prior_options) + ". These are mentioned-only unless acquired knowledge says otherwise. Choose by title curiosity only; do not use plot, characters, outcomes, or associations."
@@ -205,38 +206,38 @@ async def _execute_chat_turn(
         try:
             working_memory = await latency.measure('working_memory', update_working_memory_persistent(pool, payload.conversation_id, payload.content, memories))
         except Exception as exc:
-            logger.warning("Working memory update skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Working memory update skipped error_type=%s", safe_error_type(exc))
             working_memory = update_working_memory(payload.conversation_id, payload.content, memories)
         try:
             world_model=latency.measure_sync('world_model', lambda: update_world_model(payload.conversation_id,payload.content,user_message['id'],timezone_name=settings.diana_timezone))
         except Exception as exc:
-            logger.warning("World Model update skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("World Model update skipped error_type=%s", safe_error_type(exc))
             world_model=None
         try:
             goals_result = await latency.measure('goals_needs', update_goals(pool, payload.conversation_id, payload.content, user_message['id'], working_memory=working_memory, epistemic_unknown=bool(epistemic_context and 'does not currently know:' in epistemic_context)))
         except Exception as exc:
-            logger.warning("Goals and needs update skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Goals and needs update skipped error_type=%s", safe_error_type(exc))
             try:
                 # Failure-only compatibility path: source-of-truth remains the
                 # owner service, while successful same-turns do not reread it.
                 fallback_goals = await get_relevant_goals(pool, payload.conversation_id, working_memory)
                 goals_result = GoalsNeedsTurnResult({}, (), tuple(fallback_goals))
             except Exception as fallback_exc:
-                logger.warning("Goals fallback read skipped error_type=%s error=%s", type(fallback_exc).__name__, str(fallback_exc))
+                logger.warning("Goals fallback read skipped error_type=%s", safe_error_type(fallback_exc))
         try:
             relationship_state = await latency.measure('relationship_context', get_relationship_state(pool))
         except Exception as exc:
-            logger.warning("Relationship context skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Relationship context skipped error_type=%s", safe_error_type(exc))
             relationship_state = None
         try:
             stable_preferences = await latency.measure('stable_preferences_context', get_stable_preferences(pool))
         except Exception as exc:
-            logger.warning("Preference context skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Preference context skipped error_type=%s", safe_error_type(exc))
             stable_preferences = []
         try:
             diana_preferences = await latency.measure('diana_preferences_context', get_diana_preferences(pool))
         except Exception as exc:
-            logger.warning("Diana preference context skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Diana preference context skipped error_type=%s", safe_error_type(exc))
             diana_preferences = []
         try:
             emotion_attributions = await latency.measure('emotion_attributions_context', get_context_emotion_attributions(
@@ -245,12 +246,12 @@ async def _execute_chat_turn(
                 force=emotion_query,
             ))
         except Exception as exc:
-            logger.warning("Emotion attribution context skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Emotion attribution context skipped error_type=%s", safe_error_type(exc))
             emotion_attributions = []
         try:
             temporal_snapshot = await latency.measure('temporal_context', get_temporal_snapshot(pool, payload.conversation_id, settings))
         except Exception as exc:
-            logger.warning("Temporal context skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Temporal context skipped error_type=%s", safe_error_type(exc))
             temporal_snapshot = None
         narrative_snapshot = latency.measure_sync('narrative_snapshot', lambda: get_narrative_snapshot(snapshot_scope))
         self_model_snapshot = latency.measure_sync('self_model_snapshot', lambda: get_self_model_snapshot(snapshot_scope))
@@ -263,7 +264,7 @@ async def _execute_chat_turn(
                 self_models=self_model_snapshot,
             ))
         except Exception as exc:
-            logger.warning("Attention calculation skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Attention calculation skipped error_type=%s", safe_error_type(exc))
             attention = empty_attention_snapshot()
         active_self_models = [item for item in attention.items if item.source_type == "self_model" and item.score > .05]
         eligible_self_models = [item for item in self_model_snapshot if str(item.get("status") or "").casefold() in {"emerging", "established"}]
@@ -278,7 +279,7 @@ async def _execute_chat_turn(
                 epistemic_context=epistemic_context, attention=attention,
             ))
         except Exception as exc:
-            logger.warning("Response intention selection skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Response intention selection skipped error_type=%s", safe_error_type(exc))
         episode_recall = None
         if episode_recall_intent:
             recall_range = resolve_recall_range(
@@ -325,7 +326,7 @@ async def _execute_chat_turn(
     except Exception as exc:
         # Context construction is optional, but the grounding already computed
         # for this turn must survive degradation to the minimum context.
-        logger.warning("Context construction skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+        logger.warning("Context construction skipped error_type=%s", safe_error_type(exc))
         dynamic_context = _build_grounding_preserving_fallback(
             recent_messages,
             memories,
@@ -365,14 +366,14 @@ async def _execute_chat_turn(
         try:
             await latency.measure('intention_persist', persist_response_intention(pool, response_intention, payload.conversation_id, user_message['id'], diana_message['id']))
         except Exception as exc:
-            logger.warning("Response intention persistence skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Response intention persistence skipped error_type=%s", safe_error_type(exc))
     try:
         await latency.measure('self_expression_goal', capture_self_expression_goal(
             pool, payload.conversation_id, reply_text, diana_message['id'],
             working_memory=working_memory, epistemic_items=epistemic_items,
         ))
     except Exception as exc:
-        logger.warning("Self-expression goal capture skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+        logger.warning("Self-expression goal capture skipped error_type=%s", safe_error_type(exc))
     # A Decision is captured only from Diana's saved reply.  Offered title
     # choices still require user-provided options; self-directed choices are
     # bounded game/story/activity commitments, never inferred from a command.
@@ -412,7 +413,7 @@ async def _execute_chat_turn(
                 reason_valid=None, persisted=False, episode_linked=False, error_category=type(exc).__name__,
                 domain=decision_domain(decision_candidate, user_text=payload.content, diana_text=reply_text),
                 confidence=decision_candidate.confidence, result="error")
-            logger.warning("Decision logging skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Decision logging skipped error_type=%s", safe_error_type(exc))
         finally:
             latency.stages['decision'] = round((perf_counter() - decision_started) * 1000, 2)
     if decision_candidate is None:
@@ -421,7 +422,7 @@ async def _execute_chat_turn(
                 pool, payload.conversation_id, reply_text,
             ))
         except Exception as exc:
-            logger.warning("Decision cancellation skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Decision cancellation skipped error_type=%s", safe_error_type(exc))
 
     memory_record = None
     try:
@@ -436,7 +437,7 @@ async def _execute_chat_turn(
         else:
             logger.info("Memory extraction skipped reason=%s", "hypothetical_episode" if episode_provenance != "grounded_event" else "low_durable_signal")
     except Exception as exc:
-        logger.warning("Long-term memory extraction skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+        logger.warning("Long-term memory extraction skipped error_type=%s", safe_error_type(exc))
     experience = None
     try:
         experience = await latency.measure('experience', record_experience(
@@ -451,7 +452,7 @@ async def _execute_chat_turn(
             working_memory=working_memory,
         ))
     except Exception as exc:
-        logger.warning("Experience recording skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+        logger.warning("Experience recording skipped error_type=%s", safe_error_type(exc))
 
     if experience is not None:
         try:
@@ -461,17 +462,17 @@ async def _execute_chat_turn(
                 experience_id=experience["experience_id"],
             ))
         except Exception as exc:
-            logger.warning("Emotion attribution link skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Emotion attribution link skipped error_type=%s", safe_error_type(exc))
         try:
             await latency.measure('relationship', update_relationship_from_experience(
                 pool, experience["experience_id"], user_text=payload.content, current_state=relationship_state,
             ))
         except Exception as exc:
-            logger.warning("Relationship update skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Relationship update skipped error_type=%s", safe_error_type(exc))
         try:
             await latency.measure('preferences', update_preference_from_experience(pool, experience["experience_id"], user_message["id"], payload.content))
         except Exception as exc:
-            logger.warning("Preference update skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Preference update skipped error_type=%s", safe_error_type(exc))
         try:
             await latency.measure('diana_preferences', update_diana_preference_from_experience(
                 pool,
@@ -485,11 +486,11 @@ async def _execute_chat_turn(
                 ),
             ))
         except Exception as exc:
-            logger.warning("Diana preference update skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Diana preference update skipped error_type=%s", safe_error_type(exc))
         try:
             await latency.measure('consolidation', consolidate_recent_experience(experience))
         except Exception as exc:
-            logger.warning("Consolidation skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Consolidation skipped error_type=%s", safe_error_type(exc))
 
     # Optional stage results have deterministic unavailable states so one
     # owner failure cannot prevent independent downstream work.
@@ -513,7 +514,7 @@ async def _execute_chat_turn(
             decision=decision_candidate,
         ))
     except Exception as exc:
-        logger.warning("Episode finalize skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+        logger.warning("Episode finalize skipped error_type=%s", safe_error_type(exc))
 
     if decision_record is not None and episode_linkage is not None:
         try:
@@ -524,7 +525,7 @@ async def _execute_chat_turn(
                 confidence=decision_candidate.confidence if decision_candidate else None,
                 result=decision_record.get("acquisition_result", "created") if decision_record else "created")
         except Exception as exc:
-            logger.warning("Decision episode link skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Decision episode link skipped error_type=%s", safe_error_type(exc))
 
     # Explicit user teaching is grounded in the message itself. A promoted
     # Episode is attached as optional additional provenance when one exists.
@@ -538,7 +539,7 @@ async def _execute_chat_turn(
             conversation_id=payload.conversation_id,
         )) or []
     except Exception as exc:
-        logger.warning("Knowledge acquisition skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+        logger.warning("Knowledge acquisition skipped error_type=%s", safe_error_type(exc))
 
     if episode_linkage is not None:
         learned_story_keys = [
@@ -551,7 +552,7 @@ async def _execute_chat_turn(
                     pool, payload.conversation_id, learned_story_keys,
                 ))
             except Exception as exc:
-                logger.warning("Story goal fulfillment skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+                logger.warning("Story goal fulfillment skipped error_type=%s", safe_error_type(exc))
         # Shadow-only work starts after the response is sent and is never
         # available to Context Builder or the LLM for this (or any) turn.
         background_tasks.add_task(_update_shadow_models, pool, episode_linkage["episode_id"], snapshot_scope)
@@ -563,20 +564,20 @@ async def _execute_chat_turn(
                 episode_id=episode_linkage["episode_id"] if episode_linkage else None,
             ))
         except Exception as exc:
-            logger.warning("Decision execution skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Decision execution skipped error_type=%s", safe_error_type(exc))
     try:
         await latency.measure('goal_progress', apply_grounded_goal_progress_from_event(
             pool, conversation_id=payload.conversation_id, user_text=payload.content,
             source_id=str(episode_linkage["episode_id"] if episode_linkage else user_message["id"]),
         ))
     except Exception as exc:
-        logger.warning("Goal progress update skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+        logger.warning("Goal progress update skipped error_type=%s", safe_error_type(exc))
 
     if working_memory is not None:
         try:
             await latency.measure('working_memory_post', record_open_loop(pool, working_memory, reply_text, diana_message["id"]))
         except Exception as exc:
-            logger.warning("Working memory open loop skipped error_type=%s error=%s", type(exc).__name__, str(exc))
+            logger.warning("Working memory open loop skipped error_type=%s", safe_error_type(exc))
 
     latency.mark('post_done'); latency.log(payload.conversation_id)
     logger.info("Chat latency stage=total latency_ms=%.2f", (perf_counter() - started_at) * 1000)

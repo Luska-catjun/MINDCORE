@@ -11,6 +11,7 @@ from app.database.connection import close_pool, create_pool
 from app.routers import auth, chat, conversations, episodes, health, identity, messages, observe, relationship, state
 from app.routers.auth import require_auth_settings, request_is_authenticated
 from app.services.prompt_loader import load_persona_identity_prompt
+from app.services.error_safety import safe_error_type
 from app.services.mindcore.narrative import hydrate_narrative_snapshot
 from app.services.mindcore.self_model import hydrate_self_model_snapshot
 from app.services.mindcore.snapshot_scope import CognitiveSnapshotScope
@@ -88,6 +89,22 @@ def create_app(*, settings_override: Settings | None = None, db_pool_factory: Ca
     configure_diana_logging()
     settings = settings_override or get_settings()
     app = FastAPI(title=settings.app_name, version="0.2.0", lifespan=build_lifespan(settings_override, db_pool_factory))
+
+    @app.exception_handler(Exception)
+    async def safe_unhandled_error(request: Request, exc: Exception):
+        # Starlette/Uvicorn otherwise render an unhandled driver's exception
+        # string in the server traceback. Driver text is not safe diagnostic
+        # data because it may contain a URL, token, query, or request payload.
+        logging.getLogger("diana.runtime").error(
+            "Unhandled request failure method=%s path=%s error_type=%s",
+            request.method,
+            request.url.path,
+            safe_error_type(exc),
+        )
+        return JSONResponse(
+            {"detail": {"code": "INTERNAL_ERROR", "message": "The request could not be completed."}},
+            status_code=500,
+        )
 
     app.include_router(health.router)
     app.include_router(auth.router)

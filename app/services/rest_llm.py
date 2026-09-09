@@ -80,7 +80,7 @@ def request_json(
             raise LLMError(
                 f"{provider} API request failed.", category=category, status_code=exc.code,
                 model=model, api_base_url=api_base_url,
-            ) from exc
+            ) from None
         except TimeoutError as exc:
             if attempt < max_retries:
                 time.sleep(0.25 * (attempt + 1))
@@ -90,7 +90,7 @@ def request_json(
                             input_tokens=None, output_tokens=None, total_tokens=None,
                             latency_ms=(time.perf_counter() - started_at) * 1000, success=False,
                             error_category=category)
-            raise LLMError(f"{provider} API request timed out.", category=category, model=model, api_base_url=api_base_url) from exc
+            raise LLMError(f"{provider} API request timed out.", category=category, model=model, api_base_url=api_base_url) from None
         except URLError as exc:
             category = "timeout" if isinstance(exc.reason, TimeoutError) else "network"
             if attempt < max_retries:
@@ -101,11 +101,11 @@ def request_json(
                             latency_ms=(time.perf_counter() - started_at) * 1000, success=False,
                             error_category=category)
             logger.error("LLM connection error provider=%s category=%s model=%s error_type=%s", provider, category, model, type(exc).__name__)
-            raise LLMError(f"{provider} API connection failed.", category=category, model=model, api_base_url=api_base_url) from exc
+            raise LLMError(f"{provider} API connection failed.", category=category, model=model, api_base_url=api_base_url) from None
     try:
         parsed = json.loads(body)
     except json.JSONDecodeError as exc:
-        raise LLMError(f"{provider} API returned invalid JSON.", category="response_json", model=model, api_base_url=api_base_url) from exc
+        raise LLMError(f"{provider} API returned invalid JSON.", category="response_json", model=model, api_base_url=api_base_url) from None
     if not isinstance(parsed, dict):
         raise LLMError(f"{provider} API returned an invalid response.", category="response_json", model=model, api_base_url=api_base_url)
     return parsed, (time.perf_counter() - started_at) * 1000

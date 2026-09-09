@@ -8,6 +8,7 @@ from typing import Any
 
 import asyncpg
 
+from app.services.error_safety import safe_error_type
 from app.services.mindcore.temporal import TemporalRange
 
 logger = logging.getLogger("diana.episode_recall")
@@ -80,8 +81,7 @@ async def retrieve_episodes_for_range(
         return EpisodeRecallResult("success", time_range, episodes, raw_messages)
     except Exception as exc:
         logger.warning(
-            "[RECALL] status=failed reason=%s error_type=%s",
-            str(exc),
-            type(exc).__name__,
+            "[RECALL] status=failed error_type=%s",
+            safe_error_type(exc),
         )
         return EpisodeRecallResult("failed", time_range, [], [], type(exc).__name__)

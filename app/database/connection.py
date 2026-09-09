@@ -9,6 +9,7 @@ from fastapi import Request
 
 from app.config import Settings
 from app.database.turso import TursoPool
+from app.services.error_safety import safe_database_diagnostic
 
 logger = logging.getLogger("diana.database")
 
@@ -161,7 +162,12 @@ async def get_pool(request: Request) -> AsyncIterator[asyncpg.Pool]:
     yield pool
 
 
-async def check_database(pool: asyncpg.Pool | None, host: str | None = None, port: int | None = None) -> str:
+async def check_database(
+    pool: asyncpg.Pool | None,
+    host: str | None = None,
+    port: int | None = None,
+    database_url: str | None = None,
+) -> str:
     if pool is None:
         return "not_configured"
 
@@ -170,11 +176,14 @@ async def check_database(pool: asyncpg.Pool | None, host: str | None = None, por
             await connection.fetchval("select 1")
         return "connected"
     except Exception as exc:
+        diagnostic = safe_database_diagnostic(exc, database_url)
         logger.error(
-            "Database health check failed host=%s port=%s error_type=%s error_message=%s",
-            host or "unknown",
-            port or "unknown",
-            type(exc).__name__,
-            str(exc),
+            "Database health check failed category=%s error_type=%s "
+            "database_url_present=%s database_url_scheme=%s database_host_present=%s",
+            diagnostic.category,
+            diagnostic.error_type,
+            str(diagnostic.url_present).lower(),
+            diagnostic.url_scheme,
+            str(diagnostic.host_present or bool(host)).lower(),
         )
         return "error"

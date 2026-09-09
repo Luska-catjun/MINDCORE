@@ -56,7 +56,7 @@ def _identity(settings: Settings, identity_prompt: str | None) -> str:
         return load_persona_identity_prompt(settings)
     except PromptLoadError as exc:
         raise LLMError(str(exc), category="prompt_configuration", model=settings.anthropic_model,
-                       api_base_url=settings.anthropic_api_base_url) from exc
+                       api_base_url=settings.anthropic_api_base_url) from None
 
 
 def _memory_prompt(settings: Settings) -> str:
@@ -68,7 +68,7 @@ def _memory_prompt(settings: Settings) -> str:
             category="prompt_configuration",
             model=settings.anthropic_model,
             api_base_url=settings.anthropic_api_base_url,
-        ) from exc
+        ) from None
 
 
 async def generate_reply(settings: Settings, user_message: str, *, dynamic_context: str | None = None, identity_prompt: str | None = None) -> str:

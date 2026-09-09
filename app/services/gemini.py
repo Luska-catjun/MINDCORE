@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 
 from app.config import Settings
 from app.services.llm_errors import LLMError
+from app.services.error_safety import safe_error_type
 from app.services.prompt_loader import (
     PromptLoadError,
     load_persona_identity_prompt,
@@ -21,13 +22,6 @@ logger = logging.getLogger("diana.gemini")
 
 class GeminiError(LLMError):
     pass
-
-
-def _sanitize_for_log(text: str, settings: Settings) -> str:
-    sanitized = text
-    if settings.gemini_api_key:
-        sanitized = sanitized.replace(settings.gemini_api_key, "[REDACTED_GEMINI_API_KEY]")
-    return sanitized
 
 
 def _classify_http_error(status_code: int, body: str) -> str:
@@ -123,8 +117,7 @@ def _request_gemini_sync(settings: Settings, payload: dict[str, Any], request_ki
             break
         except HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
-            safe_body = _sanitize_for_log(error_body, settings)
-            category = _classify_http_error(exc.code, safe_body)
+            category = _classify_http_error(exc.code, error_body)
             if category == "gemini_server" and attempt < settings.gemini_max_retries:
                 logger.warning(
                     "Gemini API retry provider=gemini request_kind=%s attempt=%s category=%s status=%s model=%s",
@@ -137,12 +130,11 @@ def _request_gemini_sync(settings: Settings, payload: dict[str, Any], request_ki
                 time.sleep(0.25 * (attempt + 1))
                 continue
             logger.error(
-                "Gemini API HTTP error status=%s category=%s model=%s api_base_url=%s response_body=%s",
+                "Gemini API HTTP error provider=gemini status=%s category=%s model=%s error_type=%s",
                 exc.code,
                 category,
                 settings.gemini_model,
-                settings.gemini_api_base_url,
-                safe_body,
+                safe_error_type(exc),
             )
             raise GeminiError(
                 f"Gemini API failed with HTTP {exc.code}.",
@@ -150,7 +142,7 @@ def _request_gemini_sync(settings: Settings, payload: dict[str, Any], request_ki
                 status_code=exc.code,
                 model=settings.gemini_model,
                 api_base_url=settings.gemini_api_base_url,
-            ) from exc
+            ) from None
         except TimeoutError as exc:
             if attempt < settings.gemini_max_retries:
                 logger.warning(
@@ -162,40 +154,38 @@ def _request_gemini_sync(settings: Settings, payload: dict[str, Any], request_ki
                 time.sleep(0.25 * (attempt + 1))
                 continue
             logger.error(
-                "Gemini API timeout category=timeout model=%s api_base_url=%s",
+                "Gemini API timeout provider=gemini category=timeout model=%s error_type=%s",
                 settings.gemini_model,
-                settings.gemini_api_base_url,
+                safe_error_type(exc),
             )
             raise GeminiError(
                 "Gemini API request timed out.",
                 category="timeout",
                 model=settings.gemini_model,
                 api_base_url=settings.gemini_api_base_url,
-            ) from exc
+            ) from None
         except URLError as exc:
-            safe_reason = _sanitize_for_log(str(exc.reason), settings)
             if attempt < settings.gemini_max_retries:
                 logger.warning(
-                    "Gemini API retry provider=gemini request_kind=%s attempt=%s category=network model=%s error=%s",
+                    "Gemini API retry provider=gemini request_kind=%s attempt=%s category=network model=%s error_type=%s",
                     request_kind,
                     attempt + 1,
                     settings.gemini_model,
-                    safe_reason,
+                    safe_error_type(exc),
                 )
                 time.sleep(0.25 * (attempt + 1))
                 continue
             logger.error(
-                "Gemini API connection error category=network model=%s api_base_url=%s error=%s",
+                "Gemini API connection error provider=gemini category=network model=%s error_type=%s",
                 settings.gemini_model,
-                settings.gemini_api_base_url,
-                safe_reason,
+                safe_error_type(exc),
             )
             raise GeminiError(
-                f"Gemini API connection failed: {safe_reason}",
+                "Gemini API connection failed.",
                 category="network",
                 model=settings.gemini_model,
                 api_base_url=settings.gemini_api_base_url,
-            ) from exc
+            ) from None
     else:  # pragma: no cover - the loop exits by break or exception.
         raise AssertionError("Gemini request retry loop ended unexpectedly.")
 
@@ -203,17 +193,16 @@ def _request_gemini_sync(settings: Settings, payload: dict[str, Any], request_ki
         parsed = json.loads(body)
     except json.JSONDecodeError as exc:
         logger.error(
-            "Gemini API returned invalid JSON category=response_json model=%s api_base_url=%s response_body=%s",
+            "Gemini API returned invalid JSON provider=gemini category=response_json model=%s error_type=%s",
             settings.gemini_model,
-            settings.gemini_api_base_url,
-            _sanitize_for_log(body, settings),
+            safe_error_type(exc),
         )
         raise GeminiError(
             "Gemini API returned invalid JSON.",
             category="response_json",
             model=settings.gemini_model,
             api_base_url=settings.gemini_api_base_url,
-        ) from exc
+        ) from None
 
     usage = parsed.get("usageMetadata") or {}
     latency_ms = (time.perf_counter() - started_at) * 1000
@@ -247,7 +236,7 @@ def _call_gemini_sync(
                 category="prompt_configuration",
                 model=settings.gemini_model,
                 api_base_url=settings.gemini_api_base_url,
-            ) from exc
+            ) from None
 
     payload = build_generate_content_payload(
         prompt,
@@ -267,7 +256,7 @@ def _extract_memory_candidate_sync(settings: Settings, user_content: str, diana_
             category="prompt_configuration",
             model=settings.gemini_model,
             api_base_url=settings.gemini_api_base_url,
-        ) from exc
+        ) from None
 
     payload = build_generate_content_payload(
         f"[USER MESSAGE]\n{user_content}\n\n[PERSONA RESPONSE]\n{diana_content}",
