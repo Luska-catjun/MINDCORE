@@ -131,7 +131,21 @@ fn legacy_identity_path(app: &AppHandle) -> Result<PathBuf, String> {
         .join("identity.txt"))
 }
 fn registry(app: &AppHandle) -> Result<Option<PersonaRegistry>, String> {
-    persona_registry::migrate_legacy_config(&config_path(app)?)
+    let config = config_path(app)?;
+    let Some(mut registry) = persona_registry::migrate_legacy_config(&config)? else {
+        return Ok(None);
+    };
+    if persona_registry::recover_deleting_personas_with(
+        &config,
+        &mut registry,
+        persona_registry::cleanup_managed_persona_files,
+        persona_registry::save_registry,
+    )
+    .is_err()
+    {
+        eprintln!("[MINDCORE_PERSONA_LIFECYCLE] cleanup_retry=failed");
+    }
+    Ok(Some(registry))
 }
 fn active_profile(app: &AppHandle) -> Result<PersonaProfile, String> {
     let registry = registry(app)?.ok_or_else(|| "MindCore setup is incomplete.".to_string())?;
@@ -413,25 +427,7 @@ fn preflight_draft_env(app: &AppHandle, action: &str, d: &SetupDraft) -> Result<
     preflight_env_for_action(action, &full)
 }
 fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| "Configuration directory is unavailable".to_string())?;
-    fs::create_dir_all(dir)
-        .map_err(|_| "Could not create MindCore configuration directory.".to_string())?;
-    let tmp = dir.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("mindcore"),
-        std::process::id()
-    ));
-    fs::write(&tmp, text).map_err(|_| "Could not save MindCore configuration.".to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-    }
-    fs::rename(tmp, path).map_err(|_| "Could not finalize MindCore configuration.".to_string())
+    persona_registry::secure_atomic_write(path, text)
 }
 #[cfg(debug_assertions)]
 fn print_setup_failure_diagnostic(action: &str, exit_code: Option<i32>, stderr: &[u8]) {
@@ -707,25 +703,18 @@ fn persist_active_draft(app: &AppHandle, draft: &SetupDraft) -> Result<(), Strin
     let Some(mut registry) = persona_registry::load_registry(&config)? else {
         return Ok(());
     };
-    let index = registry
-        .personas
-        .iter()
-        .position(|persona| persona.persona_id == registry.active_persona_id)
-        .ok_or_else(|| "The active Persona profile is unavailable.".to_string())?;
-    let identity = PathBuf::from(registry.personas[index].identity_path.clone());
     let global = persona_registry::parse_env(&draft_env(app, draft)?);
-    let profile_text = persona_registry::profile_config_text(
-        &registry.personas[index].persona_id,
+    let active_persona_id = registry.active_persona_id.clone();
+    persona_registry::persist_profile_update_with(
+        &config,
+        &mut registry,
+        &active_persona_id,
         draft.persona_display_name.trim(),
-        &identity,
         &global,
-    );
-    persona_registry::secure_atomic_write(
-        Path::new(&registry.personas[index].config_path),
-        &profile_text,
+        persona_registry::secure_atomic_write,
+        persona_registry::save_registry,
     )?;
-    registry.personas[index].display_name = draft.persona_display_name.trim().to_string();
-    persona_registry::save_registry(&config, &registry)
+    Ok(())
 }
 
 #[tauri::command]
@@ -758,67 +747,20 @@ fn create_persona(
     let config = config_path(&app)?;
     let mut registry = registry(&app)?
         .ok_or_else(|| "Create the first Persona through Setup first.".to_string())?;
-    let name = persona_registry::validate_display_name(&draft.display_name)?;
-    if registry
-        .personas
-        .iter()
-        .any(|persona| persona.display_name.to_lowercase() == name.to_lowercase())
-    {
-        return Err("Persona names must be unique.".to_string());
-    }
-    if identity.trim().is_empty() || identity.len() > MAX_IDENTITY_BYTES || identity.contains('\0')
-    {
-        return Err("Identity must be UTF-8 plain text under 64 KB.".to_string());
-    }
-    if draft.database_url.trim().is_empty() || draft.database_auth_token.trim().is_empty() {
-        return Err("Complete all required Persona database fields.".to_string());
-    }
-    let persona_id = persona_registry::new_persona_id()?;
-    let directory = persona_registry::persona_directory(&config, &persona_id)?;
-    let identity_path = directory.join("identity.txt");
-    let profile_path = directory.join("persona.env");
-    let source = std::collections::BTreeMap::from([
-        (
-            "DATABASE_URL".to_string(),
-            draft.database_url.trim().to_string(),
-        ),
-        (
-            "DATABASE_AUTH_TOKEN".to_string(),
-            draft.database_auth_token.trim().to_string(),
-        ),
-    ]);
-    persona_registry::secure_atomic_write(&identity_path, &identity)?;
-    persona_registry::secure_atomic_write(
-        &profile_path,
-        &persona_registry::profile_config_text(&persona_id, &name, &identity_path, &source),
-    )?;
-    if let Err(error) = run_setup_with_config(&app, "initialize", &profile_path) {
-        let _ = fs::remove_dir_all(&directory);
-        return Err(error);
-    }
-    let created_at = persona_registry::now_epoch_seconds();
-    let profile = PersonaProfile {
-        persona_id: persona_id.clone(),
-        display_name: name,
-        identity_path: identity_path.to_string_lossy().into_owned(),
-        config_path: profile_path.to_string_lossy().into_owned(),
-        created_at,
-        last_used_at: None,
-        avatar_extension: None,
-    };
-    registry.personas.push(profile.clone());
-    if let Err(error) = persona_registry::save_registry(&config, &registry) {
-        let _ = fs::remove_dir_all(&directory);
-        return Err(error);
-    }
-    Ok(PersonaSummary {
-        persona_id: profile.persona_id,
-        display_name: profile.display_name,
-        created_at: profile.created_at,
-        last_used_at: profile.last_used_at,
-        active: false,
-        avatar_extension: None,
-    })
+    persona_registry::provision_persona_with(
+        &config,
+        &mut registry,
+        persona_registry::PersonaProvisioningInput {
+            display_name: &draft.display_name,
+            identity: &identity,
+            database_url: &draft.database_url,
+            database_auth_token: &draft.database_auth_token,
+        },
+        persona_registry::secure_atomic_write,
+        persona_registry::save_registry,
+        |profile_path| run_setup_with_config(&app, "database", profile_path).map(|_| ()),
+        |profile_path| run_setup_with_config(&app, "initialize", profile_path).map(|_| ()),
+    )
 }
 
 #[tauri::command]
@@ -895,20 +837,42 @@ fn update_persona(
         registry(&app)?.ok_or_else(|| "MindCore setup is incomplete.".to_string())?;
     let previous_registry = registry.clone();
     let active = registry.active_persona_id == persona_id;
-    let summary =
-        persona_registry::rename_persona(&mut registry, &persona_id, &draft.display_name)?;
+    let profile = registry
+        .personas
+        .iter()
+        .find(|profile| profile.persona_id == persona_id)
+        .ok_or_else(|| "Persona was not found.".to_string())?;
+    let database_source = persona_registry::parse_env(
+        &fs::read_to_string(&profile.config_path)
+            .map_err(|_| "Could not read the Persona configuration.".to_string())?,
+    );
+    let summary = persona_registry::persist_profile_update_with(
+        &config,
+        &mut registry,
+        &persona_id,
+        &draft.display_name,
+        &database_source,
+        persona_registry::secure_atomic_write,
+        persona_registry::save_registry,
+    )?;
     if active {
         stop_sidecar(&app);
-    }
-    if let Err(error) = persona_registry::save_registry(&config, &registry) {
-        if active {
-            let _ = start_sidecar(&app);
-        }
-        return Err(error);
-    }
-    if active {
         if let Err(error) = start_sidecar(&app) {
-            let _ = persona_registry::save_registry(&config, &previous_registry);
+            if let Some(previous) = previous_registry
+                .personas
+                .iter()
+                .find(|profile| profile.persona_id == persona_id)
+            {
+                let _ = persona_registry::persist_profile_update_with(
+                    &config,
+                    &mut registry,
+                    &persona_id,
+                    &previous.display_name,
+                    &database_source,
+                    persona_registry::secure_atomic_write,
+                    persona_registry::save_registry,
+                );
+            }
             let _ = start_sidecar(&app);
             return Err(error);
         }
@@ -937,8 +901,8 @@ fn switch_active_persona(app: AppHandle, persona_id: String) -> Result<PersonaSu
         return Err("Persona was not found.".to_string());
     }
     let previous_registry = registry.clone();
-    stop_sidecar(&app);
     persona_registry::activate_persona(&mut registry, &persona_id)?;
+    stop_sidecar(&app);
     if let Err(error) = persona_registry::save_registry(&config, &registry) {
         let _ = start_sidecar(&app);
         return Err(error);
@@ -955,17 +919,28 @@ fn switch_active_persona(app: AppHandle, persona_id: String) -> Result<PersonaSu
 }
 
 #[tauri::command]
-fn delete_persona(app: AppHandle, persona_id: String, confirmation: String) -> Result<(), String> {
+fn delete_persona(
+    app: AppHandle,
+    persona_id: String,
+    confirmation: String,
+) -> Result<persona_registry::PersonaDeleteResult, String> {
     let state = app.state::<PersonaRegistryLock>();
     let _guard = state.0.lock().expect("persona registry lock");
     let config = config_path(&app)?;
     let mut registry =
         registry(&app)?.ok_or_else(|| "MindCore setup is incomplete.".to_string())?;
-    let mut profile =
-        persona_registry::remove_inactive_persona(&mut registry, &persona_id, &confirmation)?;
-    persona_registry::save_registry(&config, &registry)?;
-    persona_registry::cleanup_managed_persona_files(&config, &mut profile)?;
-    Ok(())
+    let result = persona_registry::delete_persona_with(
+        &config,
+        &mut registry,
+        &persona_id,
+        &confirmation,
+        persona_registry::cleanup_managed_persona_files,
+        persona_registry::save_registry,
+    )?;
+    if result.cleanup_pending {
+        eprintln!("[MINDCORE_PERSONA_LIFECYCLE] managed_cleanup=pending");
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1049,16 +1024,27 @@ fn save_mindcore_config(app: AppHandle, draft: SetupDraft, identity: String) -> 
         return Err("Identity must be UTF-8 plain text under 64 KB.".into());
     }
     validate_draft(&draft)?;
+    let config = config_path(&app)?;
+    let identity_path = identity_path(&app)?;
+    let existing_registry = registry(&app)?;
+    let full_values = persona_registry::parse_env(&draft_env(&app, &draft)?);
+    let global = render_env_values(persona_registry::global_config_values(&full_values));
     if !draft.preserve_identity {
-        atomic_write(&identity_path(&app)?, &identity)?;
+        atomic_write(&identity_path, &identity)?;
     }
-    let global = draft_env(&app, &draft)?;
-    atomic_write(&config_path(&app)?, &global)?;
-    if registry(&app)?.is_some() {
+    if existing_registry.is_some() {
         persist_active_draft(&app, &draft)?;
+        atomic_write(&config, &global)?;
     } else {
-        persona_registry::migrate_legacy_config(&config_path(&app)?)?
-            .ok_or_else(|| "Could not create the first Persona profile.".to_string())?;
+        atomic_write(&config, &global)?;
+        persona_registry::create_initial_registry_with(
+            &config,
+            draft.persona_display_name.trim(),
+            &identity_path,
+            &full_values,
+            persona_registry::secure_atomic_write,
+            persona_registry::save_registry,
+        )?;
     }
     Ok(())
 }
