@@ -25,6 +25,7 @@ logger = logging.getLogger("diana.memory")
 MEMORY_TYPES = {"user_fact", "shared_event", "preference", "relationship", "diana_learning"}
 WRITABLE_MEMORY_TYPES = {"user_fact", "shared_event"}
 MAX_RETRIEVED_MEMORIES = 8
+MEMORY_RETRIEVAL_PAGE_SIZE = 100
 RECENT_MESSAGE_LIMIT = 8
 MEMORY_RECALL_STRENGTH_BOOST = 0.03
 MEMORY_DEDUPLICATION_STRENGTH_BOOST = 0.01
@@ -317,47 +318,113 @@ def _weight_rank_bonus(memory: dict[str, Any]) -> float:
     )
 
 
+def _memory_rank_sort_key(
+    item: tuple[int, dict[str, Any]],
+) -> tuple[float, float, float, float, str]:
+    relevance, memory = item
+    updated_at = _as_utc(memory.get("updated_at"))
+    updated_rank = updated_at.timestamp() if updated_at is not None else float("-inf")
+    return (
+        -float(relevance),
+        -_weight_rank_bonus(memory),
+        -updated_rank,
+        -float(memory.get("importance") or 0.0),
+        str(memory.get("memory_id") or ""),
+    )
+
+
+def _retain_top_ranked_memory(
+    ranked_by_id: dict[str, tuple[int, dict[str, Any]]],
+    item: tuple[int, dict[str, Any]],
+    *,
+    limit: int,
+) -> None:
+    memory_id = str(item[1].get("memory_id") or "")
+    previous = ranked_by_id.get(memory_id)
+    if previous is None or _memory_rank_sort_key(item) < _memory_rank_sort_key(previous):
+        ranked_by_id[memory_id] = item
+    if len(ranked_by_id) > limit:
+        retained = sorted(ranked_by_id.values(), key=_memory_rank_sort_key)[:limit]
+        ranked_by_id.clear()
+        ranked_by_id.update(
+            (str(memory.get("memory_id") or ""), (relevance, memory))
+            for relevance, memory in retained
+        )
+
+
 async def retrieve_relevant_memories(
     pool: asyncpg.Pool,
     user_message: str,
     *,
     limit: int = MAX_RETRIEVED_MEMORIES,
 ) -> list[dict[str, Any]]:
-    if not _keywords(user_message):
+    if limit <= 0 or not _keywords(user_message):
         return []
 
-    async with pool.acquire() as connection:
-        records = await connection.fetch(
-            """
-            select memory_id, content, memory_type, importance, recall_frequency,
-                memory_strength, last_recalled_at, created_at, updated_at
-            from memories
-            order by importance desc, updated_at desc
-            limit 100
-            """
-        )
-
     current_time = datetime.now(timezone.utc)
-    ranked = []
-    for record in records:
-        memory = dict(record)
-        if not is_retrievable_memory(memory):
-            continue
-        memory["effective_memory_strength"] = calculate_effective_memory_strength(
-            memory["memory_strength"], memory["importance"],
-            last_recalled_at=memory["last_recalled_at"],
-            updated_at=memory["updated_at"], created_at=memory["created_at"],
-            current_time=current_time,
-        )
-        ranked.append((_memory_relevance(user_message, memory["content"]), memory))
-    ranked = [item for item in ranked if item[0] > 0]
-    # Relevance is always the primary sort key. Weight only breaks ties between
-    # memories that have the same keyword relevance to the current message.
-    ranked.sort(
-        key=lambda item: (item[0], _weight_rank_bonus(item[1]), item[1]["updated_at"]),
-        reverse=True,
-    )
-    return [record for _, record in ranked[:limit]]
+    ranked_by_id: dict[str, tuple[int, dict[str, Any]]] = {}
+    last_memory_id: Any | None = None
+    async with pool.acquire() as connection:
+        # Relevance is computed for every durable Memory, but only one bounded
+        # page and the current top-K are retained in Python at a time. Keyset
+        # pagination avoids making a global importance cutoff the authority.
+        while True:
+            if last_memory_id is None:
+                records = await connection.fetch(
+                    """
+                    select memory_id, content, memory_type, importance, recall_frequency,
+                        memory_strength, last_recalled_at, created_at, updated_at
+                    from memories
+                    order by memory_id asc
+                    limit $1
+                    """,
+                    MEMORY_RETRIEVAL_PAGE_SIZE,
+                )
+            else:
+                records = await connection.fetch(
+                    """
+                    select memory_id, content, memory_type, importance, recall_frequency,
+                        memory_strength, last_recalled_at, created_at, updated_at
+                    from memories
+                    where memory_id > $1
+                    order by memory_id asc
+                    limit $2
+                    """,
+                    last_memory_id,
+                    MEMORY_RETRIEVAL_PAGE_SIZE,
+                )
+            if not records:
+                break
+
+            next_memory_id = records[-1]["memory_id"]
+            if next_memory_id == last_memory_id:
+                break
+            last_memory_id = next_memory_id
+            for record in records:
+                memory = dict(record)
+                if not is_retrievable_memory(memory):
+                    continue
+                relevance = _memory_relevance(user_message, memory["content"])
+                if relevance <= 0:
+                    continue
+                memory["effective_memory_strength"] = calculate_effective_memory_strength(
+                    memory["memory_strength"],
+                    memory["importance"],
+                    last_recalled_at=memory["last_recalled_at"],
+                    updated_at=memory["updated_at"],
+                    created_at=memory["created_at"],
+                    current_time=current_time,
+                )
+                _retain_top_ranked_memory(
+                    ranked_by_id,
+                    (relevance, memory),
+                    limit=limit,
+                )
+            if len(records) < MEMORY_RETRIEVAL_PAGE_SIZE:
+                break
+
+    ranked = sorted(ranked_by_id.values(), key=_memory_rank_sort_key)
+    return [memory for _, memory in ranked]
 
 
 async def reinforce_recalled_memories(pool: asyncpg.Pool, memories: list[dict[str, Any]]) -> None:
