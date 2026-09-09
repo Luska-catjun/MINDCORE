@@ -30,7 +30,6 @@ const SHUTDOWN_CAPABILITY_HEADER: &str = "X-MindCore-Desktop-Shutdown";
 const DESKTOP_INSTANCE_HEADER: &str = "X-MindCore-Desktop-Instance";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(250);
-#[cfg(test)]
 const UPDATER_PLUGIN_ENABLED: bool = !cfg!(mindcore_updater_disabled);
 const LLM_PROVIDERS: [&str; 5] = ["gemini", "groq", "anthropic", "xai", "openai"];
 struct Sidecar {
@@ -47,6 +46,10 @@ struct SetupStatus {
     configured: bool,
     config_path: String,
     identity_path: String,
+}
+#[derive(Debug, PartialEq, Serialize)]
+struct RuntimeCapabilities {
+    updater_available: bool,
 }
 #[derive(Serialize)]
 struct ConfigMetadata {
@@ -974,6 +977,12 @@ fn get_setup_status(app: AppHandle) -> Result<SetupStatus, String> {
     })
 }
 #[tauri::command]
+fn get_runtime_capabilities() -> RuntimeCapabilities {
+    RuntimeCapabilities {
+        updater_available: UPDATER_PLUGIN_ENABLED,
+    }
+}
+#[tauri::command]
 fn get_config_metadata(app: AppHandle) -> Result<ConfigMetadata, String> {
     let text = fs::read_to_string(config_path(&app)?)
         .map_err(|_| "MindCore configuration is unavailable.".to_string())?;
@@ -1234,12 +1243,24 @@ mod setup_validation_tests {
     #[test]
     fn updater_disabled_build_skips_updater_plugin_registration() {
         assert!(!UPDATER_PLUGIN_ENABLED);
+        assert_eq!(
+            get_runtime_capabilities(),
+            RuntimeCapabilities {
+                updater_available: false,
+            }
+        );
     }
 
     #[cfg(not(mindcore_updater_disabled))]
     #[test]
     fn updater_enabled_build_keeps_updater_plugin_registration() {
         assert!(UPDATER_PLUGIN_ENABLED);
+        assert_eq!(
+            get_runtime_capabilities(),
+            RuntimeCapabilities {
+                updater_available: true,
+            }
+        );
     }
 
     #[test]
@@ -1390,6 +1411,7 @@ fn main() {
     let app = app
         .invoke_handler(tauri::generate_handler![
             get_setup_status,
+            get_runtime_capabilities,
             get_config_metadata,
             run_setup_action,
             generic_identity_template,

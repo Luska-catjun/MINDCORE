@@ -31,6 +31,7 @@ const DEFAULT_CONVERSATION_TITLE = "MindCore conversation";
 type BackendStatus = "checking" | "connected" | "error";
 type AuthStatus = "checking" | "authenticated" | "unauthenticated";
 type SetupState = "checking" | "needed" | "configured";
+type RuntimeCapabilities = { updater_available: boolean };
 
 function App() {
   const [personaDisplayName, setPersonaDisplayName] = useState(DEFAULT_PERSONA_DISPLAY_NAME);
@@ -58,6 +59,7 @@ function App() {
   const [startupProgress, setStartupProgress] = useState(8);
   const [setupState, setSetupState] = useState<SetupState>(isDesktopRuntime() ? "checking" : "configured");
   const [reconfiguring, setReconfiguring] = useState(false);
+  const [updaterAvailable, setUpdaterAvailable] = useState(false);
 
   const clearSessionState = useCallback(() => {
     sessionGenerationRef.current += 1;
@@ -119,6 +121,9 @@ function App() {
   useEffect(() => {
     if (!isDesktopRuntime()) return;
     void invoke<{ configured: boolean }>("get_setup_status").then((status) => setSetupState(status.configured ? "configured" : "needed")).catch(() => setSetupState("needed"));
+    void invoke<RuntimeCapabilities>("get_runtime_capabilities")
+      .then((capabilities) => setUpdaterAvailable(capabilities?.updater_available === true))
+      .catch(() => setUpdaterAvailable(false));
   }, []);
 
   useEffect(() => {
@@ -440,7 +445,7 @@ function App() {
           <div className="error-banner error-banner-top">백엔드 서버에 연결할 수 없습니다. FastAPI 서버와 API 주소를 확인해주세요.</div>
         )}
         {globalError && <div className="error-banner error-banner-top">{globalError}</div>}
-        {isDesktopRuntime() && <DesktopUpdater />}
+        {isDesktopRuntime() && updaterAvailable && <DesktopUpdater />}
 
         {activeView === "chat" ? (
           <ChatWindow

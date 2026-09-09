@@ -32,6 +32,7 @@ test("updater-disabled config omits the updater plugin and artifacts", async () 
   const config = await generateConfig({ MINDCORE_UPDATER_DISABLED: "1" });
   assert.equal(config.plugins, undefined);
   assert.equal(config.bundle.createUpdaterArtifacts, false);
+  assert.deepEqual(config.app.security.capabilities[0].permissions, ["core:default", "process:default"]);
 });
 
 test("updater-enabled config retains the configured updater contract", async () => {
@@ -46,6 +47,11 @@ test("updater-enabled config retains the configured updater contract", async () 
     },
   });
   assert.equal(config.bundle.createUpdaterArtifacts, true);
+  assert.deepEqual(config.app.security.capabilities[0].permissions, [
+    "core:default",
+    "updater:default",
+    "process:default",
+  ]);
 });
 
 test("desktop CSP permits managed avatar blob URLs without broad image access", async () => {

@@ -14,6 +14,11 @@ const updaterDisabled = process.env.MINDCORE_UPDATER_DISABLED === "1";
 const endpoint = process.env.MINDCORE_UPDATE_ENDPOINT
   ?? "https://updates.mindcore.invalid/{{target}}/{{arch}}/{{current_version}}";
 const pubkey = process.env.MINDCORE_UPDATER_PUBKEY ?? developmentPublicKey;
+const permissions = [
+  "core:default",
+  ...(updaterDisabled ? [] : ["updater:default"]),
+  "process:default",
+];
 
 if (!updaterDisabled && !endpoint.startsWith("https://")) {
   throw new Error("MINDCORE_UPDATE_ENDPOINT must use HTTPS.");
@@ -29,6 +34,19 @@ if (!version) {
 
 const config = {
   version,
+  app: {
+    security: {
+      // A non-empty inline capability list is authoritative over capability
+      // files. This keeps permissions aligned with the same build flag that
+      // controls plugin registration and updater artifacts.
+      capabilities: [{
+        identifier: "default",
+        description: "Minimum permissions for the MindCore frontend shell.",
+        windows: ["main"],
+        permissions,
+      }],
+    },
+  },
   ...(updaterDisabled ? {} : { plugins: { updater: { pubkey, endpoints: [endpoint] } } }),
   bundle: { createUpdaterArtifacts: !updaterDisabled },
 };
