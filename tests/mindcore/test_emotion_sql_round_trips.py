@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 import unittest
 
 import libsql
 
-from app.database.turso import TursoConnection
+from app.database.turso import TursoConnection, TursoPool
 from app.services.mindcore.internal_state import (
     EMOTION_BASELINES,
     _default_state,
@@ -29,6 +32,7 @@ class RecordingEmotionConnection(TursoConnection):
         self.operations: list[str] = []
         self.transactions = 0
         self.fail_state_log = False
+        self.fail_state_upsert = False
 
     async def execute(self, statement, *args):
         normalized = " ".join(statement.casefold().split())
@@ -36,6 +40,8 @@ class RecordingEmotionConnection(TursoConnection):
             self.operations.append("state_load")
         elif normalized.startswith("insert into diana_state"):
             self.operations.append("state_upsert")
+            if self.fail_state_upsert:
+                raise RuntimeError("injected state-upsert failure")
         elif normalized.startswith("insert into state_log"):
             self.operations.append("state_log")
             if self.fail_state_log:
@@ -56,6 +62,15 @@ class RecordingEmotionConnection(TursoConnection):
 class LocalEmotionPool:
     def __init__(self) -> None:
         self.connection = RecordingEmotionConnection(libsql.connect(":memory:"))
+
+    @asynccontextmanager
+    async def acquire(self):
+        yield self.connection
+
+
+class PoolForExistingConnection:
+    def __init__(self, connection: RecordingEmotionConnection) -> None:
+        self.connection = connection
 
     @asynccontextmanager
     async def acquire(self):
@@ -106,25 +121,40 @@ class EmotionSqlRoundTripTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.state["mood_valence"], expected["mood_valence"])
         self.assertEqual(
             self.pool.connection.operations,
-            ["state_load", "state_upsert", "state_log", "attribution_insert", "attribution_insert", "attribution_insert"],
+            ["state_log", "state_load", "state_upsert", "attribution_insert", "attribution_insert", "attribution_insert"],
         )
         self.assertEqual(self.pool.connection.transactions, 1)
 
-    async def test_duplicate_attribution_is_a_single_guarded_insert_noop(self) -> None:
-        await update_from_user_event(self.pool, "너 정말 귀엽고 대단해", self.conversation_id, self.message_id)
+    async def test_same_message_replay_is_an_exactly_once_state_transition(self) -> None:
+        first = await update_from_user_event(self.pool, "너 정말 귀엽고 대단해", self.conversation_id, self.message_id)
         self.pool.connection.operations.clear()
         self.pool.connection.transactions = 0
 
         duplicate = await update_from_user_event(self.pool, "너 정말 귀엽고 대단해", self.conversation_id, self.message_id)
 
         self.assertEqual(duplicate.attribution_ids, [])
-        self.assertEqual(
-            self.pool.connection.operations,
-            ["state_load", "state_upsert", "state_log", "attribution_insert", "attribution_insert", "attribution_insert"],
-        )
+        self.assertIsNone(duplicate.state_log_id)
+        self.assertEqual(duplicate.state, first.state)
+        self.assertEqual(self.pool.connection.operations, ["state_log", "state_load"])
         async with self.pool.acquire() as connection:
             self.assertEqual(await connection.fetchval("select count(*) from emotion_attributions"), 3)
+            self.assertEqual(await connection.fetchval("select count(*) from state_log"), 1)
         self.assertEqual(self.pool.connection.transactions, 1)
+
+    async def test_replay_after_service_recreation_remains_a_noop(self) -> None:
+        first = await update_from_user_event(
+            self.pool, "이건 어떻게 작동해?", self.conversation_id, self.message_id
+        )
+        recreated_pool = PoolForExistingConnection(self.pool.connection)
+
+        replay = await update_from_user_event(
+            recreated_pool, "이건 어떻게 작동해?", self.conversation_id, self.message_id
+        )
+
+        self.assertEqual(replay.state, first.state)
+        async with self.pool.acquire() as connection:
+            self.assertEqual(await connection.fetchval("select count(*) from state_log"), 1)
+            self.assertEqual(await connection.fetchval("select count(*) from emotion_attributions"), 2)
 
     async def test_lazy_decay_and_mood_drive_semantics_survive_the_request_scoped_result(self) -> None:
         initial = _default_state()
@@ -143,7 +173,7 @@ class EmotionSqlRoundTripTests(unittest.IsolatedAsyncioTestCase):
         expected, _ = apply_mood_drive_decay(decayed, current_time=result.state["updated_at"])
         self.assertAlmostEqual(result.state["emotion_vector"]["curiosity"], expected["emotion_vector"]["curiosity"])
         self.assertAlmostEqual(result.state["energy"], expected["energy"])
-        self.assertEqual(self.pool.connection.operations, ["state_load", "state_upsert", "state_log", "attribution_insert"])
+        self.assertEqual(self.pool.connection.operations, ["state_log", "state_load", "state_upsert", "attribution_insert"])
 
     async def test_attribution_context_preserves_provenance_without_a_second_state_read(self) -> None:
         result = await update_from_user_event(self.pool, "너 정말 귀엽고 대단해", self.conversation_id, self.message_id)
@@ -177,9 +207,9 @@ class EmotionSqlRoundTripTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(attributions), 3)
         self.assertIn("RECENT EMOTION ATTRIBUTION", build_state_context(result.state, attributions) or "")
 
-    async def test_failure_rolls_back_state_log_and_attributions_together(self) -> None:
-        self.pool.connection.fail_state_log = True
-        with self.assertRaisesRegex(RuntimeError, "injected state-log failure"):
+    async def test_failure_after_claim_rolls_back_state_log_and_attributions_together(self) -> None:
+        self.pool.connection.fail_state_upsert = True
+        with self.assertRaisesRegex(RuntimeError, "injected state-upsert failure"):
             await update_from_user_event(self.pool, "너 정말 귀엽고 대단해", self.conversation_id, self.message_id)
 
         async with self.pool.acquire() as connection:
@@ -202,3 +232,47 @@ class EmotionSqlRoundTripTests(unittest.IsolatedAsyncioTestCase):
         async with self.pool.acquire() as connection:
             source_ids = await connection.fetch("select distinct source_id from emotion_attributions order by source_id")
         self.assertEqual({str(row["source_id"]) for row in source_ids}, {str(self.message_id), str(other_message_id)})
+
+    async def test_concurrent_duplicate_message_claims_one_transition(self) -> None:
+        with TemporaryDirectory() as directory:
+            pool = TursoPool(str(Path(directory) / "emotion.db"), "")
+            async with pool.acquire() as connection:
+                await connection.execute("""
+                    create table diana_state (
+                        id integer primary key, emotion text not null,
+                        emotion_intensity real not null, emotion_vector text not null,
+                        mood_valence real not null, energy real not null,
+                        curiosity real not null, stress real not null,
+                        source_device text not null, updated_at text not null
+                    )
+                """)
+                await connection.execute("""
+                    create table state_log (
+                        id text primary key, mood_valence real not null, emotion text not null,
+                        emotion_intensity real not null, emotion_vector text not null,
+                        energy real not null, curiosity real not null, stress real not null,
+                        source_device text not null, created_at text not null
+                    )
+                """)
+                await connection.execute("""
+                    create table emotion_attributions (
+                        emotion_attribution_id text primary key, emotion text not null,
+                        delta real not null, resulting_value real not null,
+                        cause_type text not null, cause_summary text not null,
+                        source_type text not null, source_id text, confidence real not null,
+                        created_at text not null
+                    )
+                """)
+
+            first, second = await asyncio.gather(
+                update_from_user_event(pool, "너 정말 귀엽고 대단해", self.conversation_id, self.message_id),
+                update_from_user_event(pool, "너 정말 귀엽고 대단해", self.conversation_id, self.message_id),
+            )
+
+            self.assertEqual(sum(result.state_log_id is not None for result in (first, second)), 1)
+            async with pool.acquire() as connection:
+                self.assertEqual(await connection.fetchval("select count(*) from state_log"), 1)
+                self.assertEqual(await connection.fetchval("select count(*) from emotion_attributions"), 3)
+                persisted = await connection.fetchrow("select emotion_vector from diana_state where id=1")
+            expected = apply_candidate(_default_state(), evaluate_state("너 정말 귀엽고 대단해"))
+            self.assertEqual(persisted["emotion_vector"], expected["emotion_vector"])

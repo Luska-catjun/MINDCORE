@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
+from weakref import WeakKeyDictionary
 
 import asyncpg
 
@@ -78,6 +80,8 @@ EMOTION_QUERY_MARKERS = (
     "뭐가 재밌", "지금 어때", "부끄러", "mood", "feeling", "feel", "angry",
     "happy", "excited", "sad", "why are you",
 )
+_MESSAGE_EVENT_LOCKS: WeakKeyDictionary[Any, tuple[asyncio.Lock, ...]] = WeakKeyDictionary()
+_MESSAGE_EVENT_LOCK_STRIPES = 64
 
 
 @dataclass(frozen=True)
@@ -431,7 +435,27 @@ async def _write_attribution(connection: asyncpg.Connection, *, emotion: str, de
     return row["emotion_attribution_id"] if row else None
 
 
+def _message_state_log_id(message_id: UUID) -> UUID:
+    """Return the durable exactly-once claim for one message emotion event."""
+    return uuid5(NAMESPACE_URL, f"mindcore:emotion-message:{message_id}")
+
+
+def _message_event_lock(message_id: UUID) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    locks = _MESSAGE_EVENT_LOCKS.get(loop)
+    if locks is None:
+        locks = tuple(asyncio.Lock() for _ in range(_MESSAGE_EVENT_LOCK_STRIPES))
+        _MESSAGE_EVENT_LOCKS[loop] = locks
+    return locks[message_id.int % _MESSAGE_EVENT_LOCK_STRIPES]
+
+
 async def update_from_user_event(pool: asyncpg.Pool, user_message: str, conversation_id: UUID, message_id: UUID) -> EmotionUpdateResult:
+    """Serialize same-process duplicates; the deterministic DB claim remains authoritative."""
+    async with _message_event_lock(message_id):
+        return await _update_from_user_event_locked(pool, user_message, conversation_id, message_id)
+
+
+async def _update_from_user_event_locked(pool: asyncpg.Pool, user_message: str, conversation_id: UUID, message_id: UUID) -> EmotionUpdateResult:
     """Apply UTC-aware decay and one deterministic multi-channel event atomically."""
     del conversation_id
     started = perf_counter(); candidate = evaluate_state(user_message); attribution_ids: list[UUID] = []; message_attributions: list[dict[str, Any]] = []
@@ -439,9 +463,40 @@ async def update_from_user_event(pool: asyncpg.Pool, user_message: str, conversa
     recovery: dict[str, Any] = {}
     async with pool.acquire() as connection:
         async with connection.transaction():
+            transition_time = datetime.now(timezone.utc)
+            claim_state = _default_state()
+            state_log_id = _message_state_log_id(message_id)
+            claimed = await connection.fetchrow(
+                """insert into state_log
+                       (id, mood_valence, emotion, emotion_intensity, emotion_vector,
+                        energy, curiosity, stress, source_device, created_at)
+                   values ($1,$2,$3,$4,$5,$6,$7,$8,'mindcore',$9)
+                   on conflict (id) do nothing returning id""",
+                state_log_id,
+                claim_state["mood_valence"], claim_state["emotion"],
+                claim_state["emotion_intensity"], claim_state["emotion_vector"],
+                claim_state["energy"], claim_state["curiosity"], claim_state["stress"],
+                transition_time,
+            )
+            if claimed is None:
+                row = await connection.fetchrow(
+                    "select emotion, emotion_intensity, emotion_vector, mood_valence, energy, curiosity, stress, updated_at from diana_state where id=1"
+                )
+                current = _state_from_record(row)
+                record_emotion_update(
+                    cause_type=candidate.cause_type if candidate else None,
+                    raw_delta=raw_delta,
+                    applied_delta={},
+                    recovery={},
+                )
+                logger.info(
+                    "EmotionV03 replay ignored latency_ms=%.2f channels=%s attributions=0",
+                    (perf_counter() - started) * 1000,
+                    len(candidate.channels) if candidate else 0,
+                )
+                return EmotionUpdateResult(current, current, [], None, ())
             row = await connection.fetchrow("select emotion, emotion_intensity, emotion_vector, mood_valence, energy, curiosity, stress, updated_at from diana_state where id=1")
             current = _state_from_record(row)
-            transition_time = datetime.now(timezone.utc)
             elapsed_seconds = round(_elapsed_hours(current.get("updated_at"), transition_time) * 3600, 3)
             decayed, decay_deltas = apply_time_decay(current, current_time=transition_time)
             mood_decayed, mood_drive_decay_deltas = apply_mood_drive_decay(decayed, current_time=transition_time)
@@ -466,7 +521,14 @@ async def update_from_user_event(pool: asyncpg.Pool, user_message: str, conversa
                 values (1,$1,$2,$3,$4,$5,$6,$7,'mindcore',$8)
                 on conflict (id) do update set emotion=excluded.emotion, emotion_intensity=excluded.emotion_intensity, emotion_vector=excluded.emotion_vector, mood_valence=excluded.mood_valence, energy=excluded.energy, curiosity=excluded.curiosity, stress=excluded.stress, source_device=excluded.source_device, updated_at=excluded.updated_at
                 """, next_state["emotion"], next_state["emotion_intensity"], next_state["emotion_vector"], next_state["mood_valence"], next_state["energy"], next_state["curiosity"], next_state["stress"], next_state["updated_at"])
-            state_log_id = await connection.fetchval("insert into state_log (id, mood_valence, emotion, emotion_intensity, emotion_vector, energy, curiosity, stress, source_device, created_at) values ($1,$2,$3,$4,$5,$6,$7,$8,'mindcore',$9) returning id", uuid4(), next_state["mood_valence"], next_state["emotion"], next_state["emotion_intensity"], next_state["emotion_vector"], next_state["energy"], next_state["curiosity"], next_state["stress"], next_state["updated_at"])
+            await connection.execute(
+                """update state_log set mood_valence=$1, emotion=$2, emotion_intensity=$3,
+                          emotion_vector=$4, energy=$5, curiosity=$6, stress=$7,
+                          source_device='mindcore', created_at=$8 where id=$9""",
+                next_state["mood_valence"], next_state["emotion"], next_state["emotion_intensity"],
+                next_state["emotion_vector"], next_state["energy"], next_state["curiosity"],
+                next_state["stress"], next_state["updated_at"], state_log_id,
+            )
             if decay_deltas:
                 emotion, delta = min(decay_deltas.items(), key=lambda item: item[1])
                 if abs(delta) >= EMOTION_DECAY_LOG_THRESHOLD:
