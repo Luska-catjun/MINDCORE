@@ -258,18 +258,20 @@ export interface ObservedKnowledge {
   reinforcement_count: number;
   learning_session_count: number;
   fact_count: number;
+  correction_active: boolean;
   facts: Array<{
     id: string;
     fact_text: string;
     knowledge_scope: "fictional_story";
     source_type: string;
-    source_message_id: string;
+    source_message_id: string | null;
     source_episode_id: string | null;
     confidence: number;
     reinforcement_count: number;
     contradiction_count: number;
     first_learned_at: string;
     last_reinforced_at: string;
+    active: boolean;
   }>;
 }
 

@@ -251,6 +251,34 @@ def _status(count: int, confidence: float) -> str:
     return "introduced"
 
 
+def _normalized_knowledge_text(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def apply_knowledge_authority(item: dict[str, Any]) -> dict[str, Any]:
+    """Mark whether a manual parent-summary correction supersedes story facts.
+
+    Story acquisition maintains ``summary`` as the canonical projection of the
+    first eight durable fact rows.  Observation correction intentionally edits
+    only that parent summary so fact-level provenance and contradiction history
+    remain immutable.  A diverging summary therefore denotes the authoritative
+    corrected view; the original facts stay available as inactive history.
+    """
+    result = dict(item)
+    facts = [dict(fact) for fact in result.get("facts") or []]
+    fact_projection = "; ".join(str(fact.get("fact_text") or "") for fact in facts[:8])[:900]
+    correction_active = (
+        result.get("knowledge_type") == "story"
+        and bool(facts)
+        and _normalized_knowledge_text(result.get("summary")) != _normalized_knowledge_text(fact_projection)
+    )
+    for fact in facts:
+        fact["active"] = not correction_active
+    result["facts"] = facts
+    result["correction_active"] = correction_active
+    return result
+
+
 def build_epistemic_context(items: list[dict[str, Any]]) -> str | None:
     if not items:
         return None
@@ -264,7 +292,7 @@ def build_epistemic_context(items: list[dict[str, Any]]) -> str | None:
     if known:
         lines.append("The Persona's acquired knowledge:")
         for item in known:
-            facts = item.get("facts") or []
+            facts = [fact for fact in item.get("facts") or [] if fact.get("active", True)]
             detail = "; ".join(str(fact["fact_text"]) for fact in facts[:6]) if facts else item["summary"]
             scope = "fictional story" if item.get("knowledge_type") == "story" else "acquired knowledge"
             lines.append(f"- {item['canonical_name']} ({scope}, {item['status']}): {detail}")
@@ -310,7 +338,7 @@ async def check_epistemic_state(pool: asyncpg.Pool, user_text: str) -> tuple[lis
         row = by_key.get(candidate.key)
         if row:
             row["facts"] = facts_by_knowledge_id.get(row["knowledge_id"], [])
-            items.append(row)
+            items.append(apply_knowledge_authority(row))
             continue
         items.append({
             "subject_key": candidate.key, "canonical_name": candidate.canonical_name,

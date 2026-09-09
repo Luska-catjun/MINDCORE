@@ -21,6 +21,7 @@ from app.services import repository
 from app.services.mindcore.world_model import get_observed_world_model
 from app.services.mindcore.attention import get_last_attention_snapshot
 from app.services.mindcore import observation_corrections
+from app.services.mindcore.knowledge import apply_knowledge_authority
 
 router = APIRouter(prefix="/observe", tags=["observe"])
 
@@ -443,10 +444,11 @@ async def observe_knowledge(
         knowledge_id = str(fact.pop("knowledge_id"))
         facts_by_knowledge.setdefault(knowledge_id, []).append(fact)
     items = _rows(rows)
-    for item in items:
+    for index, item in enumerate(items):
         facts = facts_by_knowledge.get(str(item["id"]), [])
         item["facts"] = facts
         item["fact_count"] = len(facts)
+        items[index] = apply_knowledge_authority(item)
     return _timed({"items": items, "total": total, "limit": limit, "offset": offset, "sort": sort}, started_at)
 
 

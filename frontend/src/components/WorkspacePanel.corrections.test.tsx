@@ -29,7 +29,7 @@ import { WorkspacePanel } from "./WorkspacePanel";
 
 const noop = () => undefined;
 const memory = { id: "memory-1", content: "Original memory", importance: 0.7, memory_strength: 0.8, effective_strength: 0.8, recall_frequency: 1, created_at: "2026-01-01T00:00:00Z", source_episode_id: null };
-const knowledge = { id: "knowledge-1", canonical_name: "Topic", knowledge_type: "fact", subject_key: "topic", status: "active", summary: "Original knowledge", confidence: 0.8, reinforcement_count: 1, source_type: "user", source_episode_id: null, fact_count: 0, learning_session_count: 0, facts: [], first_learned_at: null, last_reinforced_at: null };
+const knowledge = { id: "knowledge-1", canonical_name: "Topic", knowledge_type: "fact", subject_key: "topic", status: "active", summary: "Original knowledge", confidence: 0.8, reinforcement_count: 1, source_type: "user", source_episode_id: null, fact_count: 0, learning_session_count: 0, correction_active: false, facts: [], first_learned_at: null, last_reinforced_at: null };
 const preference = { id: "preference-1", subject: "topic", display_name: "Original preference", status: "stable", affinity: 0.8, confidence: 0.8, evidence_count: 2, positive_evidence: 2, negative_evidence: 0, curiosity_evidence: 0, first_observed_at: null, last_observed_at: null, stabilized_at: null, recent_evidence: [] };
 const narrative = { id: "narrative-1", category: "pattern", subject_key: "topic", status: "established", summary: "Original narrative", confidence: 0.8, evidence_count: 2, distinct_episode_count: 1, distinct_conversation_count: 1, activation_eligible: true, attention_score: null, attention_reasons: [], first_observed_at: null, last_observed_at: null, evidence: [] };
 const selfModel = { id: "self-1", category: "belief", subject: "self", status: "established", summary: "Original self model", confidence: 0.8, support_count: 2, independent_source_count: 1, current: true, attention_score: null, source_types: [], first_observed_at: null, last_reinforced_at: null, evidence: [] };
@@ -85,6 +85,30 @@ describe("Observation corrections", () => {
     await userEvent.click(screen.getAllByRole("button", { name: "Edit" }).at(-1)!);
     await userEvent.click(screen.getByRole("button", { name: "Save Correction" }));
     await waitFor(() => expect(apiMock.correctPersonaPreference).toHaveBeenCalledWith("preference-1", "Original preference"));
+  });
+
+  it("labels superseded story facts as historical evidence", async () => {
+    apiMock.observeKnowledge.mockResolvedValueOnce({
+      items: [{
+        ...knowledge,
+        knowledge_type: "story",
+        summary: "Project X uses Turso",
+        correction_active: true,
+        fact_count: 1,
+        facts: [{
+          id: "fact-1", fact_text: "Project X uses PostgreSQL", knowledge_scope: "fictional_story",
+          source_type: "user_story", source_message_id: null, source_episode_id: null,
+          confidence: 0.8, reinforcement_count: 1, contradiction_count: 0,
+          first_learned_at: "2026-01-01T00:00:00Z", last_reinforced_at: "2026-01-01T00:00:00Z",
+          active: false,
+        }],
+      }],
+      total: 1,
+      query_latency_ms: 1,
+    });
+
+    await open("knowledge", "Project X uses Turso");
+    expect(screen.getByText("Historical learned evidence · 1")).toBeTruthy();
   });
 
   it("warns before identity-critical Narrative and Self Model corrections", async () => {
