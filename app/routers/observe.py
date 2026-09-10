@@ -166,10 +166,22 @@ async def observe_preferences(
                from preferences where owner_type='user' order by last_seen_at desc"""
         )
         evidence_rows = await connection.fetch(
-            """select diana_preference_id, signal_type, signal_value, source_experience_id as experience_id,
-                      episode_id, created_at
-               from diana_preference_evidence order by created_at desc"""
-        )
+            """select diana_preference_id, signal_type, signal_value, experience_id,
+                       episode_id, created_at
+                from (
+                     select evidence.diana_preference_id, evidence.signal_type, evidence.signal_value,
+                            evidence.source_experience_id as experience_id, evidence.episode_id, evidence.created_at,
+                            row_number() over (
+                                partition by evidence.diana_preference_id
+                                order by evidence.created_at desc
+                            ) as evidence_rank
+                     from diana_preference_evidence as evidence
+                     join diana_preferences as preference
+                       on preference.diana_preference_id = evidence.diana_preference_id
+                ) where evidence_rank <= $1
+                order by created_at desc""",
+            evidence_limit,
+        ) if diana_rows else []
     evidence_by_preference: dict[str, list[dict[str, Any]]] = {}
     for item in _rows(evidence_rows):
         key = str(item.pop("diana_preference_id"))
@@ -298,11 +310,15 @@ async def observe_narratives(
                         confidence desc, last_observed_at desc limit $1 offset $2""", limit, offset,
         )
         total = await connection.fetchval("select count(*) from diana_narratives")
+        narrative_ids = [row["id"] for row in narratives]
         evidence = await connection.fetch(
-            """select id,narrative_id,episode_id,decision_id,preference_evidence_id,emotion_attribution_id,
-                      memory_id,relationship_log_id,knowledge_id,evidence_type,signal_value,created_at
-               from diana_narrative_evidence order by created_at desc""",
-        )
+            f"""select id,narrative_id,episode_id,decision_id,preference_evidence_id,emotion_attribution_id,
+                       memory_id,relationship_log_id,knowledge_id,evidence_type,signal_value,created_at
+                from diana_narrative_evidence
+                where narrative_id in ({_in_placeholders(narrative_ids)})
+                order by created_at desc""",
+            *narrative_ids,
+        ) if narrative_ids else []
     by_narrative: dict[str, list[dict[str, Any]]] = {}
     for item in _rows(evidence):
         by_narrative.setdefault(str(item.pop("narrative_id")), []).append(item)
@@ -353,11 +369,15 @@ async def observe_self_model(
                       confidence desc,last_reinforced_at desc limit $1 offset $2""", limit, offset,
         )
         total = await connection.fetchval("select count(*) from diana_self_model")
+        self_model_ids = [row["id"] for row in beliefs]
         evidence = await connection.fetch(
-            """select id,self_model_id,evidence_type,direction,weight,source_narrative_id,source_preference_id,
-                      source_decision_id,source_episode_id,source_conversation_id,created_at
-               from diana_self_model_evidence order by created_at desc""",
-        )
+            f"""select id,self_model_id,evidence_type,direction,weight,source_narrative_id,source_preference_id,
+                       source_decision_id,source_episode_id,source_conversation_id,created_at
+                from diana_self_model_evidence
+                where self_model_id in ({_in_placeholders(self_model_ids)})
+                order by created_at desc""",
+            *self_model_ids,
+        ) if self_model_ids else []
     by_belief: dict[str, list[dict[str, Any]]] = {}
     for item in _rows(evidence):
         by_belief.setdefault(str(item.pop("self_model_id")), []).append(item)
