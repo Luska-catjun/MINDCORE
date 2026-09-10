@@ -5,6 +5,7 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT))
 from app.config import get_settings
 from app.database.connection import create_pool,close_pool
+from app.database.migrations import ensure_turso_schema_current
 from app.database.schema_contract import (
     CURRENT_TURSO_BASELINE_VERSION,
     SchemaState,
@@ -15,19 +16,22 @@ BASELINE=ROOT/'db/turso/baseline_v1.sql'
 
 async def bootstrap(connection) -> str:
     report = await classify_turso_schema(connection)
-    if report.state == SchemaState.EMPTY:
-        async with connection.transaction():
-            for statement in BASELINE.read_text().split(';'):
-                if statement.strip(): await connection.execute(statement)
-        verified = await classify_turso_schema(connection)
-        if verified.state != SchemaState.CURRENT:
-            raise RuntimeError(f'Fresh baseline verification failed: {verified.details()}')
+    if report.state == SchemaState.PARTIAL_OR_UNKNOWN and (
+        report.version is None
+        or not report.version.isdecimal()
+        or int(report.version) >= int(CURRENT_TURSO_BASELINE_VERSION)
+    ):
+        raise RuntimeError(f'{report.details()}; refusing bootstrap overwrite.')
+    result = await ensure_turso_schema_current(
+        connection, baseline_sql=BASELINE.read_text(encoding="utf-8")
+    )
+    if result.bootstrapped:
         return f'TURSO_BOOTSTRAP_OK version={CURRENT_TURSO_BASELINE_VERSION}'
-    if report.state == SchemaState.CURRENT:
-        return 'TURSO_BOOTSTRAP_ALREADY_INITIALIZED'
-    if report.state == SchemaState.COMPATIBLE_LEGACY:
+    if result.adopted_legacy:
         return 'TURSO_BOOTSTRAP_COMPATIBLE_LEGACY'
-    raise RuntimeError(f'{report.details()}; refusing bootstrap overwrite.')
+    if not result.applied_migration_ids:
+        return 'TURSO_BOOTSTRAP_ALREADY_INITIALIZED'
+    return f'TURSO_BOOTSTRAP_MIGRATED version={CURRENT_TURSO_BASELINE_VERSION}'
 
 async def main():
     settings=get_settings()

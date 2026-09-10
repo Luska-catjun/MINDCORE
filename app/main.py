@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import Settings, get_settings
 from app.database.connection import close_pool, create_pool
+from app.database.migrations import ensure_turso_schema_current
 from app.routers import auth, chat, conversations, episodes, health, identity, messages, observe, relationship, state
 from app.routers.auth import require_auth_settings, request_is_authenticated
 from app.services.prompt_loader import load_persona_identity_prompt
@@ -70,6 +71,16 @@ def build_lifespan(
     app.state.diana_identity_prompt = load_persona_identity_prompt(settings)
     pool = db_pool_factory(settings) if db_pool_factory else create_pool(settings)
     app.state.db_pool = await pool if hasattr(pool, "__await__") else pool
+    # Setup connection preflight remains read-only. The actual backend startup
+    # is the single production boundary that adopts a released legacy schema or
+    # runs a future registered forward migration before runtime reads begin.
+    if (
+        db_pool_factory is None
+        and settings.database_backend.lower() == "turso"
+        and hasattr(app.state.db_pool, "acquire")
+    ):
+        async with app.state.db_pool.acquire() as connection:
+            await ensure_turso_schema_current(connection)
     app.state.cognitive_snapshot_scope = CognitiveSnapshotScope()
     # One startup hydration keeps Narrative activation off the foreground chat
     # path.  Isolated ASGI fixtures without a database acquire seam simply use

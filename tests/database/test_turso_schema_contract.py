@@ -199,6 +199,29 @@ class TursoSchemaContractTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await _setup_action("classify", str(config)), "INITIALIZED")
                 self.assertEqual(await _setup_action("initialize", str(config)), "INITIALIZED")
 
+    async def test_desktop_database_preflight_remains_read_only(self) -> None:
+        await self.pool.connection.execute("create table preflight_probe (id text primary key)")
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "mindcore.env"
+            config.write_text("DATABASE_BACKEND=turso\n", encoding="utf-8")
+            with (
+                patch("app.desktop_backend._settings_from", return_value=object()),
+                patch("app.database.connection.create_pool", return_value=self.pool),
+                patch("app.database.connection.close_pool", return_value=None),
+            ):
+                self.assertEqual(await _setup_action("database", str(config)), "DATABASE_CONNECTED")
+
+        self.assertIsNone(
+            await self.pool.connection.fetchrow(
+                "select name from sqlite_master where type='table' and name='schema_migration_ledger'"
+            )
+        )
+        self.assertIsNotNone(
+            await self.pool.connection.fetchrow(
+                "select name from sqlite_master where type='table' and name='preflight_probe'"
+            )
+        )
+
     async def test_complete_versionless_schema_is_compatible_legacy(self) -> None:
         legacy_sql = BASELINE_SQL.replace(
             "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n"

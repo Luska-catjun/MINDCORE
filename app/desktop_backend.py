@@ -15,7 +15,12 @@ import time
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response, status
 
-from app.database.schema_contract import SchemaState, classify_turso_schema
+from app.database.schema_contract import (
+    CURRENT_TURSO_BASELINE_VERSION,
+    SchemaState,
+    classify_turso_schema,
+)
+from app.database.migrations import ensure_turso_schema_current
 from app.main import create_app
 
 
@@ -235,21 +240,17 @@ async def _setup_action(action: str, config_path: str) -> str:
                 return classification
             if action != "initialize":
                 raise RuntimeError("unsupported_setup_action")
-            if report.state == SchemaState.PARTIAL_OR_UNKNOWN:
+            if report.state == SchemaState.PARTIAL_OR_UNKNOWN and (
+                report.version is None
+                or not report.version.isdecimal()
+                or int(report.version) >= int(CURRENT_TURSO_BASELINE_VERSION)
+            ):
                 raise RuntimeError(f"partial_or_unknown: {report.details()}")
-            if classification == "INITIALIZED":
-                return "INITIALIZED"
-            if report.state == SchemaState.COMPATIBLE_LEGACY:
-                return "COMPATIBLE_LEGACY"
             baseline = RESOURCE_ROOT / "db" / "turso" / "baseline_v1.sql"
-            async with connection.transaction():
-                for statement in baseline.read_text(encoding="utf-8").split(";"):
-                    if statement.strip():
-                        await connection.execute(statement)
-            verified = await classify_turso_schema(connection)
-            if verified.state != SchemaState.CURRENT:
-                raise RuntimeError("schema_verification_failed")
-            return "BOOTSTRAPPED"
+            result = await ensure_turso_schema_current(
+                connection, baseline_sql=baseline.read_text(encoding="utf-8")
+            )
+            return "BOOTSTRAPPED" if result.bootstrapped else "INITIALIZED"
     finally:
         await close_pool(pool)
 
