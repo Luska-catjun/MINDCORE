@@ -99,7 +99,7 @@ def build_lifespan(
 def create_app(*, settings_override: Settings | None = None, db_pool_factory: Callable[[Settings], object] | None = None) -> FastAPI:
     configure_diana_logging()
     settings = settings_override or get_settings()
-    app = FastAPI(title=settings.app_name, version="0.2.1", lifespan=build_lifespan(settings_override, db_pool_factory))
+    app = FastAPI(title=settings.app_name, version="0.2.2", lifespan=build_lifespan(settings_override, db_pool_factory))
 
     @app.exception_handler(Exception)
     async def safe_unhandled_error(request: Request, exc: Exception):
