@@ -52,6 +52,7 @@ from app.services.mindcore.temporal import (
     resolve_recall_range,
 )
 from app.services.mindcore.episode_recall import retrieve_episodes_for_range
+from app.services.turn_durability import StageNotClaimed, TurnDurability
 import logging
 from time import perf_counter
 
@@ -121,9 +122,22 @@ async def _update_narrative_shadow(
     pool: asyncpg.Pool,
     episode_id,
     snapshot_scope: CognitiveSnapshotScope | None = None,
+    *,
+    turn_id=None,
 ) -> None:
     try:
-        await update_narratives_for_episode(pool, episode_id=episode_id, snapshot_scope=snapshot_scope)
+        if turn_id is None:
+            await update_narratives_for_episode(pool, episode_id=episode_id, snapshot_scope=snapshot_scope)
+        else:
+            await TurnDurability(pool).run_stage(
+                turn_id,
+                "narrative",
+                lambda stage_pool: update_narratives_for_episode(
+                    stage_pool, episode_id=episode_id, snapshot_scope=snapshot_scope
+                ),
+            )
+    except StageNotClaimed:
+        return
     except Exception as exc:
         logger.warning("Narrative shadow update skipped error_type=%s", safe_error_type(exc))
 
@@ -132,13 +146,46 @@ async def _update_shadow_models(
     pool: asyncpg.Pool,
     episode_id,
     snapshot_scope: CognitiveSnapshotScope | None = None,
+    *,
+    turn_id=None,
 ) -> None:
     """Run shadows in order without letting either failure affect chat."""
-    await _update_narrative_shadow(pool, episode_id, snapshot_scope)
+    await _update_narrative_shadow(pool, episode_id, snapshot_scope, turn_id=turn_id)
     try:
-        await update_self_model_shadow(pool, episode_id=episode_id, snapshot_scope=snapshot_scope)
+        if turn_id is None:
+            await update_self_model_shadow(pool, episode_id=episode_id, snapshot_scope=snapshot_scope)
+        else:
+            await TurnDurability(pool).run_stage(
+                turn_id,
+                "self_model",
+                lambda stage_pool: update_self_model_shadow(
+                    stage_pool, episode_id=episode_id, snapshot_scope=snapshot_scope
+                ),
+            )
+    except StageNotClaimed:
+        return
     except Exception as exc:
         logger.warning("Self model shadow update skipped error_type=%s", safe_error_type(exc))
+
+
+async def _run_durable_stage(
+    durability: TurnDurability,
+    latency: _Latency,
+    turn_id,
+    stage_name: str,
+    operation,
+    *,
+    transactional: bool = True,
+):
+    try:
+        return await latency.measure(
+            stage_name,
+            durability.run_stage(
+                turn_id, stage_name, operation, transactional=transactional
+            ),
+        )
+    except StageNotClaimed:
+        return None
 
 
 async def _execute_chat_turn(
@@ -151,7 +198,13 @@ async def _execute_chat_turn(
 ) -> dict:
     started_at = perf_counter()
     latency = _Latency(payload.conversation_id); latency.mark('start')
-    user_message = await repository.create_message(pool, payload)
+    # The forward-migration ledger currently owns the Turso schema. Keep the
+    # retained Supabase rollback backend on its released schema contract.
+    durability = TurnDurability(
+        pool, enabled=str(getattr(settings, "database_backend", "turso")).lower() == "turso"
+    )
+    user_message = await durability.begin_turn(payload)
+    turn_id = user_message["id"]
     latency.mark('user_saved')
     state_before = None
     state_after = None
@@ -339,21 +392,29 @@ async def _execute_chat_turn(
     latency.mark('pre_llm_done')
     record_context(dynamic_context_chars=len(dynamic_context or ""), context_mode="fast" if lightweight else "full")
     llm_started_at = perf_counter()
-    reply_text = await generate_reply(
-        settings,
-        payload.content,
-        dynamic_context=dynamic_context,
-        identity_prompt=identity_prompt,
-    )
+    try:
+        reply_text = await generate_reply(
+            settings,
+            payload.content,
+            dynamic_context=dynamic_context,
+            identity_prompt=identity_prompt,
+        )
+    except BaseException as error:
+        await durability.mark_core_failed(turn_id, error)
+        raise
     logger.info("Chat latency stage=main_llm latency_ms=%.2f", (perf_counter() - llm_started_at) * 1000)
     latency.mark('provider_done')
 
     # A successful response confirms these selected memories were included in
     # the completed LLM request. Weight update failures stay non-fatal.
-    await latency.measure('memory_reinforcement', reinforce_recalled_memories(pool, selected_memories))
+    try:
+        await latency.measure('memory_reinforcement', reinforce_recalled_memories(pool, selected_memories))
+    except BaseException as error:
+        await durability.mark_core_failed(turn_id, error)
+        raise
 
-    diana_message = await latency.measure('assistant_message_save', repository.create_message(
-        pool,
+    diana_message = await latency.measure('assistant_message_save', durability.complete_core(
+        turn_id,
         MessageCreate(
             conversation_id=payload.conversation_id,
             role=MessageRole.diana,
@@ -364,14 +425,25 @@ async def _execute_chat_turn(
     ))
     if response_intention is not None:
         try:
-            await latency.measure('intention_persist', persist_response_intention(pool, response_intention, payload.conversation_id, user_message['id'], diana_message['id']))
+            await _run_durable_stage(
+                durability, latency, turn_id, "intention_persist",
+                lambda stage_pool: persist_response_intention(
+                    stage_pool, response_intention, payload.conversation_id,
+                    user_message['id'], diana_message['id'],
+                ),
+            )
         except Exception as exc:
             logger.warning("Response intention persistence skipped error_type=%s", safe_error_type(exc))
+    else:
+        await durability.complete_noop(turn_id, "intention_persist")
     try:
-        await latency.measure('self_expression_goal', capture_self_expression_goal(
-            pool, payload.conversation_id, reply_text, diana_message['id'],
-            working_memory=working_memory, epistemic_items=epistemic_items,
-        ))
+        await _run_durable_stage(
+            durability, latency, turn_id, "self_expression_goal",
+            lambda stage_pool: capture_self_expression_goal(
+                stage_pool, payload.conversation_id, reply_text, diana_message['id'],
+                working_memory=working_memory, epistemic_items=epistemic_items,
+            ),
+        )
     except Exception as exc:
         logger.warning("Self-expression goal capture skipped error_type=%s", safe_error_type(exc))
     # A Decision is captured only from Diana's saved reply.  Offered title
@@ -381,12 +453,14 @@ async def _execute_chat_turn(
     decision_record = None
     choice_context = bool(extract_choice_options(payload.content)) or any(marker in payload.content.casefold() for marker in ("무슨 동화", "뭐 듣고 싶", "어떤 이야기", "뭘 읽고 싶", "할까", "해줄"))
     if decision_candidate is None:
+        await durability.complete_noop(turn_id, "decision")
         record_decision_capture(
             context_detected=choice_context, detected=False, chosen=None, reason_valid=None,
             persisted=False, episode_linked=False, result="rejected",
             rejection_reason=decision_rejection_reason(payload.content, reply_text),
         )
     elif not is_durable_decision(decision_candidate):
+        await durability.complete_noop(turn_id, "decision")
         record_decision_capture(
             context_detected=True, detected=True, chosen=decision_candidate.chosen,
             reason_valid=decision_candidate.reason is not None, persisted=False, episode_linked=False,
@@ -397,11 +471,18 @@ async def _execute_chat_turn(
     else:
         decision_started = perf_counter()
         try:
-            decision_candidate = await sanitize_decision_reason(pool, decision_candidate, reply_text)
-            decision_record = await record_decision(
-                pool, candidate=decision_candidate, episode_id=None, conversation_id=payload.conversation_id,
-                user_message_id=user_message["id"], assistant_message_id=diana_message["id"], user_text=payload.content,
-                diana_text=reply_text,
+            async def persist_decision(stage_pool):
+                sanitized = await sanitize_decision_reason(stage_pool, decision_candidate, reply_text)
+                persisted = await record_decision(
+                    stage_pool, candidate=sanitized, episode_id=None,
+                    conversation_id=payload.conversation_id,
+                    user_message_id=user_message["id"], assistant_message_id=diana_message["id"],
+                    user_text=payload.content, diana_text=reply_text,
+                )
+                return sanitized, persisted
+
+            decision_candidate, decision_record = await durability.run_stage(
+                turn_id, "decision", persist_decision
             )
             decision_metadata = decision_record if isinstance(decision_record, dict) else {}
             record_decision_capture(context_detected=True, detected=True, chosen=decision_candidate.chosen,
@@ -418,79 +499,117 @@ async def _execute_chat_turn(
             latency.stages['decision'] = round((perf_counter() - decision_started) * 1000, 2)
     if decision_candidate is None:
         try:
-            await latency.measure('decision_cancel', cancel_active_decision_from_reply(
-                pool, payload.conversation_id, reply_text,
-            ))
+            await _run_durable_stage(
+                durability, latency, turn_id, "decision_cancel",
+                lambda stage_pool: cancel_active_decision_from_reply(
+                    stage_pool, payload.conversation_id, reply_text,
+                ),
+            )
         except Exception as exc:
             logger.warning("Decision cancellation skipped error_type=%s", safe_error_type(exc))
+    else:
+        await durability.complete_noop(turn_id, "decision_cancel")
 
     memory_record = None
     try:
         _, episode_provenance, _ = classify_episode_provenance(payload.content)
         if should_extract_memory(payload.content) and episode_provenance == "grounded_event":
             extraction_started_at = perf_counter()
-            memory_record = await latency.measure('memory_extraction', extract_and_store_memory(
-                pool, settings, user_content=payload.content, diana_content=reply_text,
-                conversation_id=payload.conversation_id, source_message_id=user_message["id"],
-            ))
+            memory_record = await _run_durable_stage(
+                durability, latency, turn_id, "memory_extraction",
+                lambda stage_pool: extract_and_store_memory(
+                    stage_pool, settings, user_content=payload.content,
+                    diana_content=reply_text, conversation_id=payload.conversation_id,
+                    source_message_id=user_message["id"], raise_on_error=True,
+                ),
+                transactional=False,
+            )
             logger.info("Chat latency stage=memory_extraction latency_ms=%.2f", (perf_counter() - extraction_started_at) * 1000)
         else:
+            await durability.complete_noop(turn_id, "memory_extraction")
             logger.info("Memory extraction skipped reason=%s", "hypothetical_episode" if episode_provenance != "grounded_event" else "low_durable_signal")
     except Exception as exc:
         logger.warning("Long-term memory extraction skipped error_type=%s", safe_error_type(exc))
     experience = None
     try:
-        experience = await latency.measure('experience', record_experience(
-            pool,
-            conversation_id=payload.conversation_id,
-            user_message_id=user_message["id"],
-            assistant_message_id=diana_message["id"],
-            user_text=payload.content,
-            selected_memories=selected_memories,
-            state_before=state_before,
-            state_after=state_after,
-            working_memory=working_memory,
-        ))
+        experience = await _run_durable_stage(
+            durability, latency, turn_id, "experience",
+            lambda stage_pool: record_experience(
+                stage_pool,
+                conversation_id=payload.conversation_id,
+                user_message_id=user_message["id"],
+                assistant_message_id=diana_message["id"],
+                user_text=payload.content,
+                selected_memories=selected_memories,
+                state_before=state_before,
+                state_after=state_after,
+                working_memory=working_memory,
+            ),
+        )
     except Exception as exc:
         logger.warning("Experience recording skipped error_type=%s", safe_error_type(exc))
 
     if experience is not None:
         try:
-            await latency.measure('emotion_attribution_link', link_attributions_to_experience(
-                pool,
-                message_id=user_message["id"],
-                experience_id=experience["experience_id"],
-            ))
+            await _run_durable_stage(
+                durability, latency, turn_id, "emotion_attribution_link",
+                lambda stage_pool: link_attributions_to_experience(
+                    stage_pool, message_id=user_message["id"],
+                    experience_id=experience["experience_id"],
+                ),
+            )
         except Exception as exc:
             logger.warning("Emotion attribution link skipped error_type=%s", safe_error_type(exc))
         try:
-            await latency.measure('relationship', update_relationship_from_experience(
-                pool, experience["experience_id"], user_text=payload.content, current_state=relationship_state,
-            ))
+            await _run_durable_stage(
+                durability, latency, turn_id, "relationship",
+                lambda stage_pool: update_relationship_from_experience(
+                    stage_pool, experience["experience_id"], user_text=payload.content,
+                    current_state=relationship_state,
+                ),
+            )
         except Exception as exc:
             logger.warning("Relationship update skipped error_type=%s", safe_error_type(exc))
         try:
-            await latency.measure('preferences', update_preference_from_experience(pool, experience["experience_id"], user_message["id"], payload.content))
+            await _run_durable_stage(
+                durability, latency, turn_id, "preferences",
+                lambda stage_pool: update_preference_from_experience(
+                    stage_pool, experience["experience_id"], user_message["id"], payload.content
+                ),
+            )
         except Exception as exc:
             logger.warning("Preference update skipped error_type=%s", safe_error_type(exc))
         try:
-            await latency.measure('diana_preferences', update_diana_preference_from_experience(
-                pool,
-                experience_id=experience["experience_id"],
-                message_id=user_message["id"],
-                user_text=payload.content,
-                decision=decision_candidate,
-                message_attributions=(
-                    getattr(emotion_update, "message_attributions", None)
-                    if emotion_update is not None else None
+            await _run_durable_stage(
+                durability, latency, turn_id, "diana_preferences",
+                lambda stage_pool: update_diana_preference_from_experience(
+                    stage_pool,
+                    experience_id=experience["experience_id"],
+                    message_id=user_message["id"],
+                    user_text=payload.content,
+                    decision=decision_candidate,
+                    message_attributions=(
+                        getattr(emotion_update, "message_attributions", None)
+                        if emotion_update is not None else None
+                    ),
                 ),
-            ))
+            )
         except Exception as exc:
             logger.warning("Diana preference update skipped error_type=%s", safe_error_type(exc))
         try:
-            await latency.measure('consolidation', consolidate_recent_experience(experience))
+            await _run_durable_stage(
+                durability, latency, turn_id, "consolidation",
+                lambda _stage_pool: consolidate_recent_experience(experience),
+                transactional=False,
+            )
         except Exception as exc:
             logger.warning("Consolidation skipped error_type=%s", safe_error_type(exc))
+    else:
+        for stage_name in (
+            "emotion_attribution_link", "relationship", "preferences",
+            "diana_preferences", "consolidation",
+        ):
+            await durability.complete_noop(turn_id, stage_name)
 
     # Optional stage results have deterministic unavailable states so one
     # owner failure cannot prevent independent downstream work.
@@ -500,25 +619,34 @@ async def _execute_chat_turn(
     # Link only completed downstream records. This remains best-effort so a
     # provenance/indexing failure cannot invalidate an already saved reply.
     try:
-        episode_linkage = await latency.measure('episode', finalize_episode_linkage(
-            pool,
-            conversation_id=payload.conversation_id,
-            user_message_id=user_message["id"],
-            assistant_message_id=diana_message["id"],
-            experience_id=experience["experience_id"] if experience else None,
-            sequence=diana_message["sequence"],
-            source_device=settings.llm_provider,
-            user_text=payload.content,
-            diana_text=reply_text,
-            memory_id=memory_record.get("memory_id") if memory_record else None,
-            decision=decision_candidate,
-        ))
+        episode_linkage = await _run_durable_stage(
+            durability, latency, turn_id, "episode",
+            lambda stage_pool: finalize_episode_linkage(
+                stage_pool,
+                conversation_id=payload.conversation_id,
+                user_message_id=user_message["id"],
+                assistant_message_id=diana_message["id"],
+                experience_id=experience["experience_id"] if experience else None,
+                sequence=diana_message["sequence"],
+                source_device=settings.llm_provider,
+                user_text=payload.content,
+                diana_text=reply_text,
+                memory_id=memory_record.get("memory_id") if memory_record else None,
+                decision=decision_candidate,
+            ),
+        )
     except Exception as exc:
         logger.warning("Episode finalize skipped error_type=%s", safe_error_type(exc))
 
     if decision_record is not None and episode_linkage is not None:
         try:
-            await latency.measure('decision_episode_link', link_decision_episode(pool, decision_id=decision_record["id"], episode_id=episode_linkage["episode_id"]))
+            await _run_durable_stage(
+                durability, latency, turn_id, "decision_episode_link",
+                lambda stage_pool: link_decision_episode(
+                    stage_pool, decision_id=decision_record["id"],
+                    episode_id=episode_linkage["episode_id"],
+                ),
+            )
             record_decision_capture(context_detected=True, detected=True, chosen=decision_candidate.chosen if decision_candidate else None,
                 reason_valid=decision_candidate.reason is not None if decision_candidate else None, persisted=True, episode_linked=True,
                 domain=decision_record.get("decision_domain") if decision_record else None,
@@ -526,18 +654,23 @@ async def _execute_chat_turn(
                 result=decision_record.get("acquisition_result", "created") if decision_record else "created")
         except Exception as exc:
             logger.warning("Decision episode link skipped error_type=%s", safe_error_type(exc))
+    else:
+        await durability.complete_noop(turn_id, "decision_episode_link")
 
     # Explicit user teaching is grounded in the message itself. A promoted
     # Episode is attached as optional additional provenance when one exists.
     try:
-        learned_knowledge = await latency.measure('knowledge', acquire_user_knowledge(
-            pool,
-            user_text=payload.content,
-            user_message_id=user_message["id"],
-            source_episode_id=episode_linkage["episode_id"] if episode_linkage else None,
-            episode_is_grounded=True,
-            conversation_id=payload.conversation_id,
-        )) or []
+        learned_knowledge = await _run_durable_stage(
+            durability, latency, turn_id, "knowledge",
+            lambda stage_pool: acquire_user_knowledge(
+                stage_pool,
+                user_text=payload.content,
+                user_message_id=user_message["id"],
+                source_episode_id=episode_linkage["episode_id"] if episode_linkage else None,
+                episode_is_grounded=True,
+                conversation_id=payload.conversation_id,
+            ),
+        ) or []
     except Exception as exc:
         logger.warning("Knowledge acquisition skipped error_type=%s", safe_error_type(exc))
 
@@ -548,36 +681,68 @@ async def _execute_chat_turn(
         ]
         if learned_story_keys:
             try:
-                await latency.measure('goal_fulfillment', satisfy_story_goals(
-                    pool, payload.conversation_id, learned_story_keys,
-                ))
+                await _run_durable_stage(
+                    durability, latency, turn_id, "goal_fulfillment",
+                    lambda stage_pool: satisfy_story_goals(
+                        stage_pool, payload.conversation_id, learned_story_keys,
+                    ),
+                )
             except Exception as exc:
                 logger.warning("Story goal fulfillment skipped error_type=%s", safe_error_type(exc))
+        else:
+            await durability.complete_noop(turn_id, "goal_fulfillment")
         # Shadow-only work starts after the response is sent and is never
         # available to Context Builder or the LLM for this (or any) turn.
-        background_tasks.add_task(_update_shadow_models, pool, episode_linkage["episode_id"], snapshot_scope)
+        background_tasks.add_task(
+            _update_shadow_models,
+            pool,
+            episode_linkage["episode_id"],
+            snapshot_scope,
+            turn_id=turn_id if durability.enabled else None,
+        )
+    else:
+        await durability.complete_noop(turn_id, "goal_fulfillment")
+        await durability.complete_noop(turn_id, "narrative")
+        await durability.complete_noop(turn_id, "self_model")
 
     if decision_candidate is None:
         try:
-            await latency.measure('decision_execution', apply_grounded_decision_execution(
-                pool, conversation_id=payload.conversation_id, user_text=payload.content,
-                episode_id=episode_linkage["episode_id"] if episode_linkage else None,
-            ))
+            await _run_durable_stage(
+                durability, latency, turn_id, "decision_execution",
+                lambda stage_pool: apply_grounded_decision_execution(
+                    stage_pool, conversation_id=payload.conversation_id,
+                    user_text=payload.content,
+                    episode_id=episode_linkage["episode_id"] if episode_linkage else None,
+                ),
+            )
         except Exception as exc:
             logger.warning("Decision execution skipped error_type=%s", safe_error_type(exc))
+    else:
+        await durability.complete_noop(turn_id, "decision_execution")
     try:
-        await latency.measure('goal_progress', apply_grounded_goal_progress_from_event(
-            pool, conversation_id=payload.conversation_id, user_text=payload.content,
-            source_id=str(episode_linkage["episode_id"] if episode_linkage else user_message["id"]),
-        ))
+        await _run_durable_stage(
+            durability, latency, turn_id, "goal_progress",
+            lambda stage_pool: apply_grounded_goal_progress_from_event(
+                stage_pool, conversation_id=payload.conversation_id,
+                user_text=payload.content,
+                source_id=str(episode_linkage["episode_id"] if episode_linkage else user_message["id"]),
+            ),
+        )
     except Exception as exc:
         logger.warning("Goal progress update skipped error_type=%s", safe_error_type(exc))
 
     if working_memory is not None:
         try:
-            await latency.measure('working_memory_post', record_open_loop(pool, working_memory, reply_text, diana_message["id"]))
+            await _run_durable_stage(
+                durability, latency, turn_id, "working_memory_post",
+                lambda stage_pool: record_open_loop(
+                    stage_pool, working_memory, reply_text, diana_message["id"]
+                ),
+            )
         except Exception as exc:
             logger.warning("Working memory open loop skipped error_type=%s", safe_error_type(exc))
+    else:
+        await durability.complete_noop(turn_id, "working_memory_post")
 
     latency.mark('post_done'); latency.log(payload.conversation_id)
     logger.info("Chat latency stage=total latency_ms=%.2f", (perf_counter() - started_at) * 1000)

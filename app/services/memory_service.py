@@ -558,6 +558,7 @@ async def extract_and_store_memory(
     diana_content: str,
     conversation_id: UUID,
     source_message_id: UUID,
+    raise_on_error: bool = False,
 ) -> dict[str, Any] | None:
     """Best-effort persistence: callers must not fail a completed chat on errors."""
     try:
@@ -591,6 +592,8 @@ async def extract_and_store_memory(
             "Long-term memory extraction skipped error_type=%s",
             safe_error_type(exc),
         )
+        if raise_on_error:
+            raise
         return None
 
 
