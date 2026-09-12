@@ -177,5 +177,14 @@ class FreshInstallAcceptance(TestCase):
         self.assertGreaterEqual(asyncio.run(self._scalar("select count(*) from preference_evidence")), 1)
         self.assertGreaterEqual(asyncio.run(self._scalar("select count(*) from decision_log")), 1)
         self.assertEqual(asyncio.run(self._scalar("select count(*) from messages where conversation_id=$1", conversation_id)), 12)
+        self.assertEqual(asyncio.run(self._scalar("select count(*) from chat_turns")), 6)
+        self.assertEqual(
+            asyncio.run(self._scalar("select count(*) from chat_turns where status='complete'")),
+            6,
+        )
+        self.assertEqual(
+            asyncio.run(self._scalar("select count(*) from chat_turn_stages where status!='completed'")),
+            0,
+        )
         self.assertEqual(asyncio.run(self._rows("pragma foreign_key_check")), [])
         self.assertEqual(asyncio.run(self._scalar("pragma integrity_check")), "ok")

@@ -348,6 +348,40 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await self.connection.fetchval(f"select count(*) from {LEDGER_TABLE}"), 2)
 
+    async def test_v22_fresh_and_migrated_turn_schema_are_equivalent(self) -> None:
+        await execute_script(self.connection, released_v21_sql())
+        await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+        fresh_raw = libsql.connect(":memory:")
+        fresh = TursoConnection(fresh_raw)
+        try:
+            await execute_script(fresh, BASELINE_SQL)
+            for table in ("chat_turns", "chat_turn_stages"):
+                with self.subTest(table=table):
+                    migrated_columns = [
+                        dict(row) for row in await self.connection.fetch(f"pragma table_info({table})")
+                    ]
+                    fresh_columns = [
+                        dict(row) for row in await fresh.fetch(f"pragma table_info({table})")
+                    ]
+                    migrated_foreign_keys = [
+                        dict(row)
+                        for row in await self.connection.fetch(f"pragma foreign_key_list({table})")
+                    ]
+                    fresh_foreign_keys = [
+                        dict(row) for row in await fresh.fetch(f"pragma foreign_key_list({table})")
+                    ]
+                    migrated_indexes = [
+                        dict(row) for row in await self.connection.fetch(f"pragma index_list({table})")
+                    ]
+                    fresh_indexes = [
+                        dict(row) for row in await fresh.fetch(f"pragma index_list({table})")
+                    ]
+                    self.assertEqual(migrated_columns, fresh_columns)
+                    self.assertEqual(migrated_foreign_keys, fresh_foreign_keys)
+                    self.assertEqual(migrated_indexes, fresh_indexes)
+        finally:
+            fresh_raw.close()
+
     async def test_file_backed_second_runner_observes_durable_ledger(self) -> None:
         with TemporaryDirectory() as directory:
             database = Path(directory) / "migration.db"

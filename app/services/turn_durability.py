@@ -323,6 +323,16 @@ class TurnDurability:
             await self.run_stage(turn_id, stage_name, noop)
         except StageNotClaimed:
             return
+        except Exception as error:
+            # A ledger/no-op failure occurs after the assistant is durable and
+            # must not turn an otherwise successful chat response into a 500.
+            # run_stage has already recorded the safe failure when possible.
+            logger.warning(
+                "TURN_STAGE turn=%s stage=%s status=noop_failed category=%s",
+                turn_id,
+                stage_name,
+                safe_error_type(error),
+            )
 
     async def get_turn(self, turn_id: UUID | str) -> dict[str, Any] | None:
         if not self.enabled:

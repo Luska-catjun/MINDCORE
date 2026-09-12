@@ -1,5 +1,6 @@
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from collections.abc import AsyncIterator, Callable
+import asyncio
 import logging
 
 from fastapi import FastAPI,Request
@@ -16,6 +17,7 @@ from app.services.error_safety import safe_error_type
 from app.services.mindcore.narrative import hydrate_narrative_snapshot
 from app.services.mindcore.self_model import hydrate_self_model_snapshot
 from app.services.mindcore.snapshot_scope import CognitiveSnapshotScope
+from app.services.turn_recovery import recover_incomplete_turns
 
 
 def configure_diana_logging() -> None:
@@ -88,9 +90,28 @@ def build_lifespan(
     if hasattr(app.state.db_pool, "acquire"):
         await hydrate_narrative_snapshot(app.state.db_pool, app.state.cognitive_snapshot_scope)
         await hydrate_self_model_snapshot(app.state.db_pool, app.state.cognitive_snapshot_scope)
+    # Recovery is bounded and never retries a provider request. It starts only
+    # after schema migration and snapshot hydration, without delaying startup.
+    app.state.turn_recovery_task = None
+    if (
+        settings.database_backend.lower() == "turso"
+        and hasattr(app.state.db_pool, "acquire")
+        and not getattr(app.state.db_pool, "isolated", False)
+    ):
+        app.state.turn_recovery_task = asyncio.create_task(
+            recover_incomplete_turns(
+                app.state.db_pool,
+                snapshot_scope=app.state.cognitive_snapshot_scope,
+            )
+        )
     try:
         yield
     finally:
+        recovery_task = app.state.turn_recovery_task
+        if recovery_task is not None and not recovery_task.done():
+            recovery_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await recovery_task
         if db_pool_factory is None:
             await close_pool(app.state.db_pool)
   return lifespan
