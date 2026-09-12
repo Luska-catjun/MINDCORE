@@ -1,8 +1,8 @@
 -- Turso fresh baseline v1 (current production schema after schema-drift repair).
 -- Historical db/migrations/001..021 are not a fresh-Turso bootstrap chain.
--- Future Turso forward migrations start at 022.
+-- Future Turso forward migrations continue after 022.
 CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','21');
+INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','22');
 
 -- OBJECT table conversations
 CREATE TABLE "conversations" ("conversation_id" TEXT NOT NULL, "source_device" TEXT NOT NULL, "started_at" TEXT NOT NULL, "ended_at" TEXT, PRIMARY KEY ("conversation_id"));
@@ -128,6 +128,32 @@ CREATE TABLE "experiences" ("experience_id" TEXT NOT NULL, "conversation_id" TEX
 CREATE TABLE "memories" ("memory_id" TEXT NOT NULL, "content" TEXT NOT NULL, "normalized_content" TEXT NOT NULL, "memory_type" TEXT NOT NULL, "importance" REAL NOT NULL, "source_conversation_id" TEXT, "source_message_id" TEXT, "created_at" TEXT NOT NULL, "updated_at" TEXT NOT NULL, "recall_frequency" INTEGER NOT NULL, "memory_strength" REAL NOT NULL, "last_recalled_at" TEXT, "source_episode_id" TEXT, PRIMARY KEY ("memory_id"), UNIQUE ("normalized_content"), FOREIGN KEY ("source_conversation_id") REFERENCES "conversations" ("conversation_id"), FOREIGN KEY ("source_message_id") REFERENCES "messages" ("id") ON DELETE SET NULL, FOREIGN KEY ("source_episode_id") REFERENCES "episodes" ("episode_id"));
 -- OBJECT table messages
 CREATE TABLE "messages" ("id" TEXT NOT NULL, "conversation_id" TEXT NOT NULL, "sequence" INTEGER NOT NULL, "role" TEXT NOT NULL, "content" TEXT NOT NULL, "source_device" TEXT NOT NULL, "created_at" TEXT NOT NULL, PRIMARY KEY ("id"), UNIQUE ("conversation_id", "sequence"), FOREIGN KEY ("conversation_id") REFERENCES "conversations" ("conversation_id") ON DELETE CASCADE);
+-- OBJECT table chat_turns (schema 22)
+CREATE TABLE chat_turns (
+  turn_id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+  user_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+  assistant_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','core_failed','core_completed','partial','complete')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  core_completed_at TEXT,
+  completed_at TEXT,
+  last_failed_stage TEXT,
+  safe_error_category TEXT
+);
+-- OBJECT table chat_turn_stages (schema 22)
+CREATE TABLE chat_turn_stages (
+  turn_id TEXT NOT NULL REFERENCES chat_turns(turn_id) ON DELETE CASCADE,
+  stage_name TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','running','completed','failed')),
+  retry_policy TEXT NOT NULL CHECK(retry_policy IN ('automatic','manual')),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+  started_at TEXT,
+  completed_at TEXT,
+  last_error_category TEXT,
+  PRIMARY KEY(turn_id, stage_name)
+);
 -- OBJECT table preference_evidence
 CREATE TABLE "preference_evidence" ("evidence_id" TEXT NOT NULL, "preference_id" TEXT NOT NULL, "experience_id" TEXT NOT NULL, "message_id" TEXT NOT NULL, "evidence_type" TEXT NOT NULL, "direction" INTEGER NOT NULL, "strength" REAL NOT NULL, "created_at" TEXT NOT NULL, PRIMARY KEY ("evidence_id"), UNIQUE ("experience_id", "preference_id"), FOREIGN KEY ("preference_id") REFERENCES "preferences" ("preference_id"), FOREIGN KEY ("experience_id") REFERENCES "experiences" ("experience_id") ON DELETE CASCADE, FOREIGN KEY ("message_id") REFERENCES "messages" ("id") ON DELETE CASCADE);
 -- OBJECT table preferences
@@ -160,5 +186,9 @@ CREATE INDEX idx_diana_self_model_status_updated ON diana_self_model (status, up
 CREATE INDEX idx_goals_active ON diana_goals (status, priority DESC);
 -- OBJECT index idx_response_intentions_conversation
 CREATE INDEX idx_response_intentions_conversation ON diana_response_intentions (conversation_id, created_at DESC);
+-- OBJECT index idx_chat_turns_recovery
+CREATE INDEX idx_chat_turns_recovery ON chat_turns (status, updated_at);
+-- OBJECT index idx_chat_turn_stages_recovery
+CREATE INDEX idx_chat_turn_stages_recovery ON chat_turn_stages (status, retry_policy, attempt_count);
 -- OBJECT index idx_wm_conversation_active
 CREATE INDEX idx_wm_conversation_active ON diana_working_memory_items (conversation_id, status, salience DESC);

@@ -128,9 +128,65 @@ class MigrationRegistry:
         return self._by_id.get(migration_id)
 
 
-# Future released schema upgrades append explicit definitions here. Historical
-# 001..021 SQL files are intentionally not registered for automatic replay.
-FORWARD_MIGRATIONS = MigrationRegistry()
+TURN_DURABILITY_V22_DEFINITION = """022_turn_durability
+create table chat_turns (
+  turn_id text primary key,
+  conversation_id text not null references conversations(conversation_id) on delete cascade,
+  user_message_id text references messages(id) on delete set null,
+  assistant_message_id text references messages(id) on delete set null,
+  status text not null check(status in ('pending','core_failed','core_completed','partial','complete')),
+  created_at text not null,
+  updated_at text not null,
+  core_completed_at text,
+  completed_at text,
+  last_failed_stage text,
+  safe_error_category text
+);
+create table chat_turn_stages (
+  turn_id text not null references chat_turns(turn_id) on delete cascade,
+  stage_name text not null,
+  status text not null check(status in ('pending','running','completed','failed')),
+  retry_policy text not null check(retry_policy in ('automatic','manual')),
+  attempt_count integer not null default 0 check(attempt_count >= 0),
+  started_at text,
+  completed_at text,
+  last_error_category text,
+  primary key(turn_id, stage_name)
+);
+create index idx_chat_turns_recovery on chat_turns(status, updated_at);
+create index idx_chat_turn_stages_recovery on chat_turn_stages(status, retry_policy, attempt_count);
+"""
+
+
+async def _apply_turn_durability_v22(connection: Any) -> None:
+    for statement in TURN_DURABILITY_V22_DEFINITION.split("\n", 1)[1].split(";"):
+        if statement.strip():
+            await connection.execute(statement)
+
+
+# Historical 001..021 SQL files remain outside automatic replay. Released
+# upgrades append immutable, contiguous definitions to this registry.
+FORWARD_MIGRATIONS = MigrationRegistry((
+    MigrationDefinition(
+        "022_turn_durability",
+        21,
+        22,
+        TURN_DURABILITY_V22_DEFINITION,
+        _apply_turn_durability_v22,
+    ),
+))
+
+
+def _is_released_v21_turn_durability_upgrade(report: Any) -> bool:
+    """Accept only the exact released v21 capability gap for migration 022."""
+    return (
+        report.version == "21"
+        and report.version_issue == "unsupported:21"
+        and set(report.missing_tables) == {"chat_turns", "chat_turn_stages"}
+        and not report.missing_columns
+        and not report.missing_constraints
+        and not report.invariant_errors
+    )
 
 
 def _baseline_checksum(version: int) -> str:
@@ -394,6 +450,11 @@ async def ensure_turso_schema_current(
             raise UnsupportedSchemaVersionError("unsupported_newer_schema_version")
         if version == target_version:
             raise SchemaMigrationError("database_schema_incompatible")
+        if version == 21 and target_version == 22:
+            if not _is_released_v21_turn_durability_upgrade(report):
+                raise SchemaMigrationError("PARTIAL_OR_UNKNOWN database_schema_incompatible")
+        else:
+            raise SchemaMigrationError("PARTIAL_OR_UNKNOWN database_schema_incompatible")
         # A registered forward chain may repair an older supported release;
         # an absent path is rejected before any mutation is attempted.
         registry.plan(version, target_version)

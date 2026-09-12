@@ -170,7 +170,7 @@ class TursoSchemaContractTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_fresh_bootstrap_and_repeat_initialize(self) -> None:
-        self.assertEqual(await bootstrap(self.pool.connection), "TURSO_BOOTSTRAP_OK version=21")
+        self.assertEqual(await bootstrap(self.pool.connection), "TURSO_BOOTSTRAP_OK version=22")
         await self.pool.connection.execute(
             "insert into conversations(conversation_id,source_device,started_at,ended_at) "
             "values ('preserved-user-row','desktop','2026-09-06T00:00:00Z',null)"
@@ -225,7 +225,7 @@ class TursoSchemaContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_complete_versionless_schema_is_compatible_legacy(self) -> None:
         legacy_sql = BASELINE_SQL.replace(
             "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n"
-            "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','21');\n",
+            "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','22');\n",
             "",
             1,
         )

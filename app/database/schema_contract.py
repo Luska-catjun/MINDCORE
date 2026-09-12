@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Any
 
 
-CURRENT_TURSO_BASELINE_VERSION = "21"
+CURRENT_TURSO_BASELINE_VERSION = "22"
 SCHEMA_VERSION_KEY = "turso_baseline_version"
 
 
@@ -28,6 +28,14 @@ def _columns(value: str) -> frozenset[str]:
 # Every listed table is used by a current runtime owner. Columns are the fields
 # read or written by those owners; additive schema evolution remains valid.
 REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
+    "chat_turn_stages": _columns(
+        "turn_id stage_name status retry_policy attempt_count started_at completed_at "
+        "last_error_category"
+    ),
+    "chat_turns": _columns(
+        "turn_id conversation_id user_message_id assistant_message_id status created_at "
+        "updated_at core_completed_at completed_at last_failed_stage safe_error_category"
+    ),
     "conversations": _columns("conversation_id source_device started_at ended_at"),
     "decision_log": _columns(
         "id target old_value new_value reason source_episode_ids created_at "
@@ -140,6 +148,7 @@ REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
 # Unique constraints are idempotence/concurrency authorities, not merely query
 # optimizations. Named indexes below cover the current high-volume read paths.
 REQUIRED_UNIQUE_CONSTRAINTS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "chat_turn_stages": (("turn_id", "stage_name"),),
     "diana_goals": (("goal_key",),),
     "diana_knowledge": (("subject_key",),),
     "diana_knowledge_facts": (("knowledge_id", "fact_key"),),
@@ -160,6 +169,8 @@ REQUIRED_UNIQUE_CONSTRAINTS: dict[str, tuple[tuple[str, ...], ...]] = {
 }
 
 REQUIRED_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    "chat_turn_stages": ("turn_id", "stage_name"),
+    "chat_turns": ("turn_id",),
     "conversations": ("conversation_id",),
     "decision_log": ("id",),
     "diana_goals": ("id",),
@@ -191,6 +202,8 @@ REQUIRED_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 REQUIRED_READ_INDEXES: dict[str, tuple[tuple[str, ...], ...]] = {
+    "chat_turn_stages": (("status", "retry_policy", "attempt_count"),),
+    "chat_turns": (("status", "updated_at"),),
     "decision_log": (("conversation_id", "decision_domain", "status", "updated_at"),),
     "diana_goals": (("status", "priority"),),
     "diana_narrative_evidence": (("episode_id",), ("narrative_id", "created_at")),
@@ -204,6 +217,10 @@ REQUIRED_READ_INDEXES: dict[str, tuple[tuple[str, ...], ...]] = {
 
 # (child table, child column, parent table, parent column, on-delete action)
 REQUIRED_FOREIGN_KEYS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("chat_turn_stages", "turn_id", "chat_turns", "turn_id", "CASCADE"),
+    ("chat_turns", "conversation_id", "conversations", "conversation_id", "CASCADE"),
+    ("chat_turns", "user_message_id", "messages", "id", "SET NULL"),
+    ("chat_turns", "assistant_message_id", "messages", "id", "SET NULL"),
     ("diana_goals", "conversation_id", "conversations", "conversation_id", "CASCADE"),
     ("diana_goals", "origin_need", "diana_needs", "need_key", "NO ACTION"),
     ("diana_knowledge", "source_episode_id", "episodes", "episode_id", "NO ACTION"),

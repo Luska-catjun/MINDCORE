@@ -11,8 +11,8 @@ class BootstrapTests(unittest.IsolatedAsyncioTestCase):
  async def test_empty_second_run_and_partial_protection(self):
   p=Pool()
   async with p.acquire() as c:
-   self.assertEqual(await bootstrap(c),'TURSO_BOOTSTRAP_OK version=21')
-   self.assertEqual(await c.fetchval("select value from schema_metadata where key='turso_baseline_version'"),'21')
+   self.assertEqual(await bootstrap(c),'TURSO_BOOTSTRAP_OK version=22')
+   self.assertEqual(await c.fetchval("select value from schema_metadata where key='turso_baseline_version'"),'22')
    self.assertEqual(await c.fetch('pragma foreign_key_check'),[])
    self.assertEqual(await bootstrap(c),'TURSO_BOOTSTRAP_ALREADY_INITIALIZED')
   partial=Pool()

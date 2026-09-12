@@ -31,6 +31,30 @@ ROOT = Path(__file__).resolve().parents[2]
 BASELINE_SQL = (ROOT / "db" / "turso" / "baseline_v1.sql").read_text(encoding="utf-8")
 
 
+def released_v21_sql() -> str:
+    sql = BASELINE_SQL.replace(
+        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','22');",
+        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','21');",
+        1,
+    )
+    start = sql.index("-- OBJECT table chat_turns (schema 22)")
+    end = sql.index("-- OBJECT table preference_evidence", start)
+    sql = sql[:start] + sql[end:]
+    sql = sql.replace(
+        "-- OBJECT index idx_chat_turns_recovery\n"
+        "CREATE INDEX idx_chat_turns_recovery ON chat_turns (status, updated_at);\n",
+        "",
+        1,
+    )
+    sql = sql.replace(
+        "-- OBJECT index idx_chat_turn_stages_recovery\n"
+        "CREATE INDEX idx_chat_turn_stages_recovery ON chat_turn_stages (status, retry_policy, attempt_count);\n",
+        "",
+        1,
+    )
+    return sql
+
+
 async def execute_script(connection: TursoConnection, sql: str) -> None:
     async with connection.transaction():
         for statement in sql.split(";"):
@@ -245,7 +269,7 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
             await self.connection.fetchval(
                 f"select migration_id from {LEDGER_TABLE} order by migration_id"
             ),
-            "baseline_v21",
+            "baseline_v22",
         )
 
     async def test_current_schema_adopts_missing_ledger_without_replaying_user_rows(self) -> None:
@@ -272,7 +296,7 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_compatible_legacy_schema_is_adopted_once_without_historical_replay(self) -> None:
         legacy_sql = BASELINE_SQL.replace(
             "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n"
-            "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','21');\n",
+            "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','22');\n",
             "",
             1,
         )
@@ -295,6 +319,34 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
             ),
             1,
         )
+
+    async def test_released_v21_upgrades_to_v22_once_and_preserves_rows(self) -> None:
+        await execute_script(self.connection, released_v21_sql())
+        await self.connection.execute(
+            "insert into conversations(conversation_id,source_device,started_at,ended_at) "
+            "values ($1,$2,$3,$4)",
+            "preserved-v21-row", "desktop", "2026-09-12T00:00:00+00:00", None,
+        )
+
+        result = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+        rerun = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+
+        self.assertEqual(result.applied_migration_ids, ("022_turn_durability",))
+        self.assertEqual(rerun.applied_migration_ids, ())
+        self.assertEqual((result.initial_version, result.final_version), (21, 22))
+        self.assertEqual(
+            await self.connection.fetchval(
+                "select count(*) from conversations where conversation_id=$1",
+                "preserved-v21-row",
+            ),
+            1,
+        )
+        self.assertIsNotNone(
+            await self.connection.fetchrow(
+                "select name from sqlite_master where type='table' and name='chat_turns'"
+            )
+        )
+        self.assertEqual(await self.connection.fetchval(f"select count(*) from {LEDGER_TABLE}"), 2)
 
     async def test_file_backed_second_runner_observes_durable_ledger(self) -> None:
         with TemporaryDirectory() as directory:

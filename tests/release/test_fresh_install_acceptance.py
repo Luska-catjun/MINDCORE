@@ -49,7 +49,7 @@ class FreshInstallAcceptance(TestCase):
         self.tempdir = TemporaryDirectory()
         self.database_path = Path(self.tempdir.name) / "fresh-install.db"
         self.pool = LocalFileTursoPool(self.database_path)
-        self.assertEqual(asyncio.run(self._bootstrap()), "TURSO_BOOTSTRAP_OK version=21")
+        self.assertEqual(asyncio.run(self._bootstrap()), "TURSO_BOOTSTRAP_OK version=22")
         self.assertEqual(asyncio.run(self._scalar("pragma integrity_check")), "ok")
         self.assertEqual(asyncio.run(self._rows("pragma foreign_key_check")), [])
         self.settings = Settings(
