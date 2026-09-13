@@ -16,6 +16,8 @@ from app.database.migrations import (
     UnsupportedSchemaVersionError,
     ensure_turso_schema_current,
     migration_checksum,
+    _apply_turn_context_v23,
+    TURN_CONTEXT_V23_DEFINITION,
     run_forward_migrations,
 )
 from app.database.schema_contract import (
@@ -31,13 +33,35 @@ ROOT = Path(__file__).resolve().parents[2]
 BASELINE_SQL = (ROOT / "db" / "turso" / "baseline_v1.sql").read_text(encoding="utf-8")
 
 
-def released_v21_sql() -> str:
+def released_v22_sql() -> str:
     sql = BASELINE_SQL.replace(
+        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','23');",
+        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','22');",
+        1,
+    )
+    sql = sql.replace(
+        ",\n  initiator_actor TEXT NOT NULL DEFAULT 'user' CHECK(initiator_actor IN ('user','persona','system')),\n"
+        "  trigger_type TEXT NOT NULL DEFAULT 'user_message' CHECK(trigger_type IN ('user_message','autonomy_decision','system_event')),\n"
+        "  input_source TEXT NOT NULL DEFAULT 'text' CHECK(\n"
+        "    input_source IN ('text','internal') AND (\n"
+        "      (initiator_actor='user' AND trigger_type='user_message' AND input_source='text') OR\n"
+        "      (initiator_actor='persona' AND trigger_type='autonomy_decision' AND input_source='internal') OR\n"
+        "      (initiator_actor='system' AND trigger_type='system_event' AND input_source='internal')\n"
+        "    )\n"
+        "  )",
+        "",
+        1,
+    )
+    return sql
+
+
+def released_v21_sql() -> str:
+    sql = released_v22_sql().replace(
         "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','22');",
         "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','21');",
         1,
     )
-    start = sql.index("-- OBJECT table chat_turns (schema 22)")
+    start = sql.index("-- OBJECT table chat_turns (schema 23)")
     end = sql.index("-- OBJECT table preference_evidence", start)
     sql = sql[:start] + sql[end:]
     sql = sql.replace(
@@ -269,7 +293,7 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
             await self.connection.fetchval(
                 f"select migration_id from {LEDGER_TABLE} order by migration_id"
             ),
-            "baseline_v22",
+            "baseline_v23",
         )
 
     async def test_current_schema_adopts_missing_ledger_without_replaying_user_rows(self) -> None:
@@ -296,7 +320,7 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_compatible_legacy_schema_is_adopted_once_without_historical_replay(self) -> None:
         legacy_sql = BASELINE_SQL.replace(
             "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n"
-            "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','22');\n",
+            "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','23');\n",
             "",
             1,
         )
@@ -320,7 +344,7 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
-    async def test_released_v21_upgrades_to_v22_once_and_preserves_rows(self) -> None:
+    async def test_released_v21_upgrades_through_v23_once_and_preserves_rows(self) -> None:
         await execute_script(self.connection, released_v21_sql())
         await self.connection.execute(
             "insert into conversations(conversation_id,source_device,started_at,ended_at) "
@@ -331,9 +355,9 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
         result = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
         rerun = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
 
-        self.assertEqual(result.applied_migration_ids, ("022_turn_durability",))
+        self.assertEqual(result.applied_migration_ids, ("022_turn_durability", "023_turn_context"))
         self.assertEqual(rerun.applied_migration_ids, ())
-        self.assertEqual((result.initial_version, result.final_version), (21, 22))
+        self.assertEqual((result.initial_version, result.final_version), (21, 23))
         self.assertEqual(
             await self.connection.fetchval(
                 "select count(*) from conversations where conversation_id=$1",
@@ -346,10 +370,10 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
                 "select name from sqlite_master where type='table' and name='chat_turns'"
             )
         )
-        self.assertEqual(await self.connection.fetchval(f"select count(*) from {LEDGER_TABLE}"), 2)
+        self.assertEqual(await self.connection.fetchval(f"select count(*) from {LEDGER_TABLE}"), 3)
 
     async def test_v22_fresh_and_migrated_turn_schema_are_equivalent(self) -> None:
-        await execute_script(self.connection, released_v21_sql())
+        await execute_script(self.connection, released_v22_sql())
         await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
         fresh_raw = libsql.connect(":memory:")
         fresh = TursoConnection(fresh_raw)
@@ -381,6 +405,57 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(migrated_indexes, fresh_indexes)
         finally:
             fresh_raw.close()
+
+    async def test_released_v22_backfills_turn_context_once_and_preserves_turn_rows(self) -> None:
+        await execute_script(self.connection, released_v22_sql())
+        await self.connection.execute(
+            "insert into conversations(conversation_id,source_device,started_at,ended_at) values($1,$2,$3,$4)",
+            "legacy-turn-conversation", "desktop", "2026-09-12T00:00:00+00:00", None,
+        )
+        await self.connection.execute(
+            "insert into messages(id,conversation_id,sequence,role,content,source_device,created_at) values($1,$2,$3,$4,$5,$6,$7)",
+            "legacy-user", "legacy-turn-conversation", 1, "user", "preserved", "desktop", "2026-09-12T00:00:00+00:00",
+        )
+        await self.connection.execute(
+            "insert into chat_turns(turn_id,conversation_id,user_message_id,assistant_message_id,status,created_at,updated_at,core_completed_at,completed_at,last_failed_stage,safe_error_category) values($1,$2,$3,$4,$5,$6,$6,null,null,null,null)",
+            "legacy-turn", "legacy-turn-conversation", "legacy-user", None, "pending", "2026-09-12T00:00:00+00:00",
+        )
+
+        result = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+        rerun = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+        row = await self.connection.fetchrow("select * from chat_turns where turn_id=$1", "legacy-turn")
+
+        self.assertEqual(result.applied_migration_ids, ("023_turn_context",))
+        self.assertEqual(rerun.applied_migration_ids, ())
+        self.assertEqual((row["user_message_id"], row["assistant_message_id"]), ("legacy-user", None))
+        self.assertEqual(
+            (row["initiator_actor"], row["trigger_type"], row["input_source"]),
+            ("user", "user_message", "text"),
+        )
+
+    async def test_turn_context_migration_failure_rolls_back_columns_ledger_and_version(self) -> None:
+        await execute_script(self.connection, released_v22_sql())
+
+        async def fail_after_turn_context(connection: TursoConnection) -> None:
+            await _apply_turn_context_v23(connection)
+            raise RuntimeError("intentional turn context failure")
+
+        failing = MigrationDefinition(
+            "023_turn_context", 22, 23, TURN_CONTEXT_V23_DEFINITION, fail_after_turn_context
+        )
+        with self.assertRaisesRegex(SchemaMigrationError, "migration_failed"):
+            await run_forward_migrations(
+                self.connection, target_version=23, registry=MigrationRegistry((failing,))
+            )
+
+        columns = {row["name"] for row in await self.connection.fetch("pragma table_info(chat_turns)")}
+        self.assertFalse({"initiator_actor", "trigger_type", "input_source"} & columns)
+        self.assertEqual(
+            await self.connection.fetchval(
+                "select value from schema_metadata where key=$1", SCHEMA_VERSION_KEY
+            ),
+            "22",
+        )
 
     async def test_file_backed_second_runner_observes_durable_ledger(self) -> None:
         with TemporaryDirectory() as directory:

@@ -12,6 +12,7 @@ import libsql
 
 from app.database.turso import TursoConnection
 from app.models.enums import MessageRole
+from app.models.turn_context import TurnContext
 from app.schemas.chat import ChatRequest
 from app.schemas.messages import MessageCreate
 from app.services import repository
@@ -101,6 +102,10 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
         async with self.pool.acquire() as connection:
             return await connection.fetchval(statement, *args)
 
+    async def _assert_user_context(self, turn_id) -> None:
+        context = await self.durability.load_turn_context(turn_id)
+        self.assertEqual(context, TurnContext.user_text())
+
     async def test_user_message_and_pending_turn_are_atomic(self) -> None:
         user = await self.durability.begin_turn(
             ChatRequest(
@@ -115,6 +120,7 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn["user_message_id"], user["id"])
         self.assertEqual(turn["status"], "pending")
         self.assertIsNone(turn["assistant_message_id"])
+        await self._assert_user_context(user["id"])
 
     async def test_provider_failure_keeps_user_message_and_marks_core_failed(self) -> None:
         user = await self.durability.begin_turn(
@@ -136,6 +142,7 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
             await self._value("select count(*) from messages where id=$1", user["id"]), 1
         )
         self.assertEqual(len(await self.durability.get_stages(user["id"])), 0)
+        await self._assert_user_context(user["id"])
 
     async def test_assistant_failure_rolls_back_row_and_never_marks_core_complete(self) -> None:
         user = await self.durability.begin_turn(
@@ -254,6 +261,7 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
         turn = await self.durability.get_turn(user["id"])
         self.assertEqual(turn["status"], "complete")
         self.assertIsNotNone(turn["completed_at"])
+        await self._assert_user_context(user["id"])
 
     async def test_background_work_is_pending_before_dispatch_and_records_result(self) -> None:
         user, _assistant = await self._core_completed_turn()
@@ -370,6 +378,7 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
         self.assertEqual((await self.durability.get_turn(user["id"]))["status"], "complete")
+        await self._assert_user_context(user["id"])
 
     async def test_restart_completes_safe_noop_stages_after_empty_prerequisites(self) -> None:
         user, _assistant = await self._core_completed_turn()
@@ -431,8 +440,7 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_message_deletion_detaches_turn_and_blocks_wrong_recovery(self) -> None:
         user, _assistant = await self._core_completed_turn()
         await self._complete_except(user["id"], {"relationship"})
-        async with self.pool.acquire() as connection:
-            await connection.execute("delete from messages where id=$1", user["id"])
+        self.assertTrue(await repository.delete_message(self.pool, user["id"]))
 
         await resume_turn(self.pool, user["id"], handlers={})
 
@@ -446,6 +454,7 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn["status"], "partial")
         self.assertEqual(stage["attempt_count"], MAX_STAGE_ATTEMPTS)
         self.assertEqual(stage["last_error_category"], "missing_recovery_input")
+        await self._assert_user_context(user["id"])
 
     async def test_persona_database_files_keep_turns_isolated(self) -> None:
         other_database = Path(self.directory.name) / "other-persona.db"
@@ -463,6 +472,7 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
         async with other_pool.acquire() as connection:
             self.assertEqual(await connection.fetchval("select count(*) from chat_turns"), 0)
         self.assertIsNone(await TurnDurability(other_pool).get_turn(user["id"]))
+        await self._assert_user_context(user["id"])
 
 
 if __name__ == "__main__":

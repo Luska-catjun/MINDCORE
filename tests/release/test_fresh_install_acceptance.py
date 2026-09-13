@@ -49,7 +49,7 @@ class FreshInstallAcceptance(TestCase):
         self.tempdir = TemporaryDirectory()
         self.database_path = Path(self.tempdir.name) / "fresh-install.db"
         self.pool = LocalFileTursoPool(self.database_path)
-        self.assertEqual(asyncio.run(self._bootstrap()), "TURSO_BOOTSTRAP_OK version=22")
+        self.assertEqual(asyncio.run(self._bootstrap()), "TURSO_BOOTSTRAP_OK version=23")
         self.assertEqual(asyncio.run(self._scalar("pragma integrity_check")), "ok")
         self.assertEqual(asyncio.run(self._rows("pragma foreign_key_check")), [])
         self.settings = Settings(
@@ -178,6 +178,16 @@ class FreshInstallAcceptance(TestCase):
         self.assertGreaterEqual(asyncio.run(self._scalar("select count(*) from decision_log")), 1)
         self.assertEqual(asyncio.run(self._scalar("select count(*) from messages where conversation_id=$1", conversation_id)), 12)
         self.assertEqual(asyncio.run(self._scalar("select count(*) from chat_turns")), 6)
+        turn_contexts = asyncio.run(self._rows(
+            "select initiator_actor,trigger_type,input_source from chat_turns order by created_at,turn_id"
+        ))
+        self.assertEqual(
+            [
+                (row["initiator_actor"], row["trigger_type"], row["input_source"])
+                for row in turn_contexts
+            ],
+            [("user", "user_message", "text")] * 6,
+        )
         self.assertEqual(
             asyncio.run(self._scalar("select count(*) from chat_turns where status='complete'")),
             6,
