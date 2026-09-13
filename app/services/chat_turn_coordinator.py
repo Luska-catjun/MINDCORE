@@ -5,6 +5,7 @@ from fastapi import BackgroundTasks
 
 from app.config import Settings
 from app.models.enums import MessageRole
+from app.models.turn_context import TurnContext
 from app.schemas.chat import ChatRequest
 from app.schemas.messages import MessageCreate
 from app.services import repository
@@ -190,6 +191,7 @@ async def _run_durable_stage(
 
 async def _execute_chat_turn(
     payload: ChatRequest,
+    turn_context: TurnContext,
     background_tasks: BackgroundTasks,
     pool: asyncpg.Pool,
     settings: Settings,
@@ -203,7 +205,7 @@ async def _execute_chat_turn(
     durability = TurnDurability(
         pool, enabled=str(getattr(settings, "database_backend", "turso")).lower() == "turso"
     )
-    user_message = await durability.begin_turn(payload)
+    user_message = await durability.begin_turn(payload, turn_context)
     turn_id = user_message["id"]
     latency.mark('user_saved')
     state_before = None
@@ -767,10 +769,11 @@ class ChatTurnCoordinator:
         self,
         *,
         payload: ChatRequest,
+        turn_context: TurnContext,
         background_tasks: BackgroundTasks,
         settings: Settings,
         identity_prompt: str,
     ) -> dict:
         return await _execute_chat_turn(
-            payload, background_tasks, self.pool, settings, identity_prompt, self.snapshot_scope
+            payload, turn_context, background_tasks, self.pool, settings, identity_prompt, self.snapshot_scope
         )

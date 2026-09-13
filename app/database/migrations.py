@@ -158,8 +158,30 @@ create index idx_chat_turn_stages_recovery on chat_turn_stages(status, retry_pol
 """
 
 
+TURN_CONTEXT_V23_DEFINITION = """023_turn_context
+alter table chat_turns add column initiator_actor text not null default 'user'
+  check(initiator_actor in ('user','persona','system'));
+alter table chat_turns add column trigger_type text not null default 'user_message'
+  check(trigger_type in ('user_message','autonomy_decision','system_event'));
+alter table chat_turns add column input_source text not null default 'text'
+  check(
+    input_source in ('text','internal') and (
+      (initiator_actor='user' and trigger_type='user_message' and input_source='text') or
+      (initiator_actor='persona' and trigger_type='autonomy_decision' and input_source='internal') or
+      (initiator_actor='system' and trigger_type='system_event' and input_source='internal')
+    )
+  );
+"""
+
+
 async def _apply_turn_durability_v22(connection: Any) -> None:
     for statement in TURN_DURABILITY_V22_DEFINITION.split("\n", 1)[1].split(";"):
+        if statement.strip():
+            await connection.execute(statement)
+
+
+async def _apply_turn_context_v23(connection: Any) -> None:
+    for statement in TURN_CONTEXT_V23_DEFINITION.split("\n", 1)[1].split(";"):
         if statement.strip():
             await connection.execute(statement)
 
@@ -174,6 +196,13 @@ FORWARD_MIGRATIONS = MigrationRegistry((
         TURN_DURABILITY_V22_DEFINITION,
         _apply_turn_durability_v22,
     ),
+    MigrationDefinition(
+        "023_turn_context",
+        22,
+        23,
+        TURN_CONTEXT_V23_DEFINITION,
+        _apply_turn_context_v23,
+    ),
 ))
 
 
@@ -184,6 +213,23 @@ def _is_released_v21_turn_durability_upgrade(report: Any) -> bool:
         and report.version_issue == "unsupported:21"
         and set(report.missing_tables) == {"chat_turns", "chat_turn_stages"}
         and not report.missing_columns
+        and not report.missing_constraints
+        and not report.invariant_errors
+    )
+
+
+def _is_released_v22_turn_context_upgrade(report: Any) -> bool:
+    """Accept only the exact released v22 capability gap for migration 023."""
+    return (
+        report.version == "22"
+        and report.version_issue == "unsupported:22"
+        and not report.missing_tables
+        and set(report.missing_columns)
+        == {
+            "chat_turns.initiator_actor",
+            "chat_turns.trigger_type",
+            "chat_turns.input_source",
+        }
         and not report.missing_constraints
         and not report.invariant_errors
     )
@@ -450,8 +496,11 @@ async def ensure_turso_schema_current(
             raise UnsupportedSchemaVersionError("unsupported_newer_schema_version")
         if version == target_version:
             raise SchemaMigrationError("database_schema_incompatible")
-        if version == 21 and target_version == 22:
+        if version == 21 and target_version >= 22:
             if not _is_released_v21_turn_durability_upgrade(report):
+                raise SchemaMigrationError("PARTIAL_OR_UNKNOWN database_schema_incompatible")
+        elif version == 22 and target_version >= 23:
+            if not _is_released_v22_turn_context_upgrade(report):
                 raise SchemaMigrationError("PARTIAL_OR_UNKNOWN database_schema_incompatible")
         else:
             raise SchemaMigrationError("PARTIAL_OR_UNKNOWN database_schema_incompatible")

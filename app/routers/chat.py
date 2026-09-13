@@ -5,6 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 
 from app.database.connection import get_pool
 from app.models.enums import MessageRole
+from app.models.turn_context import TurnContext
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.services.chat_turn_coordinator import ChatTurnCoordinator
 from app.services.llm_errors import LLMError
@@ -32,6 +33,7 @@ async def send_chat_message(
             snapshot_scope=getattr(request.app.state, "cognitive_snapshot_scope", None),
         ).execute(
             payload=payload,
+            turn_context=TurnContext.user_text(),
             background_tasks=background_tasks,
             settings=request.app.state.settings,
             identity_prompt=request.app.state.diana_identity_prompt,

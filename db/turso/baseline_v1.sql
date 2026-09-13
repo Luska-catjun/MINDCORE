@@ -1,8 +1,8 @@
 -- Turso fresh baseline v1 (current production schema after schema-drift repair).
 -- Historical db/migrations/001..021 are not a fresh-Turso bootstrap chain.
--- Future Turso forward migrations continue after 022.
+-- Future Turso forward migrations continue after 023.
 CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','22');
+INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','23');
 
 -- OBJECT table conversations
 CREATE TABLE "conversations" ("conversation_id" TEXT NOT NULL, "source_device" TEXT NOT NULL, "started_at" TEXT NOT NULL, "ended_at" TEXT, PRIMARY KEY ("conversation_id"));
@@ -128,7 +128,7 @@ CREATE TABLE "experiences" ("experience_id" TEXT NOT NULL, "conversation_id" TEX
 CREATE TABLE "memories" ("memory_id" TEXT NOT NULL, "content" TEXT NOT NULL, "normalized_content" TEXT NOT NULL, "memory_type" TEXT NOT NULL, "importance" REAL NOT NULL, "source_conversation_id" TEXT, "source_message_id" TEXT, "created_at" TEXT NOT NULL, "updated_at" TEXT NOT NULL, "recall_frequency" INTEGER NOT NULL, "memory_strength" REAL NOT NULL, "last_recalled_at" TEXT, "source_episode_id" TEXT, PRIMARY KEY ("memory_id"), UNIQUE ("normalized_content"), FOREIGN KEY ("source_conversation_id") REFERENCES "conversations" ("conversation_id"), FOREIGN KEY ("source_message_id") REFERENCES "messages" ("id") ON DELETE SET NULL, FOREIGN KEY ("source_episode_id") REFERENCES "episodes" ("episode_id"));
 -- OBJECT table messages
 CREATE TABLE "messages" ("id" TEXT NOT NULL, "conversation_id" TEXT NOT NULL, "sequence" INTEGER NOT NULL, "role" TEXT NOT NULL, "content" TEXT NOT NULL, "source_device" TEXT NOT NULL, "created_at" TEXT NOT NULL, PRIMARY KEY ("id"), UNIQUE ("conversation_id", "sequence"), FOREIGN KEY ("conversation_id") REFERENCES "conversations" ("conversation_id") ON DELETE CASCADE);
--- OBJECT table chat_turns (schema 22)
+-- OBJECT table chat_turns (schema 23)
 CREATE TABLE chat_turns (
   turn_id TEXT PRIMARY KEY,
   conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
@@ -140,9 +140,18 @@ CREATE TABLE chat_turns (
   core_completed_at TEXT,
   completed_at TEXT,
   last_failed_stage TEXT,
-  safe_error_category TEXT
+  safe_error_category TEXT,
+  initiator_actor TEXT NOT NULL DEFAULT 'user' CHECK(initiator_actor IN ('user','persona','system')),
+  trigger_type TEXT NOT NULL DEFAULT 'user_message' CHECK(trigger_type IN ('user_message','autonomy_decision','system_event')),
+  input_source TEXT NOT NULL DEFAULT 'text' CHECK(
+    input_source IN ('text','internal') AND (
+      (initiator_actor='user' AND trigger_type='user_message' AND input_source='text') OR
+      (initiator_actor='persona' AND trigger_type='autonomy_decision' AND input_source='internal') OR
+      (initiator_actor='system' AND trigger_type='system_event' AND input_source='internal')
+    )
+  )
 );
--- OBJECT table chat_turn_stages (schema 22)
+-- OBJECT table chat_turn_stages (schema 23)
 CREATE TABLE chat_turn_stages (
   turn_id TEXT NOT NULL REFERENCES chat_turns(turn_id) ON DELETE CASCADE,
   stage_name TEXT NOT NULL,

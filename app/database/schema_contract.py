@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Any
 
 
-CURRENT_TURSO_BASELINE_VERSION = "22"
+CURRENT_TURSO_BASELINE_VERSION = "23"
 SCHEMA_VERSION_KEY = "turso_baseline_version"
 
 
@@ -34,7 +34,8 @@ REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
     ),
     "chat_turns": _columns(
         "turn_id conversation_id user_message_id assistant_message_id status created_at "
-        "updated_at core_completed_at completed_at last_failed_stage safe_error_category"
+        "updated_at core_completed_at completed_at last_failed_stage safe_error_category "
+        "initiator_actor trigger_type input_source"
     ),
     "conversations": _columns("conversation_id source_device started_at ended_at"),
     "decision_log": _columns(

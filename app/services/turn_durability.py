@@ -15,6 +15,7 @@ from uuid import UUID
 
 from app.services import repository
 from app.services.error_safety import safe_error_type
+from app.models.turn_context import TurnContext
 
 
 logger = logging.getLogger("diana.turn_durability")
@@ -127,7 +128,15 @@ class TurnDurability:
             pool_supports_durability and enabled
         )
 
-    async def begin_turn(self, payload: Any) -> dict[str, Any]:
+    async def begin_turn(
+        self, payload: Any, turn_context: TurnContext | None = None
+    ) -> dict[str, Any]:
+        """Atomically create the current user message and its durable origin.
+
+        ``turn_context`` is optional only for legacy isolated fixtures; real
+        entry points construct and pass the typed canonical context explicitly.
+        """
+        turn_context = turn_context or TurnContext.user_text()
         if not self.enabled:
             return await repository.create_message(self.pool, payload)
         async with self.pool.acquire() as connection:
@@ -137,14 +146,31 @@ class TurnDurability:
                 await connection.execute(
                     """insert into chat_turns(
                          turn_id,conversation_id,user_message_id,assistant_message_id,status,
-                         created_at,updated_at,core_completed_at,completed_at,last_failed_stage,safe_error_category
-                       ) values($1,$2,$1,null,'pending',$3,$3,null,null,null,null)""",
+                         created_at,updated_at,core_completed_at,completed_at,last_failed_stage,safe_error_category,
+                         initiator_actor,trigger_type,input_source
+                       ) values($1,$2,$1,null,'pending',$3,$3,null,null,null,null,$4,$5,$6)""",
                     message["id"],
                     payload.conversation_id,
                     now,
+                    *turn_context.durable_values(),
                 )
-        logger.info("TURN_LIFECYCLE turn=%s status=pending", message["id"])
+        logger.info(
+            "TURN_LIFECYCLE turn=%s status=pending initiator=%s trigger=%s input_source=%s",
+            message["id"], *turn_context.durable_values(),
+        )
         return message
+
+    async def load_turn_context(self, turn_id: UUID | str) -> TurnContext | None:
+        """Load durable turn provenance without reconstructing it from messages."""
+        if not self.enabled:
+            return None
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """select initiator_actor,trigger_type,input_source
+                   from chat_turns where turn_id=$1""",
+                turn_id,
+            )
+        return TurnContext.from_durable(row) if row is not None else None
 
     async def mark_core_failed(self, turn_id: UUID | str, error: BaseException) -> None:
         if not self.enabled:
