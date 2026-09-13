@@ -3,6 +3,7 @@
 import unittest
 
 from desktop.build_sidecar import COLLECT_ALL, data_separator, sidecar_filename, target_suffix
+from desktop.verify_sidecar_archive import validate_archive_members
 
 
 class SidecarNamingTests(unittest.TestCase):
@@ -26,3 +27,19 @@ class SidecarNamingTests(unittest.TestCase):
 
     def test_sidecar_collects_iana_timezone_data(self) -> None:
         self.assertIn("tzdata", COLLECT_ALL)
+
+    def test_sidecar_archive_rejects_optional_websocket_speedups(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "WebSocket speedups"):
+            validate_archive_members((
+                "libsql/libsql.cp312-win_amd64.pyd",
+                "asyncpg/protocol/protocol.cp312-win_amd64.pyd",
+                "websockets/speedups.cp312-win_amd64.pyd",
+            ))
+
+    def test_sidecar_archive_requires_database_packages(self) -> None:
+        validate_archive_members((
+            "libsql/libsql.cp312-win_amd64.pyd",
+            "asyncpg/protocol/protocol.cp312-win_amd64.pyd",
+        ))
+        with self.assertRaisesRegex(RuntimeError, "database packages"):
+            validate_archive_members(("libsql/libsql.cp312-win_amd64.pyd",))

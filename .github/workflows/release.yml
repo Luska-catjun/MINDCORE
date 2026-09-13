@@ -79,6 +79,8 @@ jobs:
       - name: Build Windows sidecar
         working-directory: frontend
         run: npm run desktop:sidecar:build
+      - name: Verify Windows sidecar dependency boundary
+        run: python desktop/verify_sidecar_archive.py frontend/src-tauri/binaries/mindcore-backend-x86_64-pc-windows-msvc.exe
       - name: Run Rust tests
         working-directory: frontend/src-tauri
         run: cargo test

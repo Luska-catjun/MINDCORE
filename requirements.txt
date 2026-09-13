@@ -5,4 +5,7 @@ groq
 pydantic-settings==2.7.1
 python-dotenv==1.0.1
 tzdata==2026.3
-uvicorn[standard]==0.34.0
+# The desktop sidecar serves local REST over HTTP/1.1.  It intentionally does
+# not expose WebSocket routes, so avoid Uvicorn's optional `standard` extras
+# (including the native websockets speedups extension) in public bundles.
+uvicorn==0.34.0

@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
@@ -17,6 +18,7 @@ from app.desktop_backend import (
     DESKTOP_SHUTDOWN_CAPABILITY_HEADER,
     SETUP_DIAGNOSTIC_PREFIX,
     _desktop_session_token,
+    _desktop_server_config,
     _ensure_desktop_auth_config,
     _parent_process_is_alive,
     _register_desktop_shutdown_route,
@@ -50,6 +52,15 @@ class DesktopBackendTests(TestCase):
 
     def test_parent_liveness_recognizes_the_current_process(self) -> None:
         self.assertTrue(_parent_process_is_alive(os.getpid()))
+
+    def test_desktop_sidecar_uses_rest_only_pure_python_uvicorn_components(self) -> None:
+        config = _desktop_server_config(FastAPI(), 9876)
+
+        self.assertEqual(config.host, "127.0.0.1")
+        self.assertEqual(config.port, 9876)
+        self.assertEqual(config.loop, "asyncio")
+        self.assertEqual(config.http, "h11")
+        self.assertEqual(config.ws, "none")
 
     def test_parent_exit_marks_the_backend_for_shutdown(self) -> None:
         server = type("TestServer", (), {"should_exit": False})()
