@@ -377,6 +377,25 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
             "active", 0.1, 0.8, "legacy-conversation", "message", "legacy-message",
             "2026-09-12T00:00:00+00:00", None, "{}",
         )
+        await self.connection.execute(
+            "insert into episodes(episode_id,conversation_id,sequence,summary,recall_frequency,source_device,created_at,user_message_id,episode_type,provenance,is_grounded,updated_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$7)",
+            "legacy-episode", "legacy-conversation", 1, "preserved", 0, "desktop",
+            "2026-09-12T00:00:00+00:00", "legacy-message", "conversation", "runtime", 1,
+        )
+        await self.connection.execute(
+            "insert into memories(memory_id,content,normalized_content,memory_type,importance,source_conversation_id,source_message_id,created_at,updated_at,recall_frequency,memory_strength,source_episode_id) values($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10,$11)",
+            "legacy-memory", "preserved", "preserved", "fact", 0.8, "legacy-conversation",
+            "legacy-message", "2026-09-12T00:00:00+00:00", 0, 0.8, "legacy-episode",
+        )
+        await self.connection.execute(
+            "insert into preferences(preference_id,owner_type,subject,value,preference_type,status,confidence,evidence_count,first_seen_at,last_seen_at,created_at,updated_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$9,$9)",
+            "legacy-preference", "user", "tea", "green", "like", "active", 0.8, 1,
+            "2026-09-12T00:00:00+00:00",
+        )
+        await self.connection.execute(
+            "insert into relationship(id,familiarity,trust,affection,shared_experience,conflict_history,updated_at,conflict) values($1,$2,$3,$4,$5,$6,$7,$8)",
+            1, 0.8, 0.8, 0.8, 1.0, "[]", "2026-09-12T00:00:00+00:00", 0.0,
+        )
         report = await classify_turso_schema(self.connection)
         self.assertEqual(report.state, SchemaState.PARTIAL_OR_UNKNOWN)
         self.assertEqual(set(report.missing_tables), {"chat_turns", "chat_turn_stages"})
@@ -412,6 +431,18 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.connection.fetchval(
             "select summary from diana_goals where id='legacy-goal'"
         ), "preserved")
+        self.assertEqual(await self.connection.fetchval(
+            "select content from memories where memory_id='legacy-memory'"
+        ), "preserved")
+        self.assertEqual(await self.connection.fetchval(
+            "select summary from episodes where episode_id='legacy-episode'"
+        ), "preserved")
+        self.assertEqual(await self.connection.fetchval(
+            "select value from preferences where preference_id='legacy-preference'"
+        ), "green")
+        self.assertEqual(await self.connection.fetchval(
+            "select trust from relationship where id=1"
+        ), 0.8)
 
     async def test_unversioned_v21_with_extra_contract_drift_is_refused_without_adoption(self) -> None:
         for damaged in ("table", "index", "constraint", "ledger"):
