@@ -189,6 +189,29 @@ def _is_released_v21_turn_durability_upgrade(report: Any) -> bool:
     )
 
 
+async def _is_unversioned_released_v21_turn_durability_upgrade(
+    connection: Any, report: Any
+) -> bool:
+    """Recognize only the exact metadata-less released-v21 capability gap.
+
+    ``classify_turso_schema`` remains read-only and intentionally reports this
+    shape as partial against the v22 contract.  Adoption is allowed only here,
+    at the mutating migration boundary, after proving that the missing
+    durability tables are the sole contract gap and no legacy ledger exists.
+    """
+    tables = await _tables(connection)
+    return (
+        "schema_metadata" not in tables
+        and LEDGER_TABLE not in tables
+        and report.version is None
+        and report.version_issue is None
+        and set(report.missing_tables) == {"chat_turns", "chat_turn_stages"}
+        and not report.missing_columns
+        and not report.missing_constraints
+        and not report.invariant_errors
+    )
+
+
 def _baseline_checksum(version: int) -> str:
     return migration_checksum(f"MindCore released schema baseline v{version}")
 
@@ -415,6 +438,41 @@ async def _adopt_compatible_legacy_database(
         await _validate_ledger(connection, registry=registry, current_version=target_version)
 
 
+async def _adopt_unversioned_released_v21_database(
+    connection: Any,
+    *,
+    registry: MigrationRegistry,
+) -> None:
+    """Create durable v21 metadata, then let the normal 021→022 path run.
+
+    This intentionally commits the adoption separately from migration 022.
+    A crash after adoption leaves an ordinary versioned v21 database, which the
+    existing forward runner can safely resume on the next initialize.
+    """
+    legacy_version = 21
+    async with connection.transaction():
+        await connection.execute(
+            "create table schema_metadata (key text primary key, value text not null)"
+        )
+        await connection.execute(
+            "insert into schema_metadata(key,value) values ($1,$2)",
+            SCHEMA_VERSION_KEY,
+            str(legacy_version),
+        )
+        await _ensure_ledger_table(connection)
+        await connection.execute(
+            f"""insert into {LEDGER_TABLE}(
+                migration_id, from_version, to_version, checksum, applied_at
+            ) values ($1,$2,$3,$4,$5)""",
+            "baseline_v21",
+            legacy_version,
+            legacy_version,
+            _baseline_checksum(legacy_version),
+            datetime.now(timezone.utc),
+        )
+        await _validate_ledger(connection, registry=registry, current_version=legacy_version)
+
+
 async def ensure_turso_schema_current(
     connection: Any,
     *,
@@ -445,7 +503,15 @@ async def ensure_turso_schema_current(
     elif report.state == SchemaState.PARTIAL_OR_UNKNOWN:
         version = await _schema_version(connection)
         if version is None:
-            raise SchemaMigrationError("database_schema_incompatible")
+            if not await _is_unversioned_released_v21_turn_durability_upgrade(connection, report):
+                raise SchemaMigrationError("database_schema_incompatible")
+            await _adopt_unversioned_released_v21_database(connection, registry=registry)
+            adopted_legacy = True
+            version = 21
+            # The pre-adoption report intentionally has no version. Reclassify
+            # after recording v21 so the established released-v21 guard, not a
+            # metadata-less snapshot, authorizes the forward migration.
+            report = await classify_turso_schema(connection)
         if version > target_version:
             raise UnsupportedSchemaVersionError("unsupported_newer_schema_version")
         if version == target_version:

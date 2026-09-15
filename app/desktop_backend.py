@@ -16,7 +16,6 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response, status
 
 from app.database.schema_contract import (
-    CURRENT_TURSO_BASELINE_VERSION,
     SchemaState,
     classify_turso_schema,
 )
@@ -253,12 +252,6 @@ async def _setup_action(action: str, config_path: str) -> str:
                 return classification
             if action != "initialize":
                 raise RuntimeError("unsupported_setup_action")
-            if report.state == SchemaState.PARTIAL_OR_UNKNOWN and (
-                report.version is None
-                or not report.version.isdecimal()
-                or int(report.version) >= int(CURRENT_TURSO_BASELINE_VERSION)
-            ):
-                raise RuntimeError(f"partial_or_unknown: {report.details()}")
             baseline = RESOURCE_ROOT / "db" / "turso" / "baseline_v1.sql"
             result = await ensure_turso_schema_current(
                 connection, baseline_sql=baseline.read_text(encoding="utf-8")

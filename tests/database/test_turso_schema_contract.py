@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import libsql
 
+from app.database.migrations import SchemaMigrationError
 from app.database.schema_contract import (
     CURRENT_TURSO_BASELINE_VERSION,
     SchemaState,
@@ -43,6 +44,34 @@ async def apply_sql(connection: TursoConnection, sql: str) -> None:
         for statement in sql.split(";"):
             if statement.strip():
                 await connection.execute(statement)
+
+
+def unversioned_released_v21_sql() -> str:
+    sql = BASELINE_SQL.replace(
+        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','22');",
+        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','21');",
+        1,
+    )
+    start = sql.index("-- OBJECT table chat_turns (schema 22)")
+    end = sql.index("-- OBJECT table preference_evidence", start)
+    sql = sql[:start] + sql[end:]
+    sql = sql.replace(
+        "-- OBJECT index idx_chat_turns_recovery\n"
+        "CREATE INDEX idx_chat_turns_recovery ON chat_turns (status, updated_at);\n",
+        "",
+        1,
+    ).replace(
+        "-- OBJECT index idx_chat_turn_stages_recovery\n"
+        "CREATE INDEX idx_chat_turn_stages_recovery ON chat_turn_stages (status, retry_policy, attempt_count);\n",
+        "",
+        1,
+    )
+    return sql.replace(
+        "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n"
+        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','21');\n",
+        "",
+        1,
+    )
 
 
 class TursoSchemaContractTests(unittest.IsolatedAsyncioTestCase):
@@ -92,7 +121,10 @@ class TursoSchemaContractTests(unittest.IsolatedAsyncioTestCase):
                 patch("app.database.connection.close_pool", return_value=None),
             ):
                 self.assertEqual(await _setup_action("classify", str(config)), "PARTIAL_OR_UNKNOWN")
-                with self.assertRaisesRegex(RuntimeError, "partial_or_unknown"):
+                # Desktop delegates all mutation policy to the migration
+                # authority. An arbitrary partial schema remains rejected
+                # there, rather than by an early desktop-only rule.
+                with self.assertRaisesRegex(SchemaMigrationError, "database_schema_incompatible"):
                     await _setup_action("initialize", str(config))
 
         self.assertFalse(self.pool.closed)
@@ -198,6 +230,22 @@ class TursoSchemaContractTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await _setup_action("initialize", str(config)), "BOOTSTRAPPED")
                 self.assertEqual(await _setup_action("classify", str(config)), "INITIALIZED")
                 self.assertEqual(await _setup_action("initialize", str(config)), "INITIALIZED")
+
+    async def test_desktop_initialize_adopts_exact_unversioned_v21(self) -> None:
+        await apply_sql(self.pool.connection, unversioned_released_v21_sql())
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "mindcore.env"
+            config.write_text("DATABASE_BACKEND=turso\n", encoding="utf-8")
+            with (
+                patch("app.desktop_backend._settings_from", return_value=object()),
+                patch("app.database.connection.create_pool", return_value=self.pool),
+                patch("app.database.connection.close_pool", return_value=None),
+            ):
+                self.assertEqual(await _setup_action("classify", str(config)), "PARTIAL_OR_UNKNOWN")
+                self.assertEqual(await _setup_action("initialize", str(config)), "INITIALIZED")
+
+        report = await classify_turso_schema(self.pool.connection)
+        self.assertEqual(report.state, SchemaState.CURRENT)
 
     async def test_desktop_database_preflight_remains_read_only(self) -> None:
         await self.pool.connection.execute("create table preflight_probe (id text primary key)")
