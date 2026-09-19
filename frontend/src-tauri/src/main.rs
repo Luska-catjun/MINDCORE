@@ -458,6 +458,18 @@ fn print_setup_failure_diagnostic(action: &str, exit_code: Option<i32>, stderr: 
         );
     }
 }
+fn setup_failure_is_schema_incompatible(stderr: &[u8]) -> bool {
+    // Python emits this fixed, secret-free diagnostic line for setup actions.
+    // Never surface arbitrary stderr: libSQL and provider failures may include
+    // credentials or connection URLs.
+    std::str::from_utf8(stderr)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|line| line.starts_with("MINDCORE_SETUP_DIAGNOSTIC "))
+        })
+        .is_some_and(|line| line.split_whitespace().any(|field| field == "category=schema"))
+}
 fn setup_action(app: &AppHandle, action: &str, draft: &SetupDraft) -> Result<String, String> {
     validate_setup_action(action, draft)?;
     let config = config_path(app)?;
@@ -480,6 +492,9 @@ fn setup_action(app: &AppHandle, action: &str, draft: &SetupDraft) -> Result<Str
     } else {
         #[cfg(debug_assertions)]
         print_setup_failure_diagnostic(action, output.status.code(), &output.stderr);
+        if action == "initialize" && setup_failure_is_schema_incompatible(&output.stderr) {
+            return Err("SETUP_SCHEMA_INCOMPATIBLE".into());
+        }
         Err("Setup validation failed. Check the values and try again.".into())
     }
 }
@@ -1050,7 +1065,30 @@ fn save_mindcore_config(app: AppHandle, draft: SetupDraft, identity: String) -> 
 }
 #[tauri::command]
 fn start_mindcore_backend(app: AppHandle) -> Result<(), String> {
-    start_sidecar(&app)
+    start_sidecar(&app).map_err(|error| {
+        // Keep the user-facing error generic, but make direct-upgrade reports
+        // distinguishable in native logs without exposing config or secrets.
+        eprintln!(
+            "[MINDCORE_STARTUP_DIAGNOSTIC] category={}",
+            startup_failure_category(&error)
+        );
+        error
+    })
+}
+fn startup_failure_category(error: &str) -> &'static str {
+    if error.contains("setup is incomplete") || error.contains("Persona") {
+        "config_or_persona"
+    } else if error.contains("sidecar") && error.contains("unavailable") {
+        "sidecar_spawn"
+    } else if error.contains("exited before becoming ready") {
+        "sidecar_exit"
+    } else if error.contains("local port") {
+        "port_conflict"
+    } else if error.contains("lifecycle") {
+        "lifecycle"
+    } else {
+        "startup"
+    }
 }
 #[tauri::command]
 fn get_desktop_session(app: AppHandle) -> Result<String, String> {
@@ -1356,6 +1394,27 @@ mod setup_validation_tests {
         draft.preserve_identity = true;
         assert!(validate_setup_action("classify", &draft).is_err());
         assert!(validate_setup_action("initialize", &draft).is_err());
+    }
+
+    #[test]
+    fn only_the_fixed_safe_schema_diagnostic_maps_to_the_schema_ui_category() {
+        assert!(setup_failure_is_schema_incompatible(
+            b"MINDCORE_SETUP_DIAGNOSTIC action=initialize category=schema exception_class=SchemaMigrationError\n"
+        ));
+        assert!(!setup_failure_is_schema_incompatible(
+            b"MINDCORE_SETUP_DIAGNOSTIC action=initialize category=driver_or_configuration database_url_present=true\n"
+        ));
+        assert!(!setup_failure_is_schema_incompatible(
+            b"driver error with a database URL that must not be parsed\n"
+        ));
+    }
+
+    #[test]
+    fn startup_diagnostics_use_only_safe_categories() {
+        assert_eq!(startup_failure_category("MindCore setup is incomplete."), "config_or_persona");
+        assert_eq!(startup_failure_category("MindCore backend exited before becoming ready."), "sidecar_exit");
+        assert_eq!(startup_failure_category("MindCore backend could not claim its local port."), "port_conflict");
+        assert_eq!(startup_failure_category("unexpected secret-looking input"), "startup");
     }
 
     #[test]

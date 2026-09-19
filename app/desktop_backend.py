@@ -19,7 +19,7 @@ from app.database.schema_contract import (
     SchemaState,
     classify_turso_schema,
 )
-from app.database.migrations import ensure_turso_schema_current
+from app.database.migrations import SchemaMigrationError, ensure_turso_schema_current
 from app.main import create_app
 
 
@@ -92,7 +92,12 @@ def _setup_failure_diagnostic(action: str, config_path: str, error: Exception) -
                 character for character in error_type if character.isalnum() or character in "._"
             ) or "unavailable"
 
-    if isinstance(error, LLMError):
+    if isinstance(error, SchemaMigrationError):
+        # The schema authority already reduces its errors to structural,
+        # metadata-only identifiers.  Keep that classification available to
+        # the native shell without disclosing the underlying database input.
+        category = "schema"
+    elif isinstance(error, LLMError):
         category = error.category
     elif isinstance(error, (TimeoutError, ConnectionError)):
         category = "connection"

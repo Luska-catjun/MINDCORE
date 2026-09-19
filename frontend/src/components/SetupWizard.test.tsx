@@ -34,6 +34,24 @@ describe("SetupWizard validation", () => {
     await waitFor(expectContinueEnabled);
   }
 
+  async function reachReview(onComplete = vi.fn()) {
+    render(<SetupWizard onComplete={onComplete} />);
+    await userEvent.click(screen.getByRole("button", { name: "Get Started" }));
+    await validateDatabase();
+    await userEvent.click(continueButton());
+    fireEvent.change(screen.getByPlaceholderText("Gemini API Key"), { target: { value: "key-a" } });
+    await userEvent.click(screen.getByRole("button", { name: "Test Connection" }));
+    await waitFor(expectContinueEnabled);
+    await userEvent.click(continueButton());
+    await screen.findByRole("heading", { name: "Persona Setup" });
+    fireEvent.change(screen.getByPlaceholderText("Your display name"), { target: { value: "Luska" } });
+    fireEvent.change(screen.getByPlaceholderText("Persona name"), { target: { value: "Jarvis" } });
+    await waitFor(expectContinueEnabled);
+    await userEvent.click(continueButton());
+    await screen.findByRole("heading", { name: "Review / Initialize" });
+    return onComplete;
+  }
+
   it("blocks untested and failed database Next, then invalidates on edit", async () => {
     await enterDatabase();
     expectContinueDisabled();
@@ -235,5 +253,42 @@ describe("SetupWizard validation", () => {
     await userEvent.click(continueButton());
     expect(screen.getByText("User: Luska")).toBeTruthy();
     expect(screen.getByText("Persona: Jarvis")).toBeTruthy();
+  });
+
+  it("delegates a PARTIAL_OR_UNKNOWN schema classification to initialize authority", async () => {
+    invoke.mockImplementation((name: string, args?: { action?: string }) => {
+      if (name === "generic_identity_template") return Promise.resolve("IDENTITY");
+      if (name === "run_setup_action" && args?.action === "classify") return Promise.resolve("PARTIAL_OR_UNKNOWN");
+      return Promise.resolve("Connected");
+    });
+    const onComplete = await reachReview();
+
+    await userEvent.click(screen.getByRole("button", { name: "Initialize MindCore" }));
+
+    await waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
+    expect(invoke).not.toHaveBeenCalledWith("run_setup_action", expect.objectContaining({ action: "classify" }));
+    expect(invoke).toHaveBeenCalledWith("run_setup_action", expect.objectContaining({ action: "initialize" }));
+    expect(invoke).toHaveBeenCalledWith("save_mindcore_config", expect.anything());
+    expect(invoke).toHaveBeenCalledWith("start_mindcore_backend");
+    expect(screen.queryByText(/incomplete or unsupported MindCore schema/i)).toBeNull();
+  });
+
+  it("shows a safe unsupported-schema message only when initialize rejects the database", async () => {
+    invoke.mockImplementation((name: string, args?: { action?: string }) => {
+      if (name === "generic_identity_template") return Promise.resolve("IDENTITY");
+      if (name === "run_setup_action" && args?.action === "initialize") {
+        return Promise.reject(new Error("SETUP_SCHEMA_INCOMPATIBLE raw details must not render"));
+      }
+      return Promise.resolve("Connected");
+    });
+    const onComplete = await reachReview();
+
+    await userEvent.click(screen.getByRole("button", { name: "Initialize MindCore" }));
+
+    await screen.findByText("This database contains an incomplete or unsupported MindCore schema. It will not be overwritten.");
+    expect(onComplete).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalledWith("save_mindcore_config", expect.anything());
+    expect(invoke).not.toHaveBeenCalledWith("start_mindcore_backend");
+    expect(screen.queryByText(/raw details must not render/i)).toBeNull();
   });
 });

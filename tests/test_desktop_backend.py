@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.config import Settings, get_settings
+from app.database.migrations import SchemaMigrationError
 from app.desktop_backend import (
     DESKTOP_INSTANCE_HEADER,
     DESKTOP_SHUTDOWN_CAPABILITY_HEADER,
@@ -117,6 +118,24 @@ class DesktopBackendTests(TestCase):
         self.assertNotIn("raw provider failure", diagnostic)
         self.assertIn("validation_field=unavailable", diagnostic)
         self.assertIn("validation_type=unavailable", diagnostic)
+
+    def test_schema_setup_diagnostic_uses_a_safe_schema_category(self) -> None:
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "mindcore.env"
+            secret = "database-token-must-not-appear"
+            config.write_text(
+                f'DATABASE_URL="libsql://private.example"\nDATABASE_AUTH_TOKEN="{secret}"\n',
+                encoding="utf-8",
+            )
+            diagnostic = _setup_failure_diagnostic(
+                "initialize", str(config), SchemaMigrationError("database_schema_incompatible")
+            )
+
+        self.assertIn("action=initialize", diagnostic)
+        self.assertIn("category=schema", diagnostic)
+        self.assertIn("exception_class=SchemaMigrationError", diagnostic)
+        self.assertNotIn(secret, diagnostic)
+        self.assertNotIn("private.example", diagnostic)
 
     def test_settings_validation_diagnostic_reports_only_safe_field_and_type(self) -> None:
         with TemporaryDirectory() as directory:
