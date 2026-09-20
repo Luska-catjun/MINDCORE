@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.config import Settings, get_settings
-from app.database.migrations import SchemaMigrationError
+from app.database.migrations import SchemaBootstrapError, SchemaMigrationError
 from app.desktop_backend import (
     DESKTOP_INSTANCE_HEADER,
     DESKTOP_SHUTDOWN_CAPABILITY_HEADER,
@@ -88,7 +88,8 @@ class DesktopBackendTests(TestCase):
 
         self.assertEqual(
             diagnostic,
-            f"{SETUP_DIAGNOSTIC_PREFIX} action=database category=driver_or_configuration "
+            f"{SETUP_DIAGNOSTIC_PREFIX} action=database phase=database_connection "
+            "category=driver_or_configuration statement_index=unavailable object=unavailable "
             "exception_class=ValueError database_url_present=true "
             "database_token_present=true database_url_scheme=libsql "
             "llm_provider=gemini llm_key_present=false "
@@ -96,6 +97,35 @@ class DesktopBackendTests(TestCase):
         )
         self.assertNotIn(database_url, diagnostic)
         self.assertNotIn(database_token, diagnostic)
+
+    def test_bootstrap_diagnostic_exposes_only_safe_statement_metadata(self) -> None:
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "mindcore.env"
+            database_url = "libsql://private.example.turso.io"
+            database_token = "bootstrap-token-must-not-appear"
+            config.write_text(
+                f"DATABASE_URL={database_url}\nDATABASE_AUTH_TOKEN={database_token}\n",
+                encoding="utf-8",
+            )
+            error = SchemaBootstrapError(
+                statement_index=20,
+                object_name="emotion_attributions",
+                exception_class="OperationalError",
+            )
+            error.__cause__ = RuntimeError(
+                f"raw driver detail {database_url} {database_token} must stay internal"
+            )
+            diagnostic = _setup_failure_diagnostic("initialize", str(config), error)
+
+        self.assertIn("action=initialize", diagnostic)
+        self.assertIn("phase=database_bootstrap", diagnostic)
+        self.assertIn("category=schema_or_driver", diagnostic)
+        self.assertIn("statement_index=20", diagnostic)
+        self.assertIn("object=emotion_attributions", diagnostic)
+        self.assertIn("exception_class=OperationalError", diagnostic)
+        self.assertNotIn(database_url, diagnostic)
+        self.assertNotIn(database_token, diagnostic)
+        self.assertNotIn("raw driver detail", diagnostic)
 
     def test_llm_setup_diagnostic_reports_only_safe_provider_metadata(self) -> None:
         from app.services.llm_errors import LLMError

@@ -210,6 +210,18 @@ fn validate_database_draft(d: &SetupDraft) -> Result<(), String> {
     }
     Ok(())
 }
+fn validate_preserved_database_token_scope(
+    draft_url: &str,
+    preserve_token: bool,
+    configured_url: Option<&str>,
+) -> Result<(), String> {
+    if preserve_token
+        && configured_url.is_some_and(|url| url.trim() != draft_url.trim())
+    {
+        return Err("Enter the database token for the new database URL.".into());
+    }
+    Ok(())
+}
 fn validate_llm_draft(d: &SetupDraft) -> Result<(), String> {
     if !LLM_PROVIDERS.contains(&d.llm_provider.as_str()) {
         return Err("Choose a supported language model provider.".into());
@@ -338,6 +350,13 @@ fn draft_env_for_persona_name(
         .ok()
         .map(|text| persona_registry::parse_env(&text))
         .unwrap_or_default();
+    let configured_database_url = active_config_value(app, "DATABASE_URL")
+        .or_else(|| values.get("DATABASE_URL").cloned());
+    validate_preserved_database_token_scope(
+        &d.database_url,
+        d.preserve_database_auth_token,
+        configured_database_url.as_deref(),
+    )?;
     let token = if d.preserve_database_auth_token {
         active_config_value(app, "DATABASE_AUTH_TOKEN")
             .or_else(|| existing_secret(app, "DATABASE_AUTH_TOKEN"))
@@ -429,46 +448,114 @@ fn preflight_draft_env(app: &AppHandle, action: &str, d: &SetupDraft) -> Result<
 fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
     persona_registry::secure_atomic_write(path, text)
 }
-#[cfg(debug_assertions)]
-fn print_setup_failure_diagnostic(action: &str, exit_code: Option<i32>, stderr: &[u8]) {
-    // The sidecar emits this line from a fixed, secret-free formatter. Do not
-    // print arbitrary stderr: driver errors can echo a URL or other input.
-    let stderr = String::from_utf8_lossy(stderr);
-    let diagnostic = stderr
+#[derive(Debug, PartialEq)]
+struct SetupFailureDiagnostic {
+    action: String,
+    phase: String,
+    category: String,
+    statement_index: Option<u32>,
+    object: Option<String>,
+    exception_class: Option<String>,
+}
+
+fn safe_setup_identifier(value: &str, max_len: usize) -> Option<String> {
+    if value.is_empty()
+        || value.len() > max_len
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn parse_setup_failure_diagnostic(stderr: &[u8]) -> Option<SetupFailureDiagnostic> {
+    // Parse only the Python sidecar's fixed diagnostic record. Arbitrary stderr
+    // is never returned or logged because drivers may echo URLs or credentials.
+    let line = std::str::from_utf8(stderr)
+        .ok()?
         .lines()
-        .find(|line| line.starts_with("MINDCORE_SETUP_DIAGNOSTIC "));
-    if let Some(diagnostic) = diagnostic {
-        eprintln!(
-            "[MINDCORE_SETUP_DIAGNOSTIC] action={} sidecar_exit_code={} {}",
-            action,
-            exit_code
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "signal".to_string()),
-            diagnostic
-                .strip_prefix("MINDCORE_SETUP_DIAGNOSTIC ")
-                .unwrap_or_default(),
+        .find_map(|line| line.strip_prefix("MINDCORE_SETUP_DIAGNOSTIC "))?;
+    let mut fields = BTreeMap::new();
+    for field in line.split_whitespace() {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        if matches!(
+            key,
+            "action" | "phase" | "category" | "statement_index" | "object" | "exception_class"
+        ) {
+            fields.insert(key, value);
+        }
+    }
+    let action = safe_setup_identifier(fields.get("action")?, 24)?;
+    let phase = safe_setup_identifier(fields.get("phase")?, 48)?;
+    let category = safe_setup_identifier(fields.get("category")?, 48)?;
+    let statement_index = fields
+        .get("statement_index")
+        .filter(|value| **value != "unavailable")
+        .and_then(|value| value.parse::<u32>().ok());
+    let object = fields
+        .get("object")
+        .filter(|value| **value != "unavailable")
+        .and_then(|value| safe_setup_identifier(value, 96));
+    let exception_class = fields
+        .get("exception_class")
+        .and_then(|value| safe_setup_identifier(value, 96));
+    Some(SetupFailureDiagnostic {
+        action,
+        phase,
+        category,
+        statement_index,
+        object,
+        exception_class,
+    })
+}
+
+fn format_setup_failure_diagnostic(
+    requested_action: &str,
+    exit_code: Option<i32>,
+    stderr: &[u8],
+) -> String {
+    let exit_code = exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    let Some(diagnostic) = parse_setup_failure_diagnostic(stderr) else {
+        return format!(
+            "[MINDCORE_SETUP_DIAGNOSTIC] action={requested_action} sidecar_exit_code={exit_code} diagnostic=unavailable"
         );
-    } else {
-        eprintln!(
-            "[MINDCORE_SETUP_DIAGNOSTIC] action={} sidecar_exit_code={} diagnostic=unavailable",
-            action,
-            exit_code
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "signal".to_string()),
+    };
+    if diagnostic.action != requested_action {
+        return format!(
+            "[MINDCORE_SETUP_DIAGNOSTIC] action={requested_action} sidecar_exit_code={exit_code} diagnostic=unavailable"
         );
     }
+    let mut safe = format!(
+        "[MINDCORE_SETUP_DIAGNOSTIC] action={} phase={} category={} sidecar_exit_code={}",
+        diagnostic.action, diagnostic.phase, diagnostic.category, exit_code
+    );
+    if let Some(statement_index) = diagnostic.statement_index {
+        safe.push_str(&format!(" statement_index={statement_index}"));
+    }
+    if let Some(object) = diagnostic.object {
+        safe.push_str(&format!(" object={object}"));
+    }
+    if let Some(exception_class) = diagnostic.exception_class {
+        safe.push_str(&format!(" exception_class={exception_class}"));
+    }
+    safe
+}
+
+fn print_setup_failure_diagnostic(action: &str, exit_code: Option<i32>, stderr: &[u8]) {
+    eprintln!("{}", format_setup_failure_diagnostic(action, exit_code, stderr));
 }
 fn setup_failure_is_schema_incompatible(stderr: &[u8]) -> bool {
     // Python emits this fixed, secret-free diagnostic line for setup actions.
     // Never surface arbitrary stderr: libSQL and provider failures may include
     // credentials or connection URLs.
-    std::str::from_utf8(stderr)
-        .ok()
-        .and_then(|text| {
-            text.lines()
-                .find(|line| line.starts_with("MINDCORE_SETUP_DIAGNOSTIC "))
-        })
-        .is_some_and(|line| line.split_whitespace().any(|field| field == "category=schema"))
+    parse_setup_failure_diagnostic(stderr)
+        .is_some_and(|diagnostic| diagnostic.category == "schema")
 }
 fn setup_action(app: &AppHandle, action: &str, draft: &SetupDraft) -> Result<String, String> {
     validate_setup_action(action, draft)?;
@@ -490,10 +577,12 @@ fn setup_action(app: &AppHandle, action: &str, draft: &SetupDraft) -> Result<Str
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
-        #[cfg(debug_assertions)]
         print_setup_failure_diagnostic(action, output.status.code(), &output.stderr);
         if action == "initialize" && setup_failure_is_schema_incompatible(&output.stderr) {
             return Err("SETUP_SCHEMA_INCOMPATIBLE".into());
+        }
+        if action == "initialize" {
+            return Err("SETUP_DATABASE_INITIALIZE_FAILED".into());
         }
         Err("Setup validation failed. Check the values and try again.".into())
     }
@@ -1033,22 +1122,34 @@ fn generic_identity_template(app: AppHandle) -> Result<String, String> {
 }
 #[tauri::command]
 fn save_mindcore_config(app: AppHandle, draft: SetupDraft, identity: String) -> Result<(), String> {
+    save_mindcore_config_inner(&app, &draft, &identity).map_err(|_| {
+        eprintln!(
+            "[MINDCORE_SETUP_DIAGNOSTIC] action=save phase=config_save category=config"
+        );
+        "SETUP_CONFIG_SAVE_FAILED".to_string()
+    })
+}
+fn save_mindcore_config_inner(
+    app: &AppHandle,
+    draft: &SetupDraft,
+    identity: &str,
+) -> Result<(), String> {
     if !draft.preserve_identity
         && (identity.is_empty() || identity.len() > MAX_IDENTITY_BYTES || identity.contains('\0'))
     {
         return Err("Identity must be UTF-8 plain text under 64 KB.".into());
     }
-    validate_draft(&draft)?;
-    let config = config_path(&app)?;
-    let identity_path = identity_path(&app)?;
-    let existing_registry = registry(&app)?;
-    let full_values = persona_registry::parse_env(&draft_env(&app, &draft)?);
+    validate_draft(draft)?;
+    let config = config_path(app)?;
+    let identity_path = identity_path(app)?;
+    let existing_registry = registry(app)?;
+    let full_values = persona_registry::parse_env(&draft_env(app, draft)?);
     let global = render_env_values(persona_registry::global_config_values(&full_values));
     if !draft.preserve_identity {
         atomic_write(&identity_path, &identity)?;
     }
     if existing_registry.is_some() {
-        persist_active_draft(&app, &draft)?;
+        persist_active_draft(app, draft)?;
         atomic_write(&config, &global)?;
     } else {
         atomic_write(&config, &global)?;
@@ -1072,7 +1173,7 @@ fn start_mindcore_backend(app: AppHandle) -> Result<(), String> {
             "[MINDCORE_STARTUP_DIAGNOSTIC] category={}",
             startup_failure_category(&error)
         );
-        error
+        "SETUP_BACKEND_START_FAILED".to_string()
     })
 }
 fn startup_failure_category(error: &str) -> &'static str {
@@ -1388,6 +1489,30 @@ mod setup_validation_tests {
     }
 
     #[test]
+    fn preserved_database_token_cannot_be_reused_for_a_different_url() {
+        assert!(validate_preserved_database_token_scope(
+            "libsql://same.example",
+            true,
+            Some("libsql://same.example"),
+        )
+        .is_ok());
+        assert_eq!(
+            validate_preserved_database_token_scope(
+                "libsql://new.example",
+                true,
+                Some("libsql://old.example"),
+            ),
+            Err("Enter the database token for the new database URL.".into()),
+        );
+        assert!(validate_preserved_database_token_scope(
+            "libsql://new.example",
+            false,
+            Some("libsql://old.example"),
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn classify_and_initialize_still_reject_an_empty_persona_name() {
         let mut draft = database_step_draft();
         draft.api_key = "test-provider-key".into();
@@ -1399,14 +1524,68 @@ mod setup_validation_tests {
     #[test]
     fn only_the_fixed_safe_schema_diagnostic_maps_to_the_schema_ui_category() {
         assert!(setup_failure_is_schema_incompatible(
-            b"MINDCORE_SETUP_DIAGNOSTIC action=initialize category=schema exception_class=SchemaMigrationError\n"
+            b"MINDCORE_SETUP_DIAGNOSTIC action=initialize phase=schema_migration category=schema exception_class=SchemaMigrationError\n"
         ));
         assert!(!setup_failure_is_schema_incompatible(
-            b"MINDCORE_SETUP_DIAGNOSTIC action=initialize category=driver_or_configuration database_url_present=true\n"
+            b"MINDCORE_SETUP_DIAGNOSTIC action=initialize phase=database_initialize category=driver_or_configuration database_url_present=true\n"
         ));
         assert!(!setup_failure_is_schema_incompatible(
             b"driver error with a database URL that must not be parsed\n"
         ));
+    }
+
+    #[test]
+    fn release_safe_setup_diagnostic_parser_accepts_reordered_allowlisted_fields() {
+        let parsed = parse_setup_failure_diagnostic(
+            b"ignored raw stderr libsql://private.example token=secret\n\
+MINDCORE_SETUP_DIAGNOSTIC object=emotion_attributions unknown=secret category=schema_or_driver action=initialize exception_class=OperationalError phase=database_bootstrap statement_index=20\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.action, "initialize");
+        assert_eq!(parsed.phase, "database_bootstrap");
+        assert_eq!(parsed.category, "schema_or_driver");
+        assert_eq!(parsed.statement_index, Some(20));
+        assert_eq!(parsed.object.as_deref(), Some("emotion_attributions"));
+        assert_eq!(parsed.exception_class.as_deref(), Some("OperationalError"));
+
+        let formatted = format_setup_failure_diagnostic(
+            "initialize",
+            Some(1),
+            b"driver failed at libsql://private.example token=secret\n\
+MINDCORE_SETUP_DIAGNOSTIC phase=database_bootstrap action=initialize category=schema_or_driver unknown=secret\n",
+        );
+        assert!(formatted.contains("action=initialize phase=database_bootstrap category=schema_or_driver"));
+        assert!(!formatted.contains("private.example"));
+        assert!(!formatted.contains("token"));
+        assert!(!formatted.contains("secret"));
+        assert!(!formatted.contains("unknown"));
+    }
+
+    #[test]
+    fn release_safe_setup_diagnostic_parser_requires_core_fields_and_ignores_raw_stderr() {
+        assert!(parse_setup_failure_diagnostic(
+            b"MINDCORE_SETUP_DIAGNOSTIC action=initialize category=schema\n"
+        )
+        .is_none());
+        let formatted = format_setup_failure_diagnostic(
+            "initialize",
+            Some(1),
+            b"raw URL libsql://private.example token=secret",
+        );
+        assert_eq!(
+            formatted,
+            "[MINDCORE_SETUP_DIAGNOSTIC] action=initialize sidecar_exit_code=1 diagnostic=unavailable"
+        );
+
+        let mismatched_action = format_setup_failure_diagnostic(
+            "database",
+            Some(1),
+            b"MINDCORE_SETUP_DIAGNOSTIC action=llm phase=provider_connection category=provider exception_class=RuntimeError\n",
+        );
+        assert_eq!(
+            mismatched_action,
+            "[MINDCORE_SETUP_DIAGNOSTIC] action=database sidecar_exit_code=1 diagnostic=unavailable"
+        );
     }
 
     #[test]

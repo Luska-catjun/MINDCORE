@@ -19,7 +19,11 @@ from app.database.schema_contract import (
     SchemaState,
     classify_turso_schema,
 )
-from app.database.migrations import SchemaMigrationError, ensure_turso_schema_current
+from app.database.migrations import (
+    SchemaBootstrapError,
+    SchemaMigrationError,
+    ensure_turso_schema_current,
+)
 from app.main import create_app
 
 
@@ -92,24 +96,51 @@ def _setup_failure_diagnostic(action: str, config_path: str, error: Exception) -
                 character for character in error_type if character.isalnum() or character in "._"
             ) or "unavailable"
 
-    if isinstance(error, SchemaMigrationError):
+    statement_index = "unavailable"
+    object_name = "unavailable"
+    if isinstance(error, SchemaBootstrapError):
+        phase = "database_bootstrap"
+        category = "schema_or_driver"
+        statement_index = str(error.statement_index)
+        object_name = "".join(
+            character
+            for character in error.object_name
+            if character.isalnum() or character in "._-"
+        ) or "unknown"
+        error_class = error.exception_class
+    elif isinstance(error, SchemaMigrationError):
         # The schema authority already reduces its errors to structural,
         # metadata-only identifiers.  Keep that classification available to
         # the native shell without disclosing the underlying database input.
+        phase = "schema_migration"
         category = "schema"
     elif isinstance(error, LLMError):
+        phase = "llm_preflight"
         category = error.category
     elif isinstance(error, (TimeoutError, ConnectionError)):
+        phase = "database_connection" if action == "database" else "database_initialize"
         category = "connection"
     elif isinstance(error, OSError):
+        phase = "database_connection" if action == "database" else "database_initialize"
         category = "native_or_network"
     elif isinstance(error, ValueError):
+        phase = "database_connection" if action == "database" else "database_initialize"
         category = "driver_or_configuration"
     else:
+        phase = {
+            "database": "database_connection",
+            "llm": "llm_preflight",
+            "classify": "schema_classification",
+            "initialize": "database_initialize",
+        }.get(action, "setup")
         category = "setup"
-    error_class = "".join(character for character in type(error).__name__ if character.isalnum() or character in "._")
+    if not isinstance(error, SchemaBootstrapError):
+        error_class = "".join(
+            character for character in type(error).__name__ if character.isalnum() or character in "._"
+        )
     return (
-        f"{SETUP_DIAGNOSTIC_PREFIX} action={action} category={category} "
+        f"{SETUP_DIAGNOSTIC_PREFIX} action={action} phase={phase} category={category} "
+        f"statement_index={statement_index} object={object_name} "
         f"exception_class={error_class or 'Unknown'} "
         f"database_url_present={str(database_url_present).lower()} "
         f"database_token_present={str(database_token_present).lower()} "

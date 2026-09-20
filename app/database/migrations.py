@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
@@ -29,6 +30,22 @@ MigrationApply = Callable[[Any], Awaitable[None]]
 
 class SchemaMigrationError(RuntimeError):
     """A safe, metadata-only database schema migration failure."""
+
+
+class SchemaBootstrapError(SchemaMigrationError):
+    """A fresh-baseline failure described only by safe structural metadata."""
+
+    def __init__(
+        self,
+        *,
+        statement_index: int,
+        object_name: str,
+        exception_class: str,
+    ) -> None:
+        super().__init__("database_bootstrap_failed")
+        self.statement_index = statement_index
+        self.object_name = object_name
+        self.exception_class = exception_class
 
 
 class MigrationRegistryError(SchemaMigrationError):
@@ -403,10 +420,50 @@ def _baseline_path() -> Path:
 
 
 async def _bootstrap_empty_database(connection: Any, baseline_sql: str) -> None:
-    async with connection.transaction():
-        for statement in baseline_sql.split(";"):
-            if statement.strip():
-                await connection.execute(statement)
+    current_index = 0
+    try:
+        async with connection.transaction():
+            for current_index, (statement, object_name) in enumerate(
+                _baseline_statements(baseline_sql), start=1
+            ):
+                try:
+                    await connection.execute(statement)
+                except Exception as error:
+                    raise SchemaBootstrapError(
+                        statement_index=current_index,
+                        object_name=object_name,
+                        exception_class=_safe_exception_class(error),
+                    ) from error
+    except SchemaBootstrapError:
+        raise
+    except Exception as error:
+        # BEGIN/COMMIT/ROLLBACK failures have no trustworthy SQL statement.
+        raise SchemaBootstrapError(
+            statement_index=0,
+            object_name="transaction",
+            exception_class=_safe_exception_class(error),
+        ) from error
+
+
+_BASELINE_OBJECT = re.compile(
+    r"(?m)^-- OBJECT\s+(?:table|index|metadata)\s+([A-Za-z0-9_]+)(?:\s+\([^\n]*\))?\s*$"
+)
+
+
+def _baseline_statements(baseline_sql: str) -> tuple[tuple[str, str], ...]:
+    """Return static baseline statements with a non-secret structural label."""
+    statements: list[tuple[str, str]] = []
+    for statement in baseline_sql.split(";"):
+        if not statement.strip():
+            continue
+        markers = _BASELINE_OBJECT.findall(statement)
+        statements.append((statement, markers[-1] if markers else "unknown"))
+    return tuple(statements)
+
+
+def _safe_exception_class(error: BaseException) -> str:
+    name = type(error).__name__
+    return name if name.replace("_", "").isalnum() else "Exception"
 
 
 async def _adopt_compatible_legacy_database(

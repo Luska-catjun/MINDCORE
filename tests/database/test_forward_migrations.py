@@ -11,9 +11,11 @@ from app.database.migrations import (
     MigrationDefinition,
     MigrationRegistry,
     MigrationRegistryError,
+    SchemaBootstrapError,
     SchemaMigrationDriftError,
     SchemaMigrationError,
     UnsupportedSchemaVersionError,
+    _bootstrap_empty_database,
     ensure_turso_schema_current,
     migration_checksum,
     run_forward_migrations,
@@ -268,6 +270,7 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_empty_bootstrap_records_baseline_ledger_and_validates_contract(self) -> None:
+        self.assertNotIn("ON DELETE SET NULL ON DELETE SET NULL", BASELINE_SQL)
         result = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
 
         self.assertTrue(result.bootstrapped)
@@ -301,6 +304,52 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
         self.assertEqual(await self.connection.fetchval(f"select count(*) from {LEDGER_TABLE}"), 1)
+
+    async def test_fresh_bootstrap_failure_reports_safe_structure_and_rolls_back(self) -> None:
+        sql = """-- OBJECT table schema_metadata
+create table schema_metadata(key text primary key, value text not null);
+-- OBJECT table schema_migration_ledger
+create table schema_migration_ledger(migration_id text primary key);
+-- OBJECT table retry_marker
+create table retry_marker(id integer primary key);
+"""
+
+        class FailingConnection:
+            def __init__(self, connection: TursoConnection) -> None:
+                self.connection = connection
+                self.execute_count = 0
+
+            def transaction(self):
+                return self.connection.transaction()
+
+            async def execute(self, statement: str) -> None:
+                self.execute_count += 1
+                if self.execute_count == 2:
+                    raise RuntimeError("secret-bearing driver detail must stay internal")
+                await self.connection.execute(statement)
+
+        with self.assertRaises(SchemaBootstrapError) as caught:
+            await _bootstrap_empty_database(FailingConnection(self.connection), sql)
+
+        self.assertEqual(caught.exception.statement_index, 2)
+        self.assertEqual(caught.exception.object_name, "schema_migration_ledger")
+        self.assertEqual(caught.exception.exception_class, "RuntimeError")
+        self.assertEqual(str(caught.exception), "database_bootstrap_failed")
+        self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+        self.assertEqual(
+            await self.connection.fetch(
+                "select name from sqlite_master where type='table' and name not like 'sqlite_%'"
+            ),
+            [],
+        )
+
+        await _bootstrap_empty_database(self.connection, sql)
+        self.assertEqual(
+            {row["name"] for row in await self.connection.fetch(
+                "select name from sqlite_master where type='table' and name not like 'sqlite_%'"
+            )},
+            {"schema_metadata", "schema_migration_ledger", "retry_marker"},
+        )
 
     async def test_compatible_legacy_schema_is_adopted_once_without_historical_replay(self) -> None:
         legacy_sql = BASELINE_SQL.replace(
