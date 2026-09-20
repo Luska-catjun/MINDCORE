@@ -70,6 +70,49 @@ describe("desktop backend lifecycle recovery", () => {
     expect(await screen.findByText("Main Chat")).toBeTruthy();
   });
 
+  it("shows and copies only the canonical startup diagnostic", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    invoke.mockImplementation((command: string) => {
+      if (command === "get_setup_status") return Promise.resolve({ configured: true });
+      if (command === "start_mindcore_backend") {
+        return Promise.reject(new Error(
+          "native wrapper: MINDCORE_STARTUP_DIAGNOSTIC build=v0.2.2-diagnostic-1 phase=migration_ledger category=driver operation=ledger_commit exception_class=DatabaseError schema_version=21 token=private",
+        ));
+      }
+      return Promise.resolve();
+    });
+
+    render(<App />);
+    expect(await screen.findByText("Diagnostic Code: migration_ledger/driver")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Copy Diagnostic" }));
+    expect(writeText).toHaveBeenCalledWith(
+      "MINDCORE_STARTUP_DIAGNOSTIC build=v0.2.2-diagnostic-1 phase=migration_ledger category=driver operation=ledger_commit exception_class=DatabaseError schema_version=21",
+    );
+    expect(writeText.mock.calls[0][0]).not.toContain("private");
+  });
+
+  it("distinguishes a readiness timeout from a sidecar diagnostic", async () => {
+    let clock = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => {
+      clock += 31_000;
+      return clock;
+    });
+    invoke.mockImplementation((command: string) => {
+      if (command === "get_setup_status") return Promise.resolve({ configured: true });
+      if (command === "start_mindcore_backend") return Promise.resolve();
+      return Promise.resolve();
+    });
+    apiMock.health.mockRejectedValue(new Error("private network detail"));
+
+    render(<App />);
+    expect(await screen.findByText("Diagnostic Code: ready/timeout")).toBeTruthy();
+    expect(screen.queryByText(/private network detail/)).toBeNull();
+  });
+
   it("Restart MindCore invokes native start before retrying the session", async () => {
     let sessionCalls = 0;
     invoke.mockImplementation((command: string) => {

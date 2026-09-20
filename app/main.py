@@ -16,6 +16,7 @@ from app.services.error_safety import safe_error_type
 from app.services.mindcore.narrative import hydrate_narrative_snapshot
 from app.services.mindcore.self_model import hydrate_self_model_snapshot
 from app.services.mindcore.snapshot_scope import CognitiveSnapshotScope
+from app.services.startup_diagnostics import emit_startup_diagnostic, startup_category
 
 
 def configure_diana_logging() -> None:
@@ -35,7 +36,13 @@ def build_lifespan(
 ):
   @asynccontextmanager
   async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    settings = settings_override or get_settings()
+    try:
+        settings = settings_override or get_settings()
+    except BaseException as error:
+        emit_startup_diagnostic(
+            phase="settings", category="configuration", error=error
+        )
+        raise
     if settings.is_production:
         missing = []
         if not settings.private_access_password:
@@ -68,9 +75,23 @@ def build_lifespan(
         if missing:
             raise RuntimeError(f"Missing required production settings: {', '.join(missing)}")
     app.state.settings = settings
-    app.state.diana_identity_prompt = load_persona_identity_prompt(settings)
-    pool = db_pool_factory(settings) if db_pool_factory else create_pool(settings)
-    app.state.db_pool = await pool if hasattr(pool, "__await__") else pool
+    try:
+        app.state.diana_identity_prompt = load_persona_identity_prompt(settings)
+    except BaseException as error:
+        emit_startup_diagnostic(
+            phase="identity", category="configuration", error=error
+        )
+        raise
+    try:
+        pool = db_pool_factory(settings) if db_pool_factory else create_pool(settings)
+        app.state.db_pool = await pool if hasattr(pool, "__await__") else pool
+    except BaseException as error:
+        emit_startup_diagnostic(
+            phase="database_connect",
+            category=startup_category(error, fallback="driver"),
+            error=error,
+        )
+        raise
     # Setup connection preflight remains read-only. The actual backend startup
     # is the single production boundary that adopts a released legacy schema or
     # runs a future registered forward migration before runtime reads begin.
@@ -79,15 +100,39 @@ def build_lifespan(
         and settings.database_backend.lower() == "turso"
         and hasattr(app.state.db_pool, "acquire")
     ):
-        async with app.state.db_pool.acquire() as connection:
-            await ensure_turso_schema_current(connection)
+        try:
+            async with app.state.db_pool.acquire() as connection:
+                await ensure_turso_schema_current(connection)
+        except BaseException as error:
+            emit_startup_diagnostic(
+                phase="database_connect",
+                category=startup_category(error, fallback="driver"),
+                error=error,
+            )
+            raise
     app.state.cognitive_snapshot_scope = CognitiveSnapshotScope()
     # One startup hydration keeps Narrative activation off the foreground chat
     # path.  Isolated ASGI fixtures without a database acquire seam simply use
     # the empty, safe snapshot.
     if hasattr(app.state.db_pool, "acquire"):
-        await hydrate_narrative_snapshot(app.state.db_pool, app.state.cognitive_snapshot_scope)
-        await hydrate_self_model_snapshot(app.state.db_pool, app.state.cognitive_snapshot_scope)
+        try:
+            await hydrate_narrative_snapshot(app.state.db_pool, app.state.cognitive_snapshot_scope)
+        except BaseException as error:
+            emit_startup_diagnostic(
+                phase="narrative_hydration",
+                category=startup_category(error, fallback="hydration"),
+                error=error,
+            )
+            raise
+        try:
+            await hydrate_self_model_snapshot(app.state.db_pool, app.state.cognitive_snapshot_scope)
+        except BaseException as error:
+            emit_startup_diagnostic(
+                phase="self_model_hydration",
+                category=startup_category(error, fallback="hydration"),
+                error=error,
+            )
+            raise
     try:
         yield
     finally:
@@ -98,7 +143,13 @@ def build_lifespan(
 
 def create_app(*, settings_override: Settings | None = None, db_pool_factory: Callable[[Settings], object] | None = None) -> FastAPI:
     configure_diana_logging()
-    settings = settings_override or get_settings()
+    try:
+        settings = settings_override or get_settings()
+    except BaseException as error:
+        emit_startup_diagnostic(
+            phase="settings", category="configuration", error=error
+        )
+        raise
     app = FastAPI(title=settings.app_name, version="0.2.2", lifespan=build_lifespan(settings_override, db_pool_factory))
 
     @app.exception_handler(Exception)

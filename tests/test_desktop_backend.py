@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from app import desktop_backend
 from app.config import Settings, get_settings
 from app.desktop_backend import (
     DESKTOP_INSTANCE_HEADER,
@@ -29,6 +30,12 @@ from app.routers.auth import is_valid_session_token
 
 
 class DesktopBackendTests(TestCase):
+    def test_desktop_server_uses_rest_only_pure_python_uvicorn_stack(self) -> None:
+        config = desktop_backend._desktop_server_config(create_app(), 8765)
+        self.assertEqual(config.loop, "asyncio")
+        self.assertEqual(config.http, "h11")
+        self.assertEqual(config.ws, "none")
+
     def tearDown(self) -> None:
         get_settings.cache_clear()
 

@@ -21,6 +21,7 @@ from app.database.schema_contract import (
     SchemaState,
     classify_turso_schema,
 )
+from app.services.startup_diagnostics import emit_startup_diagnostic, startup_category
 
 
 LEDGER_TABLE = "schema_migration_ledger"
@@ -230,21 +231,39 @@ async def _adopt_version_into_ledger(
     version: int,
     registry: MigrationRegistry,
 ) -> None:
-    async with connection.transaction():
-        await _ensure_ledger_table(connection)
-        rows = await _ledger_rows(connection)
-        if not rows:
-            await connection.execute(
-                f"""insert into {LEDGER_TABLE}(
-                    migration_id, from_version, to_version, checksum, applied_at
-                ) values ($1,$2,$3,$4,$5)""",
-                f"baseline_v{version}",
-                version,
-                version,
-                _baseline_checksum(version),
-                datetime.now(timezone.utc),
-            )
-        await _validate_ledger(connection, registry=registry, current_version=version)
+    operation = "ledger_check"
+    try:
+        async with connection.transaction():
+            operation = "ledger_create"
+            await _ensure_ledger_table(connection)
+            operation = "ledger_check"
+            rows = await _ledger_rows(connection)
+            if not rows:
+                operation = "ledger_baseline_insert"
+                await connection.execute(
+                    f"""insert into {LEDGER_TABLE}(
+                        migration_id, from_version, to_version, checksum, applied_at
+                    ) values ($1,$2,$3,$4,$5)""",
+                    f"baseline_v{version}",
+                    version,
+                    version,
+                    _baseline_checksum(version),
+                    datetime.now(timezone.utc),
+                )
+            operation = "ledger_validate"
+            await _validate_ledger(connection, registry=registry, current_version=version)
+            # Any exception raised while leaving the transaction now belongs to
+            # commit/cleanup rather than validation.
+            operation = "ledger_commit"
+    except BaseException as error:
+        emit_startup_diagnostic(
+            phase="migration_ledger",
+            category=startup_category(error, fallback="driver"),
+            operation=operation,
+            schema_version=version,
+            error=error,
+        )
+        raise
 
 
 async def run_forward_migrations(
@@ -371,16 +390,40 @@ async def ensure_turso_schema_current(
     This is intentionally a mutating startup/initialize operation. Connection
     preflight must continue to use ``SELECT 1`` only.
     """
-    report = await classify_turso_schema(connection)
+    try:
+        report = await classify_turso_schema(connection)
+    except BaseException as error:
+        emit_startup_diagnostic(
+            phase="schema_classification",
+            category=startup_category(error, fallback="schema"),
+            error=error,
+        )
+        raise
     bootstrapped = False
     adopted_legacy = False
     if report.state == SchemaState.EMPTY:
-        await _bootstrap_empty_database(
-            connection,
-            baseline_sql if baseline_sql is not None else _baseline_path().read_text(encoding="utf-8"),
-        )
+        try:
+            await _bootstrap_empty_database(
+                connection,
+                baseline_sql if baseline_sql is not None else _baseline_path().read_text(encoding="utf-8"),
+            )
+        except BaseException as error:
+            emit_startup_diagnostic(
+                phase="schema_authority",
+                category=startup_category(error, fallback="schema"),
+                error=error,
+            )
+            raise
         bootstrapped = True
-        report = await classify_turso_schema(connection)
+        try:
+            report = await classify_turso_schema(connection)
+        except BaseException as error:
+            emit_startup_diagnostic(
+                phase="schema_classification",
+                category=startup_category(error, fallback="schema"),
+                error=error,
+            )
+            raise
     if report.state == SchemaState.COMPATIBLE_LEGACY:
         await _adopt_compatible_legacy_database(
             connection, target_version=target_version, registry=registry
@@ -389,20 +432,59 @@ async def ensure_turso_schema_current(
     elif report.state == SchemaState.PARTIAL_OR_UNKNOWN:
         version = await _schema_version(connection)
         if version is None:
-            raise SchemaMigrationError("database_schema_incompatible")
+            error = SchemaMigrationError("database_schema_incompatible")
+            emit_startup_diagnostic(
+                phase="schema_authority", category="schema", error=error
+            )
+            raise error
         if version > target_version:
-            raise UnsupportedSchemaVersionError("unsupported_newer_schema_version")
+            error = UnsupportedSchemaVersionError("unsupported_newer_schema_version")
+            emit_startup_diagnostic(
+                phase="schema_authority",
+                category="schema",
+                schema_version=version,
+                error=error,
+            )
+            raise error
         if version == target_version:
-            raise SchemaMigrationError("database_schema_incompatible")
+            error = SchemaMigrationError("database_schema_incompatible")
+            emit_startup_diagnostic(
+                phase="schema_authority",
+                category="schema",
+                schema_version=version,
+                error=error,
+            )
+            raise error
         # A registered forward chain may repair an older supported release;
         # an absent path is rejected before any mutation is attempted.
-        registry.plan(version, target_version)
+        try:
+            registry.plan(version, target_version)
+        except BaseException as error:
+            emit_startup_diagnostic(
+                phase="schema_authority",
+                category="schema",
+                schema_version=version,
+                error=error,
+            )
+            raise
     result = await run_forward_migrations(
         connection, target_version=target_version, registry=registry
     )
-    final_report = await classify_turso_schema(connection)
+    try:
+        final_report = await classify_turso_schema(connection)
+    except BaseException as error:
+        emit_startup_diagnostic(
+            phase="schema_classification",
+            category=startup_category(error, fallback="schema"),
+            error=error,
+        )
+        raise
     if final_report.state != SchemaState.CURRENT:
-        raise SchemaMigrationError("database_schema_migration_validation_failed")
+        error = SchemaMigrationError("database_schema_migration_validation_failed")
+        emit_startup_diagnostic(
+            phase="schema_authority", category="schema", error=error
+        )
+        raise error
     return MigrationRunResult(
         result.initial_version,
         result.final_version,

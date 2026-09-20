@@ -31,6 +31,19 @@ DESKTOP_INSTANCE_HEADER = "X-MindCore-Desktop-Instance"
 SETUP_DIAGNOSTIC_PREFIX = "MINDCORE_SETUP_DIAGNOSTIC"
 
 
+def _desktop_server_config(app: FastAPI, port: int) -> uvicorn.Config:
+    """Use the diagnostic sidecar's REST-only, pure-Python Uvicorn stack."""
+    return uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=port,
+        log_level="info",
+        loop="asyncio",
+        http="h11",
+        ws="none",
+    )
+
+
 def _settings_from(config_path: str):
     from app.config import get_settings
 
@@ -287,7 +300,7 @@ def main() -> None:
             raise SystemExit(1)
         return
     app = create_app()
-    config = uvicorn.Config(app, host="127.0.0.1", port=args.port, log_level="info")
+    config = _desktop_server_config(app, args.port)
     server = uvicorn.Server(config)
 
     if args.parent_pid:

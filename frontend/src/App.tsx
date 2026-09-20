@@ -21,6 +21,12 @@ import { chatDebug } from "./chatDebug";
 import { DEFAULT_PERSONA_DISPLAY_NAME, DEFAULT_USER_DISPLAY_NAME } from "./assets";
 import { PersonaManager, type PersonaSummary } from "./components/PersonaManager";
 import { PersonaAvatar } from "./components/PersonaAvatar";
+import {
+  DIAGNOSTIC_BUILD_LABEL,
+  parseStartupDiagnostic,
+  readyTimeoutDiagnostic,
+  type StartupDiagnostic,
+} from "./startupDiagnostic";
 import "./styles.css";
 
 const SOURCE_DEVICE = "web";
@@ -60,6 +66,7 @@ function App() {
   const [setupState, setSetupState] = useState<SetupState>(isDesktopRuntime() ? "checking" : "configured");
   const [reconfiguring, setReconfiguring] = useState(false);
   const [updaterAvailable, setUpdaterAvailable] = useState(false);
+  const [startupDiagnostic, setStartupDiagnostic] = useState<StartupDiagnostic | null>(null);
 
   const clearSessionState = useCallback(() => {
     sessionGenerationRef.current += 1;
@@ -135,14 +142,18 @@ function App() {
     let cancelled = false;
     const checkHealth = async () => {
       setBackendStatus("checking");
+      setStartupDiagnostic(null);
       setStartupProgress(18);
       if (isDesktopRuntime()) {
         try {
           // Native start is idempotent for a healthy managed child and creates
           // a new generation after a crash or completed stop.
           await invoke("start_mindcore_backend");
-        } catch {
-          if (!cancelled) setBackendStatus("error");
+        } catch (error) {
+          if (!cancelled) {
+            setStartupDiagnostic(parseStartupDiagnostic(error));
+            setBackendStatus("error");
+          }
           return;
         }
       }
@@ -156,7 +167,10 @@ function App() {
           return;
         } catch {
           if (!isDesktopRuntime() || Date.now() >= deadline) {
-            if (!cancelled) setBackendStatus("error");
+            if (!cancelled) {
+              if (isDesktopRuntime()) setStartupDiagnostic(readyTimeoutDiagnostic());
+              setBackendStatus("error");
+            }
             return;
           }
           await new Promise((resolve) => window.setTimeout(resolve, 250));
@@ -228,6 +242,7 @@ function App() {
   };
 
   const retryDesktopBackend = useCallback(() => {
+    setStartupDiagnostic(null);
     setBackendStatus("checking");
     setAuthStatus("checking");
     setDesktopSessionError(false);
@@ -415,7 +430,7 @@ function App() {
   }
 
   if (isDesktopRuntime() && backendStatus === "error") {
-    return <main className="login-screen"><div className="login-form"><div className="login-title">MINDCORE</div><p>MindCore could not start.</p><button className="login-button" type="button" onClick={retryDesktopBackend}>Retry</button><button className="login-button" type="button" onClick={() => void invoke("open_configuration_folder")}>Open Configuration</button><p className="workspace-muted">Check the desktop backend diagnostics in the app log.</p></div></main>;
+    return <main className="login-screen"><div className="login-form"><div className="login-title">MINDCORE</div><p>MindCore could not start.</p><p className="workspace-muted">Diagnostic build: {DIAGNOSTIC_BUILD_LABEL}</p>{startupDiagnostic && <><p className="workspace-muted">Diagnostic Code: {startupDiagnostic.phase}/{startupDiagnostic.category}</p><button className="login-button" type="button" onClick={() => void navigator.clipboard.writeText(startupDiagnostic.line)}>Copy Diagnostic</button></>}<button className="login-button" type="button" onClick={retryDesktopBackend}>Retry</button><button className="login-button" type="button" onClick={() => void invoke("open_configuration_folder")}>Open Configuration</button><p className="workspace-muted">Copy the diagnostic code and send it with the startup report.</p></div></main>;
   }
 
   if (isDesktopRuntime() && (desktopSessionError || authStatus === "unauthenticated")) {

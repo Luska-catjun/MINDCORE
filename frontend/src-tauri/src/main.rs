@@ -30,12 +30,93 @@ const SHUTDOWN_CAPABILITY_HEADER: &str = "X-MindCore-Desktop-Shutdown";
 const DESKTOP_INSTANCE_HEADER: &str = "X-MindCore-Desktop-Instance";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const STARTUP_DIAGNOSTIC_PREFIX: &str = "MINDCORE_STARTUP_DIAGNOSTIC";
+const DIAGNOSTIC_BUILD_LABEL: &str = "v0.2.2-diagnostic-1";
 const UPDATER_PLUGIN_ENABLED: bool = !cfg!(mindcore_updater_disabled);
 const LLM_PROVIDERS: [&str; 5] = ["gemini", "groq", "anthropic", "xai", "openai"];
 struct Sidecar {
     lifecycle: Arc<Mutex<SidecarLifecycle<CommandChild>>>,
 }
 struct PersonaRegistryLock(Mutex<()>);
+
+#[derive(Clone, Debug, PartialEq)]
+struct StartupDiagnostic {
+    phase: String,
+    category: String,
+    operation: Option<String>,
+    exception_class: String,
+    schema_version: Option<String>,
+}
+
+fn safe_startup_identifier(value: &str, max_len: usize) -> Option<String> {
+    if value.is_empty()
+        || value.len() > max_len
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn allowed_startup_phase(value: &str) -> bool {
+    matches!(value, "settings" | "identity" | "persona_registry" | "database_connect" | "schema_classification" | "schema_authority" | "migration_ledger" | "narrative_hydration" | "self_model_hydration" | "sidecar_spawn" | "ready")
+}
+
+fn allowed_startup_category(value: &str) -> bool {
+    matches!(value, "configuration" | "connection" | "native_or_network" | "driver" | "schema" | "hydration" | "timeout" | "process" | "runtime")
+}
+
+fn allowed_startup_operation(value: &str) -> bool {
+    matches!(value, "ledger_check" | "ledger_create" | "ledger_baseline_insert" | "ledger_validate" | "ledger_commit" | "sidecar_spawn" | "sidecar_exit" | "ready_wait")
+}
+
+fn parse_startup_diagnostic(stderr: &[u8]) -> Option<StartupDiagnostic> {
+    let line = std::str::from_utf8(stderr).ok()?.lines().find_map(|line| line.strip_prefix(&format!("{STARTUP_DIAGNOSTIC_PREFIX} ")))?;
+    let mut fields = BTreeMap::new();
+    for item in line.split_whitespace() {
+        let Some((key, value)) = item.split_once('=') else { continue };
+        if matches!(key, "build" | "phase" | "category" | "operation" | "exception_class" | "schema_version") {
+            fields.insert(key, value);
+        }
+    }
+    if fields.get("build").copied()? != DIAGNOSTIC_BUILD_LABEL { return None; }
+    let phase = safe_startup_identifier(fields.get("phase")?, 48)?;
+    let category = safe_startup_identifier(fields.get("category")?, 48)?;
+    if !allowed_startup_phase(&phase) || !allowed_startup_category(&category) { return None; }
+    let operation = fields.get("operation").and_then(|value| safe_startup_identifier(value, 48)).filter(|value| allowed_startup_operation(value));
+    let exception_class = safe_startup_identifier(fields.get("exception_class")?, 96)?;
+    let schema_version = fields.get("schema_version").filter(|value| value.len() <= 4 && value.chars().all(|character| character.is_ascii_digit())).map(|value| value.to_string());
+    Some(StartupDiagnostic { phase, category, operation, exception_class, schema_version })
+}
+
+impl StartupDiagnostic {
+    fn line(&self) -> String {
+        let mut line = format!("{STARTUP_DIAGNOSTIC_PREFIX} build={DIAGNOSTIC_BUILD_LABEL} phase={} category={}", self.phase, self.category);
+        if let Some(operation) = &self.operation { line.push_str(&format!(" operation={operation}")); }
+        line.push_str(&format!(" exception_class={}", self.exception_class));
+        if let Some(schema_version) = &self.schema_version { line.push_str(&format!(" schema_version={schema_version}")); }
+        line
+    }
+}
+
+fn fixed_startup_diagnostic(phase: &str, category: &str, operation: Option<&str>, exception_class: &str) -> StartupDiagnostic {
+    StartupDiagnostic { phase: phase.into(), category: category.into(), operation: operation.map(str::to_string), exception_class: exception_class.into(), schema_version: None }
+}
+
+fn native_startup_diagnostic(error: &str) -> StartupDiagnostic {
+    if error.starts_with(STARTUP_DIAGNOSTIC_PREFIX) {
+        return parse_startup_diagnostic(error.as_bytes()).unwrap_or_else(|| fixed_startup_diagnostic("ready", "runtime", None, "DiagnosticUnavailable"));
+    }
+    if error.contains("setup is incomplete") || error.contains("Persona") {
+        fixed_startup_diagnostic("persona_registry", "configuration", None, "ConfigurationError")
+    } else if error.contains("could not start") || error.contains("unavailable") {
+        fixed_startup_diagnostic("sidecar_spawn", "native_or_network", Some("sidecar_spawn"), "SpawnError")
+    } else {
+        fixed_startup_diagnostic("ready", "runtime", None, "StartupError")
+    }
+}
 #[derive(Serialize)]
 struct PersonaAvatarPayload {
     mime_type: String,
@@ -625,9 +706,23 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
         return Err("MindCore backend start was superseded by another lifecycle operation.".into());
     }
     let lifecycle = Arc::clone(&state.lifecycle);
+    let startup_diagnostic = Arc::new(Mutex::new(None::<StartupDiagnostic>));
+    let event_diagnostic = Arc::clone(&startup_diagnostic);
     tauri::async_runtime::spawn(async move {
+        let mut safe_stderr = Vec::new();
         while let Some(event) = events.recv().await {
             match event {
+                CommandEvent::Stderr(bytes) => {
+                    const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+                    if safe_stderr.len() < MAX_DIAGNOSTIC_BYTES {
+                        let remaining = MAX_DIAGNOSTIC_BYTES - safe_stderr.len();
+                        safe_stderr.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+                    }
+                    if let Some(diagnostic) = parse_startup_diagnostic(&safe_stderr) {
+                        *event_diagnostic.lock().expect("startup diagnostic lock") = Some(diagnostic);
+                        safe_stderr.clear();
+                    }
+                }
                 CommandEvent::Terminated(_) => {
                     let _ = lifecycle
                         .lock()
@@ -654,7 +749,9 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
             .expect("sidecar lifecycle lock")
             .is_generation_active(generation)
         {
-            return Err("MindCore backend exited before becoming ready.".into());
+            let diagnostic = startup_diagnostic.lock().expect("startup diagnostic lock").clone().unwrap_or_else(|| fixed_startup_diagnostic("ready", "process", Some("sidecar_exit"), "SidecarExited"));
+            eprintln!("{}", diagnostic.line());
+            return Err(diagnostic.line());
         }
         if request_instance_readiness(&shutdown_capability) {
             if state
@@ -680,7 +777,9 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
     {
         let _ = child.kill();
     }
-    Err("MindCore backend could not claim its local port. Another application may be using port 8765.".into())
+    let diagnostic = startup_diagnostic.lock().expect("startup diagnostic lock").clone().unwrap_or_else(|| fixed_startup_diagnostic("ready", "timeout", Some("ready_wait"), "StartupTimeout"));
+    eprintln!("{}", diagnostic.line());
+    Err(diagnostic.line())
 }
 
 fn run_setup_with_config(app: &AppHandle, action: &str, config: &Path) -> Result<String, String> {
@@ -1050,7 +1149,12 @@ fn save_mindcore_config(app: AppHandle, draft: SetupDraft, identity: String) -> 
 }
 #[tauri::command]
 fn start_mindcore_backend(app: AppHandle) -> Result<(), String> {
-    start_sidecar(&app)
+    start_sidecar(&app).map_err(|error| {
+        let diagnostic = native_startup_diagnostic(&error);
+        let line = diagnostic.line();
+        eprintln!("{line}");
+        line
+    })
 }
 #[tauri::command]
 fn get_desktop_session(app: AppHandle) -> Result<String, String> {
@@ -1386,6 +1490,32 @@ mod setup_validation_tests {
             b"HTTP/1.1 204 No Content\r\nX-MindCore-Desktop-Instance: other-capability\r\n\r\n",
             capability,
         ));
+    }
+
+    #[test]
+    fn startup_diagnostic_parser_keeps_only_allowlisted_fields() {
+        let stderr = b"unrelated raw stderr\nMINDCORE_STARTUP_DIAGNOSTIC build=v0.2.2-diagnostic-1 phase=migration_ledger category=driver operation=ledger_commit exception_class=DatabaseError schema_version=21 token=private\n";
+        let diagnostic = parse_startup_diagnostic(stderr).unwrap();
+        assert_eq!(diagnostic.phase, "migration_ledger");
+        assert_eq!(diagnostic.operation.as_deref(), Some("ledger_commit"));
+        assert_eq!(diagnostic.schema_version.as_deref(), Some("21"));
+        assert!(!diagnostic.line().contains("private"));
+        assert!(!diagnostic.line().contains("token"));
+    }
+
+    #[test]
+    fn startup_diagnostic_parser_rejects_unknown_or_unsafe_records() {
+        assert!(parse_startup_diagnostic(b"MINDCORE_STARTUP_DIAGNOSTIC build=other phase=ready category=timeout exception_class=Timeout").is_none());
+        assert!(parse_startup_diagnostic(b"MINDCORE_STARTUP_DIAGNOSTIC build=v0.2.2-diagnostic-1 phase=ready category=timeout exception_class=bad/value").is_none());
+    }
+
+    #[test]
+    fn native_startup_errors_are_reduced_to_fixed_safe_codes() {
+        let diagnostic = native_startup_diagnostic("could not start /Users/private/mindcore with token=private");
+        assert_eq!(diagnostic.phase, "sidecar_spawn");
+        assert_eq!(diagnostic.exception_class, "SpawnError");
+        assert!(!diagnostic.line().contains("/Users"));
+        assert!(!diagnostic.line().contains("private"));
     }
 }
 fn main() {

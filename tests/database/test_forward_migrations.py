@@ -3,6 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
+from unittest.mock import AsyncMock, patch
 
 import libsql
 
@@ -17,6 +20,7 @@ from app.database.migrations import (
     ensure_turso_schema_current,
     migration_checksum,
     run_forward_migrations,
+    _adopt_version_into_ledger,
 )
 from app.database.schema_contract import (
     CURRENT_TURSO_BASELINE_VERSION,
@@ -295,6 +299,81 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
             ),
             1,
         )
+
+    async def test_ledger_create_failure_emits_secret_safe_operation(self) -> None:
+        await execute_script(self.connection, BASELINE_SQL)
+        stderr = StringIO()
+        error = RuntimeError("token=private libsql://private.example")
+        with patch(
+            "app.database.migrations._ensure_ledger_table",
+            new=AsyncMock(side_effect=error),
+        ), redirect_stderr(stderr):
+            with self.assertRaises(RuntimeError):
+                await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+        line = stderr.getvalue()
+        self.assertIn("phase=migration_ledger", line)
+        self.assertIn("operation=ledger_create", line)
+        self.assertIn("schema_version=21", line)
+        self.assertNotIn("private", line)
+        self.assertNotIn("libsql", line)
+
+    async def test_schema_classification_failure_emits_safe_phase(self) -> None:
+        stderr = StringIO()
+        with patch(
+            "app.database.migrations.classify_turso_schema",
+            new=AsyncMock(side_effect=RuntimeError("/Users/private/schema secret")),
+        ), redirect_stderr(stderr):
+            with self.assertRaises(RuntimeError):
+                await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+        line = stderr.getvalue()
+        self.assertIn("phase=schema_classification", line)
+        self.assertIn("exception_class=RuntimeError", line)
+        self.assertNotIn("/Users", line)
+        self.assertNotIn("secret", line)
+
+    async def test_ledger_insert_and_commit_failures_identify_exact_operation(self) -> None:
+        class Transaction:
+            def __init__(self, *, fail_commit: bool) -> None:
+                self.fail_commit = fail_commit
+
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_args):
+                if self.fail_commit:
+                    raise RuntimeError("commit secret")
+
+        class Connection:
+            def __init__(self, *, fail_insert: bool, fail_commit: bool) -> None:
+                self.fail_insert = fail_insert
+                self.fail_commit = fail_commit
+
+            def transaction(self):
+                return Transaction(fail_commit=self.fail_commit)
+
+            async def execute(self, *_args):
+                if self.fail_insert:
+                    raise RuntimeError("insert token=secret")
+
+        for expected, connection in (
+            ("ledger_baseline_insert", Connection(fail_insert=True, fail_commit=False)),
+            ("ledger_commit", Connection(fail_insert=False, fail_commit=True)),
+        ):
+            stderr = StringIO()
+            with patch(
+                "app.database.migrations._ensure_ledger_table", new=AsyncMock(return_value=None)
+            ), patch(
+                "app.database.migrations._ledger_rows", new=AsyncMock(return_value=[])
+            ), patch(
+                "app.database.migrations._validate_ledger", new=AsyncMock(return_value=None)
+            ), redirect_stderr(stderr):
+                with self.assertRaises(RuntimeError):
+                    await _adopt_version_into_ledger(
+                        connection, version=21, registry=MigrationRegistry()
+                    )
+            line = stderr.getvalue()
+            self.assertIn(f"operation={expected}", line)
+            self.assertNotIn("secret", line)
 
     async def test_file_backed_second_runner_observes_durable_ledger(self) -> None:
         with TemporaryDirectory() as directory:
