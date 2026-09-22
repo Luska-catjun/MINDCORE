@@ -74,17 +74,17 @@ jobs:
           $installer = Get-ChildItem "frontend/src-tauri/target/release/bundle/nsis" -Filter *.exe -Recurse | Select-Object -First 1
           if (!(Test-Path $sidecar)) { throw "Windows sidecar is missing" }
           if ($null -eq $installer -or $installer.Length -le 0) { throw "NSIS installer is missing or empty" }
-          if ($env:GITHUB_REF_NAME -eq "diagnostic/v022-startup-failure") {
+          if ($env:GITHUB_REF_NAME -eq "diagnostic/v022-startup-progress") {
             & $sidecar --help | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "Windows sidecar archive could not start" }
-            $diagnostic = Join-Path $installer.DirectoryName "MindCore_0.2.2_Diagnostic_Setup.exe"
+            $diagnostic = Join-Path $installer.DirectoryName "MindCore_0.2.2_Diagnostic2_Setup.exe"
             Move-Item $installer.FullName $diagnostic -Force
             $hash = (Get-FileHash $diagnostic -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$hash *MindCore_0.2.2_Diagnostic_Setup.exe" | Set-Content "$diagnostic.sha256" -NoNewline
+            "$hash *MindCore_0.2.2_Diagnostic2_Setup.exe" | Set-Content "$diagnostic.sha256" -NoNewline
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.ref_name == 'diagnostic/v022-startup-failure' && 'MindCore-0.2.2-Startup-Diagnostic-Windows' || 'mindcore-windows-unsigned' }}
+          name: ${{ github.ref_name == 'diagnostic/v022-startup-progress' && 'MindCore-0.2.2-Startup-Diagnostic-2-Windows' || 'mindcore-windows-unsigned' }}
           path: |
             frontend/src-tauri/target/release/bundle/nsis/**
           if-no-files-found: error

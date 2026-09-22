@@ -25,4 +25,13 @@ describe("startup diagnostic parser", () => {
     expect(readyTimeoutDiagnostic().line).toContain("operation=ready_wait");
     expect(readyTimeoutDiagnostic().line).toContain("exception_class=HealthTimeout");
   });
+
+  it("keeps only allowlisted last progress fields", () => {
+    const parsed = parseStartupDiagnostic(
+      `MINDCORE_STARTUP_DIAGNOSTIC build=${DIAGNOSTIC_BUILD_LABEL} phase=ready category=timeout operation=ready_wait exception_class=StartupTimeout last_phase=ready last_operation=lifespan_ready token=private`,
+    );
+    expect(parsed?.lastPhase).toBe("ready");
+    expect(parsed?.lastOperation).toBe("lifespan_ready");
+    expect(parsed?.line).not.toContain("private");
+  });
 });

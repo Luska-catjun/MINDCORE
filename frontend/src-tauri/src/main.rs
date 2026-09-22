@@ -31,7 +31,8 @@ const DESKTOP_INSTANCE_HEADER: &str = "X-MindCore-Desktop-Instance";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const STARTUP_DIAGNOSTIC_PREFIX: &str = "MINDCORE_STARTUP_DIAGNOSTIC";
-const DIAGNOSTIC_BUILD_LABEL: &str = "v0.2.2-diagnostic-1";
+const STARTUP_PROGRESS_PREFIX: &str = "MINDCORE_STARTUP_PROGRESS";
+const DIAGNOSTIC_BUILD_LABEL: &str = "v0.2.2-diagnostic-2";
 const UPDATER_PLUGIN_ENABLED: bool = !cfg!(mindcore_updater_disabled);
 const LLM_PROVIDERS: [&str; 5] = ["gemini", "groq", "anthropic", "xai", "openai"];
 struct Sidecar {
@@ -45,6 +46,15 @@ struct StartupDiagnostic {
     category: String,
     operation: Option<String>,
     exception_class: String,
+    schema_version: Option<String>,
+    last_phase: Option<String>,
+    last_operation: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct StartupProgress {
+    phase: String,
+    operation: String,
     schema_version: Option<String>,
 }
 
@@ -64,12 +74,49 @@ fn allowed_startup_phase(value: &str) -> bool {
     matches!(value, "settings" | "identity" | "persona_registry" | "database_connect" | "schema_classification" | "schema_authority" | "migration_ledger" | "narrative_hydration" | "self_model_hydration" | "sidecar_spawn" | "ready")
 }
 
+fn allowed_startup_progress_phase(value: &str) -> bool {
+    matches!(
+        value,
+        "settings"
+            | "identity"
+            | "database_connect"
+            | "schema_classification"
+            | "schema_authority"
+            | "migration_ledger"
+            | "narrative_hydration"
+            | "self_model_hydration"
+            | "ready"
+    )
+}
+
 fn allowed_startup_category(value: &str) -> bool {
     matches!(value, "configuration" | "connection" | "native_or_network" | "driver" | "schema" | "hydration" | "timeout" | "process" | "runtime")
 }
 
 fn allowed_startup_operation(value: &str) -> bool {
-    matches!(value, "ledger_check" | "ledger_create" | "ledger_baseline_insert" | "ledger_validate" | "ledger_commit" | "sidecar_spawn" | "sidecar_exit" | "ready_wait")
+    matches!(value, "settings_load" | "identity_load" | "pool_create" | "pool_acquire" | "schema_classify_initial" | "schema_classify_final" | "schema_ensure" | "ledger_check" | "ledger_create" | "ledger_baseline_insert" | "ledger_validate" | "ledger_commit" | "narrative_hydrate" | "self_model_hydrate" | "lifespan_ready" | "ready_wait" | "sidecar_spawn" | "sidecar_exit")
+}
+
+fn allowed_startup_progress_operation(value: &str) -> bool {
+    matches!(
+        value,
+        "settings_load"
+            | "identity_load"
+            | "pool_create"
+            | "pool_acquire"
+            | "schema_classify_initial"
+            | "schema_classify_final"
+            | "schema_ensure"
+            | "ledger_check"
+            | "ledger_create"
+            | "ledger_baseline_insert"
+            | "ledger_validate"
+            | "ledger_commit"
+            | "narrative_hydrate"
+            | "self_model_hydrate"
+            | "lifespan_ready"
+            | "ready_wait"
+    )
 }
 
 fn parse_startup_diagnostic(stderr: &[u8]) -> Option<StartupDiagnostic> {
@@ -77,7 +124,7 @@ fn parse_startup_diagnostic(stderr: &[u8]) -> Option<StartupDiagnostic> {
     let mut fields = BTreeMap::new();
     for item in line.split_whitespace() {
         let Some((key, value)) = item.split_once('=') else { continue };
-        if matches!(key, "build" | "phase" | "category" | "operation" | "exception_class" | "schema_version") {
+        if matches!(key, "build" | "phase" | "category" | "operation" | "exception_class" | "schema_version" | "last_phase" | "last_operation") {
             fields.insert(key, value);
         }
     }
@@ -88,7 +135,54 @@ fn parse_startup_diagnostic(stderr: &[u8]) -> Option<StartupDiagnostic> {
     let operation = fields.get("operation").and_then(|value| safe_startup_identifier(value, 48)).filter(|value| allowed_startup_operation(value));
     let exception_class = safe_startup_identifier(fields.get("exception_class")?, 96)?;
     let schema_version = fields.get("schema_version").filter(|value| value.len() <= 4 && value.chars().all(|character| character.is_ascii_digit())).map(|value| value.to_string());
-    Some(StartupDiagnostic { phase, category, operation, exception_class, schema_version })
+    let last_phase = fields.get("last_phase").and_then(|value| safe_startup_identifier(value, 48)).filter(|value| allowed_startup_progress_phase(value));
+    let last_operation = fields.get("last_operation").and_then(|value| safe_startup_identifier(value, 48)).filter(|value| allowed_startup_progress_operation(value));
+    Some(StartupDiagnostic { phase, category, operation, exception_class, schema_version, last_phase, last_operation })
+}
+
+fn parse_startup_progress(stderr: &[u8]) -> Option<StartupProgress> {
+    let text = std::str::from_utf8(stderr).ok()?;
+    text.lines().filter_map(|line| {
+        let line = line.strip_prefix(&format!("{STARTUP_PROGRESS_PREFIX} "))?;
+        let mut fields = BTreeMap::new();
+        for item in line.split_whitespace() {
+            let Some((key, value)) = item.split_once('=') else { continue };
+            if matches!(key, "build" | "phase" | "operation" | "schema_version") {
+                fields.insert(key, value);
+            }
+        }
+        if fields.get("build").copied()? != DIAGNOSTIC_BUILD_LABEL { return None; }
+        let phase = safe_startup_identifier(fields.get("phase")?, 48)?;
+        let operation = safe_startup_identifier(fields.get("operation")?, 48)?;
+        if !allowed_startup_progress_phase(&phase) || !allowed_startup_progress_operation(&operation) { return None; }
+        let schema_version = fields.get("schema_version")
+            .filter(|value| value.len() <= 4 && value.chars().all(|character| character.is_ascii_digit()))
+            .map(|value| value.to_string());
+        Some(StartupProgress { phase, operation, schema_version })
+    }).last()
+}
+
+fn consume_startup_stderr(
+    pending: &mut Vec<u8>,
+    bytes: &[u8],
+) -> (Option<StartupDiagnostic>, Option<StartupProgress>) {
+    const MAX_PARTIAL_LINE_BYTES: usize = 1024;
+    pending.extend_from_slice(bytes);
+    let mut diagnostic = None;
+    let mut progress = None;
+    while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+        let line: Vec<u8> = pending.drain(..=end).collect();
+        if let Some(parsed) = parse_startup_diagnostic(&line) {
+            diagnostic = Some(parsed);
+        }
+        if let Some(parsed) = parse_startup_progress(&line) {
+            progress = Some(parsed);
+        }
+    }
+    if pending.len() > MAX_PARTIAL_LINE_BYTES {
+        pending.clear();
+    }
+    (diagnostic, progress)
 }
 
 impl StartupDiagnostic {
@@ -97,12 +191,22 @@ impl StartupDiagnostic {
         if let Some(operation) = &self.operation { line.push_str(&format!(" operation={operation}")); }
         line.push_str(&format!(" exception_class={}", self.exception_class));
         if let Some(schema_version) = &self.schema_version { line.push_str(&format!(" schema_version={schema_version}")); }
+        if let Some(last_phase) = &self.last_phase { line.push_str(&format!(" last_phase={last_phase}")); }
+        if let Some(last_operation) = &self.last_operation { line.push_str(&format!(" last_operation={last_operation}")); }
         line
+    }
+
+    fn with_last_progress(mut self, progress: Option<StartupProgress>) -> Self {
+        if let Some(progress) = progress {
+            self.last_phase = Some(progress.phase);
+            self.last_operation = Some(progress.operation);
+        }
+        self
     }
 }
 
 fn fixed_startup_diagnostic(phase: &str, category: &str, operation: Option<&str>, exception_class: &str) -> StartupDiagnostic {
-    StartupDiagnostic { phase: phase.into(), category: category.into(), operation: operation.map(str::to_string), exception_class: exception_class.into(), schema_version: None }
+    StartupDiagnostic { phase: phase.into(), category: category.into(), operation: operation.map(str::to_string), exception_class: exception_class.into(), schema_version: None, last_phase: None, last_operation: None }
 }
 
 fn native_startup_diagnostic(error: &str) -> StartupDiagnostic {
@@ -707,20 +811,21 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
     }
     let lifecycle = Arc::clone(&state.lifecycle);
     let startup_diagnostic = Arc::new(Mutex::new(None::<StartupDiagnostic>));
+    let startup_progress = Arc::new(Mutex::new(None::<StartupProgress>));
     let event_diagnostic = Arc::clone(&startup_diagnostic);
+    let event_progress = Arc::clone(&startup_progress);
     tauri::async_runtime::spawn(async move {
-        let mut safe_stderr = Vec::new();
+        let mut pending_stderr_line = Vec::new();
         while let Some(event) = events.recv().await {
             match event {
                 CommandEvent::Stderr(bytes) => {
-                    const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
-                    if safe_stderr.len() < MAX_DIAGNOSTIC_BYTES {
-                        let remaining = MAX_DIAGNOSTIC_BYTES - safe_stderr.len();
-                        safe_stderr.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
-                    }
-                    if let Some(diagnostic) = parse_startup_diagnostic(&safe_stderr) {
+                    let (diagnostic, progress) =
+                        consume_startup_stderr(&mut pending_stderr_line, &bytes);
+                    if let Some(diagnostic) = diagnostic {
                         *event_diagnostic.lock().expect("startup diagnostic lock") = Some(diagnostic);
-                        safe_stderr.clear();
+                    }
+                    if let Some(progress) = progress {
+                        *event_progress.lock().expect("startup progress lock") = Some(progress);
                     }
                 }
                 CommandEvent::Terminated(_) => {
@@ -749,7 +854,10 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
             .expect("sidecar lifecycle lock")
             .is_generation_active(generation)
         {
-            let diagnostic = startup_diagnostic.lock().expect("startup diagnostic lock").clone().unwrap_or_else(|| fixed_startup_diagnostic("ready", "process", Some("sidecar_exit"), "SidecarExited"));
+            let diagnostic = startup_diagnostic.lock().expect("startup diagnostic lock").clone().unwrap_or_else(|| {
+                fixed_startup_diagnostic("ready", "process", Some("sidecar_exit"), "SidecarExited")
+                    .with_last_progress(startup_progress.lock().expect("startup progress lock").clone())
+            });
             eprintln!("{}", diagnostic.line());
             return Err(diagnostic.line());
         }
@@ -777,7 +885,10 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
     {
         let _ = child.kill();
     }
-    let diagnostic = startup_diagnostic.lock().expect("startup diagnostic lock").clone().unwrap_or_else(|| fixed_startup_diagnostic("ready", "timeout", Some("ready_wait"), "StartupTimeout"));
+    let diagnostic = startup_diagnostic.lock().expect("startup diagnostic lock").clone().unwrap_or_else(|| {
+        fixed_startup_diagnostic("ready", "timeout", Some("ready_wait"), "StartupTimeout")
+            .with_last_progress(startup_progress.lock().expect("startup progress lock").clone())
+    });
     eprintln!("{}", diagnostic.line());
     Err(diagnostic.line())
 }
@@ -1494,7 +1605,7 @@ mod setup_validation_tests {
 
     #[test]
     fn startup_diagnostic_parser_keeps_only_allowlisted_fields() {
-        let stderr = b"unrelated raw stderr\nMINDCORE_STARTUP_DIAGNOSTIC build=v0.2.2-diagnostic-1 phase=migration_ledger category=driver operation=ledger_commit exception_class=DatabaseError schema_version=21 token=private\n";
+        let stderr = b"unrelated raw stderr\nMINDCORE_STARTUP_DIAGNOSTIC build=v0.2.2-diagnostic-2 phase=migration_ledger category=driver operation=ledger_commit exception_class=DatabaseError schema_version=21 token=private\n";
         let diagnostic = parse_startup_diagnostic(stderr).unwrap();
         assert_eq!(diagnostic.phase, "migration_ledger");
         assert_eq!(diagnostic.operation.as_deref(), Some("ledger_commit"));
@@ -1506,7 +1617,79 @@ mod setup_validation_tests {
     #[test]
     fn startup_diagnostic_parser_rejects_unknown_or_unsafe_records() {
         assert!(parse_startup_diagnostic(b"MINDCORE_STARTUP_DIAGNOSTIC build=other phase=ready category=timeout exception_class=Timeout").is_none());
-        assert!(parse_startup_diagnostic(b"MINDCORE_STARTUP_DIAGNOSTIC build=v0.2.2-diagnostic-1 phase=ready category=timeout exception_class=bad/value").is_none());
+        assert!(parse_startup_diagnostic(b"MINDCORE_STARTUP_DIAGNOSTIC build=v0.2.2-diagnostic-2 phase=ready category=timeout exception_class=bad/value").is_none());
+    }
+
+    #[test]
+    fn startup_progress_parser_accepts_safe_reordered_fields_and_ignores_unknowns() {
+        let progress = parse_startup_progress(b"raw stderr\nMINDCORE_STARTUP_PROGRESS operation=ledger_commit secret=hidden phase=migration_ledger build=v0.2.2-diagnostic-2 schema_version=21\n").unwrap();
+        assert_eq!(progress.phase, "migration_ledger");
+        assert_eq!(progress.operation, "ledger_commit");
+        assert_eq!(progress.schema_version.as_deref(), Some("21"));
+    }
+
+    #[test]
+    fn startup_progress_parser_rejects_wrong_build_unknown_and_unsafe_values() {
+        for line in [
+            "MINDCORE_STARTUP_PROGRESS build=other phase=ready operation=lifespan_ready",
+            "MINDCORE_STARTUP_PROGRESS build=v0.2.2-diagnostic-2 phase=unknown operation=lifespan_ready",
+            "MINDCORE_STARTUP_PROGRESS build=v0.2.2-diagnostic-2 phase=ready operation=unknown",
+            "MINDCORE_STARTUP_PROGRESS build=v0.2.2-diagnostic-2 phase=ready/path operation=lifespan_ready",
+            "arbitrary raw stderr token=private",
+        ] {
+            assert!(parse_startup_progress(line.as_bytes()).is_none());
+        }
+    }
+
+    #[test]
+    fn startup_progress_keeps_the_last_valid_marker() {
+        let progress = parse_startup_progress(b"MINDCORE_STARTUP_PROGRESS build=v0.2.2-diagnostic-2 phase=database_connect operation=pool_create\nMINDCORE_STARTUP_PROGRESS build=v0.2.2-diagnostic-2 phase=database_connect operation=pool_acquire\nMINDCORE_STARTUP_PROGRESS build=v0.2.2-diagnostic-2 phase=schema_authority operation=schema_ensure\nMINDCORE_STARTUP_PROGRESS build=v0.2.2-diagnostic-2 phase=migration_ledger operation=ledger_commit\n").unwrap();
+        assert_eq!(progress.phase, "migration_ledger");
+        assert_eq!(progress.operation, "ledger_commit");
+    }
+
+    #[test]
+    fn stderr_stream_discards_raw_lines_and_parses_fragmented_safe_records() {
+        let mut pending = Vec::new();
+        let first = consume_startup_stderr(
+            &mut pending,
+            b"private path /Users/person token=secret\nMINDCORE_STARTUP_PROG",
+        );
+        assert_eq!(first, (None, None));
+        let (_, progress) = consume_startup_stderr(
+            &mut pending,
+            b"RESS build=v0.2.2-diagnostic-2 phase=database_connect operation=pool_acquire\n",
+        );
+        let progress = progress.expect("safe progress");
+        assert_eq!(progress.phase, "database_connect");
+        assert_eq!(progress.operation, "pool_acquire");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn synthesized_timeout_and_exit_include_only_last_safe_progress() {
+        let progress = parse_startup_progress(b"MINDCORE_STARTUP_PROGRESS build=v0.2.2-diagnostic-2 phase=migration_ledger operation=ledger_commit\n");
+        let timeout = fixed_startup_diagnostic("ready", "timeout", Some("ready_wait"), "StartupTimeout").with_last_progress(progress.clone());
+        assert!(timeout.line().contains("last_phase=migration_ledger last_operation=ledger_commit"));
+        let exited = fixed_startup_diagnostic("ready", "process", Some("sidecar_exit"), "SidecarExited").with_last_progress(progress);
+        assert!(exited.line().contains("last_phase=migration_ledger last_operation=ledger_commit"));
+    }
+
+    #[test]
+    fn lifespan_ready_progress_is_preserved_on_timeout() {
+        let progress = parse_startup_progress(b"MINDCORE_STARTUP_PROGRESS build=v0.2.2-diagnostic-2 phase=ready operation=lifespan_ready\n");
+        let timeout = fixed_startup_diagnostic("ready", "timeout", Some("ready_wait"), "StartupTimeout").with_last_progress(progress);
+        assert_eq!(timeout.last_phase.as_deref(), Some("ready"));
+        assert_eq!(timeout.last_operation.as_deref(), Some("lifespan_ready"));
+    }
+
+    #[test]
+    fn actual_python_failure_remains_authoritative_over_progress() {
+        let progress = parse_startup_progress(b"MINDCORE_STARTUP_PROGRESS build=v0.2.2-diagnostic-2 phase=migration_ledger operation=ledger_commit\n");
+        let actual = parse_startup_diagnostic(b"MINDCORE_STARTUP_DIAGNOSTIC build=v0.2.2-diagnostic-2 phase=migration_ledger category=driver operation=ledger_commit exception_class=DatabaseError\n");
+        let selected = actual.unwrap_or_else(|| fixed_startup_diagnostic("ready", "timeout", Some("ready_wait"), "StartupTimeout").with_last_progress(progress));
+        assert_eq!(selected.exception_class, "DatabaseError");
+        assert_eq!(selected.phase, "migration_ledger");
     }
 
     #[test]

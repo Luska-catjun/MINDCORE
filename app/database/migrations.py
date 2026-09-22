@@ -21,7 +21,11 @@ from app.database.schema_contract import (
     SchemaState,
     classify_turso_schema,
 )
-from app.services.startup_diagnostics import emit_startup_diagnostic, startup_category
+from app.services.startup_diagnostics import (
+    emit_startup_diagnostic,
+    emit_startup_progress,
+    startup_category,
+)
 
 
 LEDGER_TABLE = "schema_migration_ledger"
@@ -235,11 +239,20 @@ async def _adopt_version_into_ledger(
     try:
         async with connection.transaction():
             operation = "ledger_create"
+            emit_startup_progress(
+                phase="migration_ledger", operation=operation, schema_version=version
+            )
             await _ensure_ledger_table(connection)
             operation = "ledger_check"
+            emit_startup_progress(
+                phase="migration_ledger", operation=operation, schema_version=version
+            )
             rows = await _ledger_rows(connection)
             if not rows:
                 operation = "ledger_baseline_insert"
+                emit_startup_progress(
+                    phase="migration_ledger", operation=operation, schema_version=version
+                )
                 await connection.execute(
                     f"""insert into {LEDGER_TABLE}(
                         migration_id, from_version, to_version, checksum, applied_at
@@ -251,10 +264,16 @@ async def _adopt_version_into_ledger(
                     datetime.now(timezone.utc),
                 )
             operation = "ledger_validate"
+            emit_startup_progress(
+                phase="migration_ledger", operation=operation, schema_version=version
+            )
             await _validate_ledger(connection, registry=registry, current_version=version)
             # Any exception raised while leaving the transaction now belongs to
             # commit/cleanup rather than validation.
             operation = "ledger_commit"
+            emit_startup_progress(
+                phase="migration_ledger", operation=operation, schema_version=version
+            )
     except BaseException as error:
         emit_startup_diagnostic(
             phase="migration_ledger",
@@ -364,7 +383,17 @@ async def _adopt_compatible_legacy_database(
             SCHEMA_VERSION_KEY,
             str(target_version),
         )
+        emit_startup_progress(
+            phase="migration_ledger",
+            operation="ledger_create",
+            schema_version=target_version,
+        )
         await _ensure_ledger_table(connection)
+        emit_startup_progress(
+            phase="migration_ledger",
+            operation="ledger_baseline_insert",
+            schema_version=target_version,
+        )
         await connection.execute(
             f"""insert into {LEDGER_TABLE}(
                 migration_id, from_version, to_version, checksum, applied_at
@@ -375,7 +404,17 @@ async def _adopt_compatible_legacy_database(
             _baseline_checksum(target_version),
             datetime.now(timezone.utc),
         )
+        emit_startup_progress(
+            phase="migration_ledger",
+            operation="ledger_validate",
+            schema_version=target_version,
+        )
         await _validate_ledger(connection, registry=registry, current_version=target_version)
+        emit_startup_progress(
+            phase="migration_ledger",
+            operation="ledger_commit",
+            schema_version=target_version,
+        )
 
 
 async def ensure_turso_schema_current(
@@ -390,6 +429,9 @@ async def ensure_turso_schema_current(
     This is intentionally a mutating startup/initialize operation. Connection
     preflight must continue to use ``SELECT 1`` only.
     """
+    emit_startup_progress(
+        phase="schema_classification", operation="schema_classify_initial"
+    )
     try:
         report = await classify_turso_schema(connection)
     except BaseException as error:
@@ -402,6 +444,9 @@ async def ensure_turso_schema_current(
     bootstrapped = False
     adopted_legacy = False
     if report.state == SchemaState.EMPTY:
+        emit_startup_progress(
+            phase="schema_authority", operation="schema_ensure"
+        )
         try:
             await _bootstrap_empty_database(
                 connection,
@@ -425,6 +470,9 @@ async def ensure_turso_schema_current(
             )
             raise
     if report.state == SchemaState.COMPATIBLE_LEGACY:
+        emit_startup_progress(
+            phase="schema_authority", operation="schema_ensure"
+        )
         await _adopt_compatible_legacy_database(
             connection, target_version=target_version, registry=registry
         )
@@ -469,6 +517,9 @@ async def ensure_turso_schema_current(
             raise
     result = await run_forward_migrations(
         connection, target_version=target_version, registry=registry
+    )
+    emit_startup_progress(
+        phase="schema_classification", operation="schema_classify_final"
     )
     try:
         final_report = await classify_turso_schema(connection)

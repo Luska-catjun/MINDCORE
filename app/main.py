@@ -16,7 +16,11 @@ from app.services.error_safety import safe_error_type
 from app.services.mindcore.narrative import hydrate_narrative_snapshot
 from app.services.mindcore.self_model import hydrate_self_model_snapshot
 from app.services.mindcore.snapshot_scope import CognitiveSnapshotScope
-from app.services.startup_diagnostics import emit_startup_diagnostic, startup_category
+from app.services.startup_diagnostics import (
+    emit_startup_diagnostic,
+    emit_startup_progress,
+    startup_category,
+)
 
 
 def configure_diana_logging() -> None:
@@ -36,6 +40,7 @@ def build_lifespan(
 ):
   @asynccontextmanager
   async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    emit_startup_progress(phase="settings", operation="settings_load")
     try:
         settings = settings_override or get_settings()
     except BaseException as error:
@@ -75,6 +80,7 @@ def build_lifespan(
         if missing:
             raise RuntimeError(f"Missing required production settings: {', '.join(missing)}")
     app.state.settings = settings
+    emit_startup_progress(phase="identity", operation="identity_load")
     try:
         app.state.diana_identity_prompt = load_persona_identity_prompt(settings)
     except BaseException as error:
@@ -82,6 +88,7 @@ def build_lifespan(
             phase="identity", category="configuration", error=error
         )
         raise
+    emit_startup_progress(phase="database_connect", operation="pool_create")
     try:
         pool = db_pool_factory(settings) if db_pool_factory else create_pool(settings)
         app.state.db_pool = await pool if hasattr(pool, "__await__") else pool
@@ -100,8 +107,10 @@ def build_lifespan(
         and settings.database_backend.lower() == "turso"
         and hasattr(app.state.db_pool, "acquire")
     ):
+        emit_startup_progress(phase="database_connect", operation="pool_acquire")
         try:
             async with app.state.db_pool.acquire() as connection:
+                emit_startup_progress(phase="schema_authority", operation="schema_ensure")
                 await ensure_turso_schema_current(connection)
         except BaseException as error:
             emit_startup_diagnostic(
@@ -115,6 +124,9 @@ def build_lifespan(
     # path.  Isolated ASGI fixtures without a database acquire seam simply use
     # the empty, safe snapshot.
     if hasattr(app.state.db_pool, "acquire"):
+        emit_startup_progress(
+            phase="narrative_hydration", operation="narrative_hydrate"
+        )
         try:
             await hydrate_narrative_snapshot(app.state.db_pool, app.state.cognitive_snapshot_scope)
         except BaseException as error:
@@ -124,6 +136,9 @@ def build_lifespan(
                 error=error,
             )
             raise
+        emit_startup_progress(
+            phase="self_model_hydration", operation="self_model_hydrate"
+        )
         try:
             await hydrate_self_model_snapshot(app.state.db_pool, app.state.cognitive_snapshot_scope)
         except BaseException as error:
@@ -133,6 +148,7 @@ def build_lifespan(
                 error=error,
             )
             raise
+    emit_startup_progress(phase="ready", operation="lifespan_ready")
     try:
         yield
     finally:
@@ -143,6 +159,7 @@ def build_lifespan(
 
 def create_app(*, settings_override: Settings | None = None, db_pool_factory: Callable[[Settings], object] | None = None) -> FastAPI:
     configure_diana_logging()
+    emit_startup_progress(phase="settings", operation="settings_load")
     try:
         settings = settings_override or get_settings()
     except BaseException as error:

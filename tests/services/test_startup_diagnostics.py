@@ -14,10 +14,32 @@ from app.main import create_app
 from app.services.startup_diagnostics import (
     DIAGNOSTIC_BUILD_LABEL,
     emit_startup_diagnostic,
+    emit_startup_progress,
 )
 
 
 class StartupDiagnosticTests(unittest.TestCase):
+    def test_progress_uses_fixed_vocabulary_and_no_runtime_values(self) -> None:
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            emit_startup_progress(
+                phase="migration_ledger",
+                operation="ledger_commit",
+                schema_version=21,
+            )
+        self.assertEqual(
+            stderr.getvalue().strip(),
+            "MINDCORE_STARTUP_PROGRESS "
+            f"build={DIAGNOSTIC_BUILD_LABEL} "
+            "phase=migration_ledger operation=ledger_commit schema_version=21",
+        )
+
+    def test_progress_rejects_values_outside_the_allowlist(self) -> None:
+        with self.assertRaises(ValueError):
+            emit_startup_progress(phase="bad/path", operation="ledger_commit")
+        with self.assertRaises(ValueError):
+            emit_startup_progress(phase="ready", operation="token=secret")
+
     def test_emits_only_fixed_secret_safe_fields(self) -> None:
         error = RuntimeError(
             "database libsql://private.example?authToken=secret at /Users/private/data.db"
@@ -116,6 +138,44 @@ class StartupDiagnosticTests(unittest.TestCase):
             self.assertIn(f"phase={expected_phase}", line)
             self.assertNotIn("/Users", line)
             self.assertNotIn("prompt", line)
+
+    def test_normal_startup_progress_sequence_is_logical(self) -> None:
+        class Pool:
+            @asynccontextmanager
+            async def acquire(self):
+                yield object()
+
+        settings = Settings(_env_file=None, database_backend="supabase")
+        stderr = StringIO()
+        with (
+            patch("app.main.hydrate_narrative_snapshot", new=AsyncMock(return_value=None)),
+            patch("app.main.hydrate_self_model_snapshot", new=AsyncMock(return_value=None)),
+            redirect_stderr(stderr),
+        ):
+            app = create_app(
+                settings_override=settings,
+                db_pool_factory=lambda _settings: Pool(),
+            )
+            with TestClient(app):
+                pass
+        phases = [
+            item.split("phase=", 1)[1].split(" ", 1)[0]
+            for item in stderr.getvalue().splitlines()
+            if item.startswith("MINDCORE_STARTUP_PROGRESS ")
+        ]
+        expected = [
+            "settings",
+            "identity",
+            "database_connect",
+            "narrative_hydration",
+            "self_model_hydration",
+            "ready",
+        ]
+        cursor = 0
+        for phase in phases:
+            if cursor < len(expected) and phase == expected[cursor]:
+                cursor += 1
+        self.assertEqual(cursor, len(expected), phases)
 
 
 if __name__ == "__main__":

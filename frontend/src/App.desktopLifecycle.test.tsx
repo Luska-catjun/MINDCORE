@@ -80,17 +80,19 @@ describe("desktop backend lifecycle recovery", () => {
       if (command === "get_setup_status") return Promise.resolve({ configured: true });
       if (command === "start_mindcore_backend") {
         return Promise.reject(new Error(
-          "native wrapper: MINDCORE_STARTUP_DIAGNOSTIC build=v0.2.2-diagnostic-1 phase=migration_ledger category=driver operation=ledger_commit exception_class=DatabaseError schema_version=21 token=private",
+          "native wrapper: MINDCORE_STARTUP_DIAGNOSTIC build=v0.2.2-diagnostic-2 phase=ready category=timeout operation=ready_wait exception_class=StartupTimeout last_phase=migration_ledger last_operation=ledger_commit token=private",
         ));
       }
       return Promise.resolve();
     });
 
     render(<App />);
-    expect(await screen.findByText("Diagnostic Code: migration_ledger/driver")).toBeTruthy();
+    expect(await screen.findByText("Diagnostic Code: ready/timeout")).toBeTruthy();
+    expect(screen.getByText("Last phase: migration_ledger")).toBeTruthy();
+    expect(screen.getByText("Last operation: ledger_commit")).toBeTruthy();
     await userEvent.click(screen.getByRole("button", { name: "Copy Diagnostic" }));
     expect(writeText).toHaveBeenCalledWith(
-      "MINDCORE_STARTUP_DIAGNOSTIC build=v0.2.2-diagnostic-1 phase=migration_ledger category=driver operation=ledger_commit exception_class=DatabaseError schema_version=21",
+      "MINDCORE_STARTUP_DIAGNOSTIC build=v0.2.2-diagnostic-2 phase=ready category=timeout operation=ready_wait exception_class=StartupTimeout last_phase=migration_ledger last_operation=ledger_commit",
     );
     expect(writeText.mock.calls[0][0]).not.toContain("private");
   });
