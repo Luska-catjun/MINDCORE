@@ -28,7 +28,7 @@ const MAX_IDENTITY_BYTES: usize = 64 * 1024;
 const SHUTDOWN_CAPABILITY_ENV: &str = "MINDCORE_DESKTOP_SHUTDOWN_CAPABILITY";
 const SHUTDOWN_CAPABILITY_HEADER: &str = "X-MindCore-Desktop-Shutdown";
 const DESKTOP_INSTANCE_HEADER: &str = "X-MindCore-Desktop-Instance";
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const UPDATER_PLUGIN_ENABLED: bool = !cfg!(mindcore_updater_disabled);
 const LLM_PROVIDERS: [&str; 5] = ["gemini", "groq", "anthropic", "xai", "openai"];
@@ -730,8 +730,11 @@ fn request_instance_readiness(capability: &str) -> ReadinessAttempt {
     }
 }
 fn local_backend_port_is_occupied() -> bool {
+    local_backend_port_is_occupied_at(DESKTOP_PORT)
+}
+fn local_backend_port_is_occupied_at(port: u16) -> bool {
     TcpStream::connect_timeout(
-        &SocketAddr::from(([127, 0, 0, 1], DESKTOP_PORT)),
+        &SocketAddr::from(([127, 0, 0, 1], port)),
         Duration::from_millis(150),
     )
     .is_ok()
@@ -1788,11 +1791,26 @@ MINDCORE_SETUP_DIAGNOSTIC phase=database_bootstrap action=initialize category=sc
 
     #[test]
     fn startup_diagnostics_use_only_safe_categories() {
+        assert_eq!(STARTUP_TIMEOUT, Duration::from_secs(45));
         assert_eq!(startup_failure_category("MindCore setup is incomplete."), "config_or_persona");
         assert_eq!(startup_failure_category("MindCore backend exited before becoming ready."), "sidecar_exit");
-        assert_eq!(startup_failure_category("MindCore backend could not claim its local port."), "port_conflict");
+        assert_eq!(startup_failure_category("MindCore backend could not claim its local port. Another application may be using port 8765."), "port_conflict");
         assert_eq!(startup_failure_category("MindCore backend startup timed out before readiness."), "startup_timeout");
+        assert_eq!(startup_failure_category("MindCore backend lifecycle changed during startup."), "lifecycle");
         assert_eq!(startup_failure_category("unexpected secret-looking input"), "startup");
+    }
+
+    #[test]
+    fn an_occupied_local_port_is_classified_as_port_conflict() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test port");
+        let port = listener.local_addr().expect("test port address").port();
+        assert!(local_backend_port_is_occupied_at(port));
+        assert_eq!(
+            startup_failure_category(
+                "MindCore backend could not claim its local port. Another application may be using port 8765."
+            ),
+            "port_conflict"
+        );
     }
 
     #[test]
