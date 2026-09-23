@@ -113,6 +113,19 @@ impl<C> SidecarLifecycle<C> {
             && matches!(self.phase, LifecyclePhase::Stopped | LifecyclePhase::Failed)
     }
 
+    pub(crate) fn is_running(&self) -> bool {
+        self.phase == LifecyclePhase::Running && self.active.is_some()
+    }
+
+    pub(crate) fn current_capability(&self) -> Option<String> {
+        if self.phase != LifecyclePhase::Running {
+            return None;
+        }
+        self.active
+            .as_ref()
+            .map(|active| active.shutdown_capability.clone())
+    }
+
     pub(crate) fn record_exit(&mut self, generation: u64, event_is_error: bool) -> Option<C> {
         if self.current_generation != Some(generation) {
             return None;
@@ -206,9 +219,11 @@ mod tests {
         let mut state = SidecarLifecycle::new();
         let generation = start_running(&mut state);
         assert_eq!(state.phase(), LifecyclePhase::Running);
+        assert!(state.is_running());
         assert_eq!(state.generation(), Some(generation));
         assert!(state.has_child());
         assert_eq!(state.begin_start(), StartDecision::AlreadyRunning);
+        assert_eq!(state.current_capability().as_deref(), Some("capability-1"));
     }
 
     #[test]
@@ -221,6 +236,7 @@ mod tests {
             .attach_child(generation, "first", "first-capability".into())
             .expect("child should attach");
         assert_eq!(state.record_exit(generation, false), Some("first"));
+        assert!(state.current_capability().is_none());
         assert_eq!(state.phase(), LifecyclePhase::Failed);
         assert!(!state.has_child());
         let StartDecision::Spawn {
@@ -238,6 +254,7 @@ mod tests {
         let generation = start_running(&mut state);
         assert_eq!(state.record_exit(generation, true), Some("child"));
         assert_eq!(state.phase(), LifecyclePhase::Failed);
+        assert!(!state.is_running());
         assert_eq!(state.generation(), None);
         assert!(!state.has_child());
     }

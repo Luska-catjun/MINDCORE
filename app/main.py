@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager, suppress
 from collections.abc import AsyncIterator, Callable
 import asyncio
 import logging
+from time import perf_counter
 
 from fastapi import FastAPI,Request
 from fastapi.responses import JSONResponse
@@ -18,6 +19,7 @@ from app.services.mindcore.narrative import hydrate_narrative_snapshot
 from app.services.mindcore.self_model import hydrate_self_model_snapshot
 from app.services.mindcore.snapshot_scope import CognitiveSnapshotScope
 from app.services.turn_recovery import recover_incomplete_turns
+from app.services.startup_timing import emit_startup_timing
 
 
 def configure_diana_logging() -> None:
@@ -37,6 +39,7 @@ def build_lifespan(
 ):
   @asynccontextmanager
   async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    lifespan_started = perf_counter()
     settings = settings_override or get_settings()
     if settings.is_production:
         missing = []
@@ -70,9 +73,13 @@ def build_lifespan(
         if missing:
             raise RuntimeError(f"Missing required production settings: {', '.join(missing)}")
     app.state.settings = settings
+    identity_started = perf_counter()
     app.state.diana_identity_prompt = load_persona_identity_prompt(settings)
+    emit_startup_timing("identity", "identity_load", round((perf_counter() - identity_started) * 1000))
+    pool_started = perf_counter()
     pool = db_pool_factory(settings) if db_pool_factory else create_pool(settings)
     app.state.db_pool = await pool if hasattr(pool, "__await__") else pool
+    emit_startup_timing("database_connect", "pool_create", round((perf_counter() - pool_started) * 1000))
     # Setup connection preflight remains read-only. The actual backend startup
     # is the single production boundary that adopts a released legacy schema or
     # runs a future registered forward migration before runtime reads begin.
@@ -81,15 +88,29 @@ def build_lifespan(
         and settings.database_backend.lower() == "turso"
         and hasattr(app.state.db_pool, "acquire")
     ):
+        acquire_started = perf_counter()
         async with app.state.db_pool.acquire() as connection:
+            emit_startup_timing(
+                "database_connect", "pool_acquire", round((perf_counter() - acquire_started) * 1000)
+            )
             await ensure_turso_schema_current(connection)
     app.state.cognitive_snapshot_scope = CognitiveSnapshotScope()
     # One startup hydration keeps Narrative activation off the foreground chat
     # path.  Isolated ASGI fixtures without a database acquire seam simply use
     # the empty, safe snapshot.
     if hasattr(app.state.db_pool, "acquire"):
+        narrative_started = perf_counter()
+        emit_startup_timing("hydration", "narrative_start", 0)
         await hydrate_narrative_snapshot(app.state.db_pool, app.state.cognitive_snapshot_scope)
+        emit_startup_timing(
+            "hydration", "narrative_end", round((perf_counter() - narrative_started) * 1000)
+        )
+        self_model_started = perf_counter()
+        emit_startup_timing("hydration", "self_model_start", 0)
         await hydrate_self_model_snapshot(app.state.db_pool, app.state.cognitive_snapshot_scope)
+        emit_startup_timing(
+            "hydration", "self_model_end", round((perf_counter() - self_model_started) * 1000)
+        )
     # Recovery is bounded and never retries a provider request. It starts only
     # after schema migration and snapshot hydration, without delaying startup.
     app.state.turn_recovery_task = None
@@ -98,12 +119,20 @@ def build_lifespan(
         and hasattr(app.state.db_pool, "acquire")
         and not getattr(app.state.db_pool, "isolated", False)
     ):
+        recovery_started = perf_counter()
         app.state.turn_recovery_task = asyncio.create_task(
             recover_incomplete_turns(
                 app.state.db_pool,
                 snapshot_scope=app.state.cognitive_snapshot_scope,
             )
         )
+        emit_startup_timing(
+            "recovery", "recovery_task_schedule",
+            round((perf_counter() - recovery_started) * 1000),
+        )
+    emit_startup_timing(
+        "uvicorn", "lifespan_complete", round((perf_counter() - lifespan_started) * 1000)
+    )
     try:
         yield
     finally:
@@ -119,7 +148,11 @@ def build_lifespan(
 
 def create_app(*, settings_override: Settings | None = None, db_pool_factory: Callable[[Settings], object] | None = None) -> FastAPI:
     configure_diana_logging()
+    settings_started = perf_counter()
     settings = settings_override or get_settings()
+    emit_startup_timing(
+        "settings", "settings_load", round((perf_counter() - settings_started) * 1000)
+    )
     app = FastAPI(title=settings.app_name, version="0.2.5", lifespan=build_lifespan(settings_override, db_pool_factory))
 
     @app.exception_handler(Exception)
@@ -142,7 +175,7 @@ def create_app(*, settings_override: Settings | None = None, db_pool_factory: Ca
     app.include_router(auth.router)
     @app.middleware("http")
     async def private_access(request: Request, call_next):
-        if request.method == "OPTIONS" or request.url.path in {"/health", "/_desktop/ready", "/_desktop/shutdown"} or request.url.path.startswith("/auth/"):
+        if request.method == "OPTIONS" or request.url.path in {"/health", "/_desktop/ready", "/_desktop/session", "/_desktop/shutdown"} or request.url.path.startswith("/auth/"):
             return await call_next(request)
         settings = request.app.state.settings
         try:

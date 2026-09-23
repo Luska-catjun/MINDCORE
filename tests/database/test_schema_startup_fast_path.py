@@ -12,6 +12,7 @@ from app.database.migrations import (
     SchemaMigrationDriftError,
     SchemaMigrationError,
     ensure_turso_schema_current,
+    validate_turso_schema_full,
 )
 from app.database.schema_contract import classify_turso_schema
 from app.database.turso import TursoConnection
@@ -27,6 +28,7 @@ class CountingConnection:
         self.latency = latency
         self.read_round_trips = 0
         self.execute_round_trips = 0
+        self.statements: list[str] = []
 
     async def _wait(self) -> None:
         if self.latency:
@@ -34,16 +36,19 @@ class CountingConnection:
 
     async def fetch(self, statement: str, *args):
         self.read_round_trips += 1
+        self.statements.append(statement.lower())
         await self._wait()
         return await self.connection.fetch(statement, *args)
 
     async def fetchval(self, statement: str, *args):
         self.read_round_trips += 1
+        self.statements.append(statement.lower())
         await self._wait()
         return await self.connection.fetchval(statement, *args)
 
     async def fetchrow(self, statement: str, *args):
         self.read_round_trips += 1
+        self.statements.append(statement.lower())
         await self._wait()
         return await self.connection.fetchrow(statement, *args)
 
@@ -73,7 +78,19 @@ class CurrentSchemaStartupFastPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result.initial_version, result.final_version), (22, 22))
         self.assertEqual(counted.read_round_trips, 1)
         self.assertEqual(counted.execute_round_trips, 0)
+        joined = " ".join(counted.statements)
+        self.assertNotIn("pragma_integrity_check", joined)
+        self.assertNotIn("pragma_foreign_key_check", joined)
         classifier.assert_not_awaited()
+
+    async def test_full_validator_still_checks_integrity_and_foreign_keys(self) -> None:
+        counted = CountingConnection(self.connection)
+        # The full validation is exercised after writes/bootstrap, and its
+        # call shape retains both expensive data-integrity checks.
+        await validate_turso_schema_full(counted)
+        joined = " ".join(counted.statements)
+        self.assertIn("pragma foreign_key_check", joined)
+        self.assertIn("pragma integrity_check", joined)
 
     async def test_full_classifier_batches_metadata_round_trips(self) -> None:
         counted = CountingConnection(self.connection)
@@ -103,7 +120,7 @@ class CurrentSchemaStartupFastPathTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(SchemaMigrationDriftError, "ledger_drift"):
             await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
 
-    async def test_foreign_key_violation_is_not_hidden_by_fast_path(self) -> None:
+    async def test_current_startup_skips_data_scan_but_full_validation_catches_fk_violation(self) -> None:
         await self.connection.execute("pragma foreign_keys=off")
         await self.connection.execute(
             "insert into messages(id,conversation_id,sequence,role,content,source_device,created_at) "
@@ -113,8 +130,12 @@ class CurrentSchemaStartupFastPathTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.connection.execute("pragma foreign_keys=on")
 
-        with self.assertRaisesRegex(SchemaMigrationError, "schema_incompatible"):
-            await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+        counted = CountingConnection(self.connection)
+        result = await ensure_turso_schema_current(counted, baseline_sql=BASELINE_SQL)
+        self.assertEqual((result.initial_version, result.final_version), (22, 22))
+        self.assertFalse(any("pragma foreign_key_check" in query for query in counted.statements))
+        with self.assertRaisesRegex(SchemaMigrationError, "validation_failed"):
+            await validate_turso_schema_full(self.connection)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ import hashlib
 from pathlib import Path
 import re
 import sys
+from time import perf_counter
 from typing import Any
 
 from app.database.schema_contract import (
@@ -23,6 +24,7 @@ from app.database.schema_contract import (
     classify_turso_schema,
     inspect_current_turso_schema,
 )
+from app.services.startup_timing import emit_startup_timing
 
 
 LEDGER_TABLE = "schema_migration_ledger"
@@ -337,39 +339,42 @@ async def _current_schema_fast_path(
     registry: MigrationRegistry,
     target_version: int,
 ) -> MigrationRunResult | None:
-    """Return a current result after one structural metadata round trip.
+    """Return current after a schema-only snapshot and ledger validation.
 
-    The normal path validates every required table, column, key, index,
-    FK/nullability rule, schema version, immutable migration ledger, and the
-    FK/integrity checks in the same server-side metadata snapshot.
+    The startup path checks every required table, column, key, index,
+    FK/nullability rule, schema version, and immutable migration ledger. It
+    deliberately does not scan user data with integrity_check or
+    foreign_key_check; those remain in full validation after migrations and
+    in explicit diagnostics.
     """
+    snapshot_started = perf_counter()
+    emit_startup_timing("schema", "fast_schema_snapshot_start", 0)
     inspection = await inspect_current_turso_schema(connection)
+    snapshot_elapsed = round((perf_counter() - snapshot_started) * 1000)
+    emit_startup_timing("schema", "fast_schema_snapshot_end", snapshot_elapsed)
     if inspection is None or inspection.report.state != SchemaState.CURRENT:
         return None
     if inspection.report.version != str(target_version) or not inspection.ledger_rows:
         return None
+    ledger_started = perf_counter()
     _validate_ledger_rows(
         inspection.ledger_rows,
         registry=registry,
         current_version=target_version,
     )
+    emit_startup_timing(
+        "schema", "ledger_validation", round((perf_counter() - ledger_started) * 1000)
+    )
     return MigrationRunResult(target_version, target_version, ())
 
 
-async def _validate_schema_postcondition(
+async def validate_turso_schema_full(
     connection: Any,
     *,
-    registry: MigrationRegistry,
-    target_version: int,
+    registry: MigrationRegistry = FORWARD_MIGRATIONS,
+    target_version: int = int(CURRENT_TURSO_BASELINE_VERSION),
 ) -> None:
-    """Validate bootstrap/migration output without a second full classifier."""
-    result = await _current_schema_fast_path(
-        connection, registry=registry, target_version=target_version
-    )
-    if result is not None:
-        return
-    # Compatibility fallback for a libSQL build without table-valued PRAGMA
-    # support. This is not used by the supported driver but preserves safety.
+    """Run the full read-only structural, FK, integrity, version, and ledger checks."""
     report = await classify_turso_schema(connection)
     if report.state != SchemaState.CURRENT:
         raise SchemaMigrationError("database_schema_migration_validation_failed")
@@ -380,6 +385,18 @@ async def _validate_schema_postcondition(
     if not rows:
         raise SchemaMigrationError("database_migration_ledger_missing")
     _validate_ledger_rows(rows, registry=registry, current_version=target_version)
+
+
+async def _validate_schema_postcondition(
+    connection: Any,
+    *,
+    registry: MigrationRegistry,
+    target_version: int,
+) -> None:
+    """After a write, verify full data and schema invariants before returning."""
+    await validate_turso_schema_full(
+        connection, registry=registry, target_version=target_version
+    )
 
 
 async def _adopt_version_into_ledger(
@@ -604,13 +621,23 @@ async def ensure_turso_schema_current(
     This is intentionally a mutating startup/initialize operation. Connection
     preflight must continue to use ``SELECT 1`` only.
     """
+    authority_started = perf_counter()
     fast_result = await _current_schema_fast_path(
         connection, registry=registry, target_version=target_version
     )
     if fast_result is not None:
+        emit_startup_timing(
+            "schema", "schema_authority_complete",
+            round((perf_counter() - authority_started) * 1000),
+        )
         return fast_result
 
+    emit_startup_timing("schema", "fallback_full_classify_start", 0)
+    classify_started = perf_counter()
     report = await classify_turso_schema(connection)
+    emit_startup_timing(
+        "schema", "fallback_full_classify_end", round((perf_counter() - classify_started) * 1000)
+    )
     bootstrapped = False
     adopted_legacy = False
     if report.state == SchemaState.EMPTY:
@@ -658,10 +685,15 @@ async def ensure_turso_schema_current(
     await _validate_schema_postcondition(
         connection, registry=registry, target_version=target_version
     )
-    return MigrationRunResult(
+    result = MigrationRunResult(
         result.initial_version,
         result.final_version,
         result.applied_migration_ids,
         adopted_legacy=adopted_legacy,
         bootstrapped=bootstrapped,
     )
+    emit_startup_timing(
+        "schema", "schema_authority_complete",
+        round((perf_counter() - authority_started) * 1000),
+    )
+    return result

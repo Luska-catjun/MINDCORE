@@ -17,6 +17,7 @@ import { SetupWizard } from "./components/SetupWizard";
 import { DesktopUpdater } from "./components/DesktopUpdater";
 import { invoke } from "@tauri-apps/api/core";
 import "./buildRevision";
+import { emitFrontendStartupTiming } from "./startupTiming";
 import { chatDebug } from "./chatDebug";
 import { DEFAULT_PERSONA_DISPLAY_NAME, DEFAULT_USER_DISPLAY_NAME } from "./assets";
 import { PersonaManager, type PersonaSummary } from "./components/PersonaManager";
@@ -27,7 +28,6 @@ const SOURCE_DEVICE = "web";
 const LEGACY_MAIN_CONVERSATION_STORAGE_KEY = "diana-main-conversation-id";
 const MAIN_CONVERSATION_STORAGE_KEY = "mindcore-main-conversation-id";
 const DEFAULT_CONVERSATION_TITLE = "MindCore conversation";
-
 type BackendStatus = "checking" | "connected" | "error";
 type AuthStatus = "checking" | "authenticated" | "unauthenticated";
 type SetupState = "checking" | "needed" | "configured";
@@ -74,6 +74,7 @@ function App() {
   }, []);
 
   const loadMainConversation = useCallback(async (expectedGeneration: number) => {
+    if (isDesktopRuntime()) emitFrontendStartupTiming("conversation_load_start");
     setConversationLoading(true);
     try {
       const conversations = await api.listConversations(200);
@@ -100,6 +101,7 @@ function App() {
           : "MindCore 대화를 준비하는 중 오류가 발생했습니다."
       );
     } finally {
+      if (isDesktopRuntime()) emitFrontendStartupTiming("conversation_load_end");
       if (expectedGeneration === sessionGenerationRef.current) setConversationLoading(false);
     }
   }, [activePersonaId]);
@@ -138,30 +140,25 @@ function App() {
       setStartupProgress(18);
       if (isDesktopRuntime()) {
         try {
-          // Native start is idempotent for a healthy managed child and creates
-          // a new generation after a crash or completed stop.
+          // Native readiness is authoritative for the managed desktop child:
+          // its 204 is served only after the backend lifespan (DB/schema and
+          // runtime hydration) has completed. Do not gate it on an additional
+          // /health request, which performs another remote DB round trip.
           await invoke("start_mindcore_backend");
+          emitFrontendStartupTiming("native_ready");
+          if (!cancelled) { setStartupProgress(100); setBackendStatus("connected"); }
+          return;
         } catch {
           if (!cancelled) setBackendStatus("error");
           return;
         }
       }
-      // The packaged sidecar normally starts in well under a second. Polling
-      // avoids an authentication/API storm while it is still coming up.
-      const deadline = Date.now() + (isDesktopRuntime() ? 30_000 : 0);
-      do {
-        try {
-          await api.health();
-          if (!cancelled) { setStartupProgress(100); setBackendStatus("connected"); }
-          return;
-        } catch {
-          if (!isDesktopRuntime() || Date.now() >= deadline) {
-            if (!cancelled) setBackendStatus("error");
-            return;
-          }
-          await new Promise((resolve) => window.setTimeout(resolve, 250));
-        }
-      } while (!cancelled);
+      try {
+        await api.health();
+        if (!cancelled) { setStartupProgress(100); setBackendStatus("connected"); }
+      } catch {
+        if (!cancelled) setBackendStatus("error");
+      }
     };
     void checkHealth();
     const progressTimer = window.setInterval(() => setStartupProgress((value) => value < 90 ? Math.min(90, value + 2) : value), 700);
@@ -185,6 +182,7 @@ function App() {
       setActivePersonaId(session.persona_id || null);
       setPersonaDisplayName(session.persona_display_name || DEFAULT_PERSONA_DISPLAY_NAME);
       setUserDisplayName(session.user_display_name || DEFAULT_USER_DISPLAY_NAME);
+      if (isDesktopRuntime()) emitFrontendStartupTiming("authenticated_session");
       setAuthStatus("authenticated");
     }).catch((error) => {
       if (expectedGeneration !== sessionGenerationRef.current) return;

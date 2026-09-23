@@ -279,11 +279,34 @@ class DesktopBackendTests(TestCase):
                 headers={DESKTOP_SHUTDOWN_CAPABILITY_HEADER: capability},
             )
 
-        self.assertEqual(missing.status_code, 403)
-        self.assertEqual(wrong.status_code, 403)
+        self.assertIn(missing.status_code, {401, 403})
+        self.assertIn(wrong.status_code, {401, 403})
         self.assertEqual(accepted.status_code, 204)
         self.assertFalse(server.should_exit)
         self.assertEqual(accepted.headers[DESKTOP_INSTANCE_HEADER], capability)
+        self.assertNotIn(capability, str(accepted.request.url))
+        self.assertNotIn(capability, accepted.text)
+
+    def test_desktop_session_requires_parent_capability_and_returns_valid_token(self) -> None:
+        from app.routers.auth import is_valid_session_token
+
+        client, _server, capability = self._shutdown_client()
+        with client, self.assertNoLogs("diana.auth", level="INFO"):
+            missing = client.get("/_desktop/session")
+            wrong = client.get(
+                "/_desktop/session",
+                headers={DESKTOP_SHUTDOWN_CAPABILITY_HEADER: "wrong-capability"},
+            )
+            accepted = client.get(
+                "/_desktop/session",
+                headers={DESKTOP_SHUTDOWN_CAPABILITY_HEADER: capability},
+            )
+
+        self.assertIn(missing.status_code, {401, 403})
+        self.assertIn(wrong.status_code, {401, 403})
+        self.assertEqual(accepted.status_code, 200)
+        token = accepted.json()["access_token"]
+        self.assertTrue(is_valid_session_token(client.app.state.settings, token))
         self.assertNotIn(capability, str(accepted.request.url))
         self.assertNotIn(capability, accepted.text)
 

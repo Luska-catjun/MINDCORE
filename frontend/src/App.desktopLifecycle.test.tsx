@@ -68,6 +68,7 @@ describe("desktop backend lifecycle recovery", () => {
 
     await waitFor(() => expect(startCalls).toBe(2));
     expect(await screen.findByText("Main Chat")).toBeTruthy();
+    expect(apiMock.health).not.toHaveBeenCalled();
   });
 
   it("Restart MindCore invokes native start before retrying the session", async () => {
@@ -96,5 +97,6 @@ describe("desktop backend lifecycle recovery", () => {
       expect(invoke.mock.calls.filter(([command]) => command === "start_mindcore_backend")).toHaveLength(2);
     });
     expect(await screen.findByText("Main Chat")).toBeTruthy();
+    expect(apiMock.health).not.toHaveBeenCalled();
   });
 });

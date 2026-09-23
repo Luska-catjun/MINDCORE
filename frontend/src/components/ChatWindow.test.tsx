@@ -8,6 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("../api/client", () => ({
   api: { listMessages, sendChatMessage: vi.fn() },
   ApiError: class ApiError extends Error {},
+  isDesktopRuntime: () => true,
 }));
 
 import { ChatWindow } from "./ChatWindow";

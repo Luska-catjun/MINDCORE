@@ -538,11 +538,12 @@ async def _batched_metadata(connection: Any, tables: set[str]) -> tuple[
 
 
 async def inspect_current_turso_schema(connection: Any) -> CurrentSchemaInspection | None:
-    """Inspect a fully provisioned current DB in one remote round trip.
+    """Inspect current schema structure without scanning user data.
 
     Missing metadata/ledger tables make the UNION fail; callers then use the
-    general classifier.  The query contains identifiers and schema metadata
-    only, never user rows.
+    general classifier. This startup snapshot checks schema metadata only:
+    integrity_check and foreign_key_check scan durable user data and are kept
+    in the explicit full classifier path. The query never reads row content.
     """
     query = f"""
 select 'table' as kind, name as owner, type as name, '' as v1, '' as v2,
@@ -569,12 +570,6 @@ union all
 select 'ledger', '{MIGRATION_LEDGER_TABLE}', migration_id, cast(from_version as text),
        cast(to_version as text), checksum, applied_at, ''
 from {MIGRATION_LEDGER_TABLE}
-union all
-select 'fk_check', [table], cast(rowid as text), parent, cast(fkid as text), '', '', ''
-from pragma_foreign_key_check
-union all
-select 'integrity', '', integrity_check, '', '', '', '', ''
-from pragma_integrity_check
 """
     try:
         rows = await connection.fetch(query)
@@ -586,7 +581,6 @@ from pragma_integrity_check
     foreign_keys: dict[str, list[dict[str, Any]]] = {}
     version: str | None = None
     ledger_rows: list[dict[str, Any]] = []
-    data_invariant_errors: list[str] = []
     for row in rows:
         kind = str(row["kind"])
         owner = str(row["owner"])
@@ -618,17 +612,13 @@ from pragma_integrity_check
                     "applied_at": row["v4"],
                 }
             )
-        elif kind == "fk_check":
-            data_invariant_errors.append("foreign_key_check")
-        elif kind == "integrity" and str(row["name"]) != "ok":
-            data_invariant_errors.append("integrity_check")
     report = _report_from_metadata(
         tables=tables,
         table_info=table_info,
         index_info=index_info,
         foreign_keys=foreign_keys,
         version=version,
-        data_invariant_errors=tuple(data_invariant_errors),
+        data_invariant_errors=(),
     )
     return CurrentSchemaInspection(report, tuple(ledger_rows))
 

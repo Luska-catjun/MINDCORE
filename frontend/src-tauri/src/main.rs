@@ -589,36 +589,61 @@ fn setup_action(app: &AppHandle, action: &str, draft: &SetupDraft) -> Result<Str
 }
 fn ensure_desktop_auth(app: &AppHandle) -> Result<(), String> {
     let config = config_path(app)?;
-    let output = tauri::async_runtime::block_on(
-        sidecar(app)?
-            .args(["--desktop-ensure-auth", "--config"])
-            .arg(&config)
-            .output(),
-    )
-    .map_err(|_| "MindCore desktop authentication could not be prepared.".to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err("MindCore desktop authentication could not be prepared.".into())
-    }
+    ensure_desktop_auth_config(&config)
 }
-fn desktop_session(app: &AppHandle) -> Result<String, String> {
-    ensure_desktop_auth(app)?;
-    let config = config_path(app)?;
-    let output = tauri::async_runtime::block_on(
-        sidecar(app)?
-            .args(["--desktop-print-session", "--config"])
-            .arg(&config)
-            .output(),
-    )
-    .map_err(|_| "MindCore desktop session could not start.".to_string())?;
-    if output.status.success() {
-        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !token.is_empty() {
-            return Ok(token);
+
+fn ensure_desktop_auth_config(config: &Path) -> Result<(), String> {
+    let text = fs::read_to_string(config)
+        .map_err(|_| "MindCore desktop authentication could not be prepared.".to_string())?;
+    let keys: std::collections::HashSet<&str> = text
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(key, _)| key))
+        .collect();
+    let mut additions = Vec::new();
+    for key in ["PRIVATE_ACCESS_PASSWORD", "AUTH_SIGNING_SECRET"] {
+        if !keys.contains(key) {
+            additions.push(format!("{key}={}", new_auth_secret()?));
         }
     }
-    Err("MindCore desktop session could not start.".into())
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(config, fs::Permissions::from_mode(0o600))
+            .map_err(|_| "MindCore desktop authentication could not be prepared.".to_string())?;
+    }
+    if additions.is_empty() {
+        return Ok(());
+    }
+    let mut updated = text;
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&additions.join("\n"));
+    updated.push('\n');
+    atomic_write(config, &updated)
+}
+
+fn new_auth_secret() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|_| "MindCore desktop authentication could not be prepared.".to_string())?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+fn desktop_session(app: &AppHandle) -> Result<String, String> {
+    let session_started = Instant::now();
+    startup_timing("desktop_session_enter", session_started);
+    let capability = app
+        .state::<Sidecar>()
+        .lifecycle
+        .lock()
+        .map_err(|_| "MindCore desktop session could not start.".to_string())?
+        .current_capability()
+        .ok_or_else(|| "MindCore desktop session could not start.".to_string())?;
+    startup_timing("desktop_session_capability_ready", session_started);
+    let token = request_desktop_session(&capability)
+        .ok_or_else(|| "MindCore desktop session could not start.".to_string())?;
+    startup_timing("desktop_session_process_done", session_started);
+    Ok(token)
 }
 fn new_shutdown_capability() -> Result<String, String> {
     let mut bytes = [0_u8; 32];
@@ -628,6 +653,32 @@ fn new_shutdown_capability() -> Result<String, String> {
 }
 fn lifecycle_request(method: &str, path: &str, capability: &str) -> String {
     format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{SHUTDOWN_CAPABILITY_HEADER}: {capability}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+}
+fn desktop_session_response_token(response: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct SessionResponse {
+        access_token: String,
+    }
+    let text = std::str::from_utf8(response).ok()?;
+    let (headers, body) = text.split_once("\r\n\r\n")?;
+    let status_ok = headers.lines().next()?.split_whitespace().nth(1) == Some("200");
+    if !status_ok || body.len() > 4096 {
+        return None;
+    }
+    let parsed: SessionResponse = serde_json::from_str(body).ok()?;
+    (!parsed.access_token.is_empty()).then_some(parsed.access_token)
+}
+fn request_desktop_session(capability: &str) -> Option<String> {
+    let address = SocketAddr::from(([127, 0, 0, 1], DESKTOP_PORT));
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream
+        .write_all(lifecycle_request("GET", "/_desktop/session", capability).as_bytes())
+        .ok()?;
+    let mut response = Vec::with_capacity(512);
+    stream.take(8192).read_to_end(&mut response).ok()?;
+    desktop_session_response_token(&response)
 }
 fn readiness_response_is_current(response: &[u8], capability: &str) -> bool {
     let Ok(text) = std::str::from_utf8(response) else {
@@ -642,10 +693,14 @@ fn readiness_response_is_current(response: &[u8], capability: &str) -> bool {
             })
         })
 }
-fn request_instance_readiness(capability: &str) -> bool {
+struct ReadinessAttempt {
+    tcp_connected: bool,
+    ready: bool,
+}
+fn request_instance_readiness(capability: &str) -> ReadinessAttempt {
     let address = SocketAddr::from(([127, 0, 0, 1], DESKTOP_PORT));
     let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(150)) else {
-        return false;
+        return ReadinessAttempt { tcp_connected: false, ready: false };
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(150)));
@@ -653,7 +708,7 @@ fn request_instance_readiness(capability: &str) -> bool {
         .write_all(lifecycle_request("GET", "/_desktop/ready", capability).as_bytes())
         .is_err()
     {
-        return false;
+        return ReadinessAttempt { tcp_connected: true, ready: false };
     }
     let mut response = Vec::with_capacity(256);
     let mut chunk = [0_u8; 128];
@@ -666,10 +721,13 @@ fn request_instance_readiness(capability: &str) -> bool {
                     break;
                 }
             }
-            Err(_) => return false,
+            Err(_) => return ReadinessAttempt { tcp_connected: true, ready: false },
         }
     }
-    readiness_response_is_current(&response, capability)
+    ReadinessAttempt {
+        tcp_connected: true,
+        ready: readiness_response_is_current(&response, capability),
+    }
 }
 fn local_backend_port_is_occupied() -> bool {
     TcpStream::connect_timeout(
@@ -678,16 +736,45 @@ fn local_backend_port_is_occupied() -> bool {
     )
     .is_ok()
 }
-fn start_sidecar(app: &AppHandle) -> Result<(), String> {
-    if !config_is_complete(app)? {
-        return Err("MindCore setup is incomplete.".into());
+fn startup_timing(operation: &str, started: Instant) {
+    // Fixed operation labels only; never include config, profile, or child output.
+    eprintln!(
+        "MINDCORE_STARTUP_TIMING phase=native operation={} elapsed_ms={}",
+        operation,
+        started.elapsed().as_millis()
+    );
+}
+fn safe_python_startup_timing_line(line: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(line);
+    let marker = "MINDCORE_STARTUP_TIMING ";
+    let payload = text.split_once(marker)?.1.trim();
+    let mut fields = payload.split_whitespace();
+    let phase = fields.next()?.strip_prefix("phase=")?;
+    let operation = fields.next()?.strip_prefix("operation=")?;
+    let elapsed = fields.next()?.strip_prefix("elapsed_ms=")?;
+    if fields.next().is_some() || elapsed.is_empty() || !elapsed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
     }
-    ensure_desktop_auth(app)?;
-    let profile = active_profile(app)?;
-    let overrides = persona_registry::profile_overrides(&profile)?;
-    let mut command = sidecar(app)?;
-    let config = config_path(app)?;
-    let shutdown_capability = new_shutdown_capability()?;
+    let allowed = matches!(
+        (phase, operation),
+        ("settings", "settings_load")
+            | ("identity", "identity_load")
+            | ("database_connect", "pool_create" | "pool_acquire" | "select_1")
+            | ("schema", "fast_schema_snapshot_start" | "fast_schema_snapshot_end" | "ledger_validation" | "fallback_full_classify_start" | "fallback_full_classify_end" | "schema_authority_complete")
+            | ("hydration", "narrative_start" | "narrative_end" | "self_model_start" | "self_model_end")
+            | ("recovery", "recovery_task_schedule")
+            | ("uvicorn", "lifespan_complete" | "ready_route_registered")
+            | ("health", "database_check")
+    );
+    allowed.then(|| {
+        format!(
+            "MINDCORE_STARTUP_TIMING phase={phase} operation={operation} elapsed_ms={elapsed}"
+        )
+    })
+}
+fn start_sidecar(app: &AppHandle) -> Result<(), String> {
+    let startup_started = Instant::now();
+    startup_timing("start_sidecar_enter", startup_started);
     let state = app.state::<Sidecar>();
     let generation = match state
         .lifecycle
@@ -697,13 +784,55 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
     {
         StartDecision::AlreadyRunning => return Ok(()),
         StartDecision::InProgress => {
-            // The native setup start is authoritative. A frontend start call
-            // arriving while that generation is still becoming ready should
-            // poll health, not surface a false lifecycle failure or spawn a
-            // second child.
-            return Ok(());
+            // Concurrent callers share the in-flight readiness result rather
+            // than returning success before the managed child is usable.
+            let deadline = Instant::now() + STARTUP_TIMEOUT;
+            loop {
+                let lifecycle = state.lifecycle.lock().expect("sidecar lifecycle lock");
+                if lifecycle.is_running() {
+                    return Ok(());
+                }
+                if lifecycle.is_inactive() {
+                    return Err("MindCore backend exited before becoming ready.".into());
+                }
+                drop(lifecycle);
+                if Instant::now() >= deadline {
+                    return Err("MindCore backend startup timed out before readiness.".into());
+                }
+                thread::sleep(STARTUP_POLL_INTERVAL);
+            }
         }
         StartDecision::Spawn { generation } => generation,
+    };
+    let prepared = (|| {
+        if !config_is_complete(app)? {
+            return Err("MindCore setup is incomplete.".to_string());
+        }
+        startup_timing("config_complete_done", startup_started);
+        startup_timing("desktop_auth_start", startup_started);
+        ensure_desktop_auth(app)?;
+        startup_timing("desktop_auth_end", startup_started);
+        let profile = active_profile(app)?;
+        startup_timing("profile_load_done", startup_started);
+        let overrides = persona_registry::profile_overrides(&profile)?;
+        startup_timing("profile_overrides_done", startup_started);
+        let command = sidecar(app)?;
+        let config = config_path(app)?;
+        startup_timing("config_path_done", startup_started);
+        let shutdown_capability = new_shutdown_capability()?;
+        startup_timing("capability_generated", startup_started);
+        Ok((profile, overrides, command, config, shutdown_capability))
+    })();
+    let (profile, overrides, mut command, config, shutdown_capability) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            state
+                .lifecycle
+                .lock()
+                .expect("sidecar lifecycle lock")
+                .fail_start(generation);
+            return Err(error);
+        }
     };
     if local_backend_port_is_occupied() {
         state
@@ -716,6 +845,7 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
                 .into(),
         );
     }
+    startup_timing("port_check_done", startup_started);
     for (key, value) in overrides {
         command = command.env(key, value);
     }
@@ -723,15 +853,20 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
         .env("PERSONA_ID", &profile.persona_id)
         .env("PERSONA_DISPLAY_NAME", &profile.display_name)
         .env("PERSONA_IDENTITY_PATH", &profile.identity_path);
+    startup_timing("sidecar_command_prepared", startup_started);
     let port = DESKTOP_PORT.to_string();
     let pid = std::process::id().to_string();
+    startup_timing("sidecar_spawn_start", startup_started);
     let spawned = command
         .args(["--port", &port, "--parent-pid", &pid])
         .env("MINDCORE_ENV_FILE", config)
         .env(SHUTDOWN_CAPABILITY_ENV, &shutdown_capability)
         .spawn();
     let (mut events, child) = match spawned {
-        Ok(spawned) => spawned,
+        Ok(spawned) => {
+            startup_timing("sidecar_spawn_success", startup_started);
+            spawned
+        }
         Err(_) => {
             state
                 .lifecycle
@@ -754,6 +889,11 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn(async move {
         while let Some(event) = events.recv().await {
             match event {
+                CommandEvent::Stdout(line) | CommandEvent::Stderr(line) => {
+                    if let Some(safe_line) = safe_python_startup_timing_line(&line) {
+                        eprintln!("{safe_line}");
+                    }
+                }
                 CommandEvent::Terminated(_) => {
                     let _ = lifecycle
                         .lock()
@@ -773,6 +913,8 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
         }
     });
     let deadline = Instant::now() + STARTUP_TIMEOUT;
+    startup_timing("ready_poll_start", startup_started);
+    let mut tcp_accept_logged = false;
     loop {
         if !state
             .lifecycle
@@ -782,7 +924,14 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
         {
             return Err("MindCore backend exited before becoming ready.".into());
         }
-        if request_instance_readiness(&shutdown_capability) {
+        let readiness = request_instance_readiness(&shutdown_capability);
+        if readiness.tcp_connected && !tcp_accept_logged {
+            startup_timing("port_listen_detected", startup_started);
+            startup_timing("first_tcp_accept", startup_started);
+            tcp_accept_logged = true;
+        }
+        if readiness.ready {
+            startup_timing("ready_success", startup_started);
             if state
                 .lifecycle
                 .lock()
@@ -806,6 +955,7 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
     {
         let _ = child.kill();
     }
+    startup_timing("ready_timeout", startup_started);
     Err("MindCore backend startup timed out before readiness.".into())
 }
 
@@ -1071,11 +1221,14 @@ fn delete_persona(
 
 #[tauri::command]
 fn get_setup_status(app: AppHandle) -> Result<SetupStatus, String> {
-    Ok(SetupStatus {
+    let started = Instant::now();
+    let status = SetupStatus {
         configured: config_is_complete(&app)?,
         config_path: config_path(&app)?.to_string_lossy().into(),
         identity_path: identity_path(&app)?.to_string_lossy().into(),
-    })
+    };
+    startup_timing("setup_status_done", started);
+    Ok(status)
 }
 #[tauri::command]
 fn get_runtime_capabilities() -> RuntimeCapabilities {
@@ -1217,7 +1370,28 @@ fn startup_failure_category(error: &str) -> &'static str {
 }
 #[tauri::command]
 fn get_desktop_session(app: AppHandle) -> Result<String, String> {
-    desktop_session(&app)
+    let started = Instant::now();
+    let result = desktop_session(&app);
+    startup_timing("desktop_session_done", started);
+    result
+}
+#[tauri::command]
+fn report_frontend_startup_stage(operation: String, elapsed_ms: u64) {
+    if matches!(
+        operation.as_str(),
+        "native_ready"
+            | "authenticated_session"
+            | "conversation_load_start"
+            | "conversation_load_end"
+            | "chat_history_start"
+            | "chat_history_end"
+            | "chat_ready"
+    ) {
+        eprintln!(
+            "MINDCORE_STARTUP_TIMING phase=frontend operation={} elapsed_ms={}",
+            operation, elapsed_ms
+        );
+    }
 }
 fn open_managed_path(path: &Path) -> Result<(), String> {
     let mut command = if cfg!(target_os = "windows") {
@@ -1622,6 +1796,28 @@ MINDCORE_SETUP_DIAGNOSTIC phase=database_bootstrap action=initialize category=sc
     }
 
     #[test]
+    fn python_startup_timing_forwarder_only_accepts_fixed_safe_fields() {
+        assert_eq!(
+            safe_python_startup_timing_line(
+                b"INFO diana.startup MINDCORE_STARTUP_TIMING phase=database_connect operation=pool_acquire elapsed_ms=123\n"
+            ),
+            Some("MINDCORE_STARTUP_TIMING phase=database_connect operation=pool_acquire elapsed_ms=123".into())
+        );
+        assert_eq!(
+            safe_python_startup_timing_line(
+                b"MINDCORE_STARTUP_TIMING phase=database_connect operation=pool_acquire elapsed_ms=123 token=secret"
+            ),
+            None
+        );
+        assert_eq!(
+            safe_python_startup_timing_line(
+                b"MINDCORE_STARTUP_TIMING phase=database_connect operation=secret elapsed_ms=123"
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn lifecycle_capability_is_sent_in_a_header_not_the_url() {
         let capability = "test-capability";
         let shutdown = graceful_shutdown_request(capability);
@@ -1650,6 +1846,45 @@ MINDCORE_SETUP_DIAGNOSTIC phase=database_bootstrap action=initialize category=sc
             capability,
         ));
     }
+
+    #[test]
+    fn desktop_session_response_requires_success_and_nonempty_token() {
+        let accepted = desktop_session_response_token(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 24\r\n\r\n{\"access_token\":\"abc\"}",
+        );
+        assert_eq!(accepted.as_deref(), Some("abc"));
+        assert!(desktop_session_response_token(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\n\r\n{}"
+        )
+        .is_none());
+        assert!(desktop_session_response_token(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\n{\"access_token\":\"\"}"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn desktop_auth_config_adds_only_missing_secrets_and_is_owner_only() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config = directory.path().join("mindcore.env");
+        fs::write(&config, "DATABASE_URL=libsql://example\nPRIVATE_ACCESS_PASSWORD=existing\n")
+            .expect("write config");
+        ensure_desktop_auth_config(&config).expect("provision auth");
+        let content = fs::read_to_string(&config).expect("read config");
+        assert!(content.contains("PRIVATE_ACCESS_PASSWORD=existing\n"));
+        let signing_secret = content
+            .lines()
+            .find_map(|line| line.strip_prefix("AUTH_SIGNING_SECRET="))
+            .expect("new signing secret");
+        assert_eq!(signing_secret.len(), 64);
+        ensure_desktop_auth_config(&config).expect("idempotent auth provisioning");
+        assert_eq!(fs::read_to_string(&config).expect("reread config"), content);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&config).expect("metadata").permissions().mode() & 0o777, 0o600);
+        }
+    }
 }
 fn main() {
     let app = tauri::Builder::default()
@@ -1667,6 +1902,7 @@ fn main() {
             save_mindcore_config,
             start_mindcore_backend,
             get_desktop_session,
+            report_frontend_startup_stage,
             stop_mindcore_backend,
             open_configuration_folder,
             open_identity_file,
@@ -1685,9 +1921,9 @@ fn main() {
                 lifecycle: Arc::new(Mutex::new(SidecarLifecycle::new())),
             });
             app.manage(PersonaRegistryLock(Mutex::new(())));
-            if config_is_complete(&app.handle())? {
-                let _ = start_sidecar(&app.handle());
-            }
+            // start_sidecar owns the completeness check; avoid reading and
+            // migrating the same registry twice during native startup.
+            let _ = start_sidecar(&app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())

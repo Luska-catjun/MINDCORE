@@ -1,9 +1,11 @@
 import asyncpg
 from fastapi import APIRouter, Request
 import logging
+from time import perf_counter
 
 from app.database.connection import check_database, parse_supabase_db_url
 from app.services.error_safety import safe_database_diagnostic
+from app.services.startup_timing import emit_startup_timing
 
 router = APIRouter(tags=["health"])
 logger = logging.getLogger("diana.database")
@@ -33,6 +35,8 @@ async def health(request: Request) -> dict[str, str]:
             )
 
     database_url = settings.database_url if settings.database_backend.lower() == "turso" else settings.supabase_db_url
+    check_started = perf_counter()
     db_status = await check_database(pool, host=host, port=port, database_url=database_url)
+    emit_startup_timing("health", "database_check", round((perf_counter() - check_started) * 1000))
     status = "ok" if db_status == "connected" else "degraded"
     return {"status": status, "db": db_status}
