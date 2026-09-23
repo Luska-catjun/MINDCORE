@@ -75,10 +75,21 @@ async def apply_sql(connection: TursoConnection, sql: str) -> None:
 
 def unversioned_released_v21_sql() -> str:
     sql = BASELINE_SQL.replace(
-        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','23');",
+        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','24');",
         "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','21');",
         1,
     )
+    start = sql.index("-- OBJECT table autonomy_executions (schema 24)")
+    end = sql.index("-- OBJECT table preference_evidence", start)
+    sql = sql[:start] + sql[end:]
+    for name in (
+        "uq_autonomy_execution_active_dedupe", "idx_autonomy_executions_recovery",
+        "idx_autonomy_executions_conversation", "idx_autonomy_executions_anchor_failures",
+    ):
+        start = sql.find(f"-- OBJECT index {name}\n")
+        if start >= 0:
+            end = sql.index(";\n", start) + 2
+            sql = sql[:start] + sql[end:]
     start = sql.index("-- OBJECT table chat_turns (schema 23)")
     end = sql.index("-- OBJECT table preference_evidence", start)
     sql = sql[:start] + sql[end:]
@@ -93,6 +104,14 @@ def unversioned_released_v21_sql() -> str:
         "",
         1,
     )
+    for name in (
+        "uq_autonomy_execution_active_dedupe", "idx_autonomy_executions_recovery",
+        "idx_autonomy_executions_conversation", "idx_autonomy_executions_anchor_failures",
+    ):
+        start = sql.find(f"-- OBJECT index {name}\n")
+        if start >= 0:
+            end = sql.index(";\n", start) + 2
+            sql = sql[:start] + sql[end:]
     return sql.replace(
         "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n"
         "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','21');\n",
@@ -229,7 +248,7 @@ class TursoSchemaContractTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_fresh_bootstrap_and_repeat_initialize(self) -> None:
-        self.assertEqual(await bootstrap(self.pool.connection), "TURSO_BOOTSTRAP_OK version=23")
+        self.assertEqual(await bootstrap(self.pool.connection), "TURSO_BOOTSTRAP_OK version=24")
         await self.pool.connection.execute(
             "insert into conversations(conversation_id,source_device,started_at,ended_at) "
             "values ('preserved-user-row','desktop','2026-09-06T00:00:00Z',null)"
@@ -347,7 +366,7 @@ class TursoSchemaContractTests(unittest.IsolatedAsyncioTestCase):
             await self.pool.connection.fetchval(
                 "select value from schema_metadata where key='turso_baseline_version'"
             ),
-            "23",
+            "24",
         )
         self.assertEqual(
             await self.pool.connection.fetchval(
@@ -382,7 +401,7 @@ class TursoSchemaContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_complete_versionless_schema_is_compatible_legacy(self) -> None:
         legacy_sql = BASELINE_SQL.replace(
             "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n"
-            "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','23');\n",
+            "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','24');\n",
             "",
             1,
         )

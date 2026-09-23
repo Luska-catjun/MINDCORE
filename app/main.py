@@ -22,6 +22,7 @@ from app.services.mindcore.autonomy_runtime import (
     AutonomyRuntimeState,
     run_autonomy_scheduler,
 )
+from app.services.mindcore.autonomy_execution_store import recover_incomplete_autonomy_executions
 from app.services.mindcore.self_model import hydrate_self_model_snapshot
 from app.services.mindcore.snapshot_scope import CognitiveSnapshotScope
 from app.services.turn_recovery import recover_incomplete_turns
@@ -138,28 +139,43 @@ def build_lifespan(
         )
     app.state.autonomy_scheduler_task = None
     app.state.autonomy_runtime_state = None
-    if (
-        settings.proactive_enabled
-        and bool(os.environ.get("MINDCORE_DESKTOP_SHUTDOWN_CAPABILITY"))
+    app.state.autonomy_recovery_task = None
+    desktop_autonomy_runtime = (
+        bool(os.environ.get("MINDCORE_DESKTOP_SHUTDOWN_CAPABILITY"))
         and settings.database_backend.lower() == "turso"
         and hasattr(app.state.db_pool, "acquire")
         and not getattr(app.state.db_pool, "isolated", False)
-    ):
+    )
+    if desktop_autonomy_runtime:
+        async def recover_autonomy_after_turns() -> dict[str, int] | None:
+            try:
+                recovery = app.state.turn_recovery_task
+                if recovery is not None:
+                    await recovery
+                return await recover_incomplete_autonomy_executions(
+                    app.state.db_pool,
+                    persona_id=str(settings.persona_id),
+                    now=datetime.now(timezone.utc),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logging.getLogger("diana.autonomy.runtime").warning(
+                    "AUTONOMY_CYCLE status=not_started reason=recovery_failed category=%s",
+                    type(error).__name__,
+                )
+                return None
+
+        app.state.autonomy_recovery_task = asyncio.create_task(recover_autonomy_after_turns())
+    if settings.proactive_enabled and desktop_autonomy_runtime:
         runtime_state = AutonomyRuntimeState(started_at=datetime.now(timezone.utc))
         app.state.autonomy_runtime_state = runtime_state
 
         async def start_after_recovery() -> None:
-            recovery = app.state.turn_recovery_task
+            recovery = app.state.autonomy_recovery_task
             if recovery is not None:
-                try:
-                    await recovery
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
-                    logging.getLogger("diana.autonomy.runtime").warning(
-                        "AUTONOMY_CYCLE status=not_started reason=recovery_failed category=%s",
-                        type(error).__name__,
-                    )
+                recovered = await recovery
+                if recovered is None:
                     return
             await run_autonomy_scheduler(
                 pool=app.state.db_pool,
@@ -185,6 +201,11 @@ def build_lifespan(
             recovery_task.cancel()
             with suppress(asyncio.CancelledError):
                 await recovery_task
+        autonomy_recovery_task = app.state.autonomy_recovery_task
+        if autonomy_recovery_task is not None and not autonomy_recovery_task.done():
+            autonomy_recovery_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await autonomy_recovery_task
         if db_pool_factory is None:
             await close_pool(app.state.db_pool)
   return lifespan

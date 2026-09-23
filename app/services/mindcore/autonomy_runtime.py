@@ -23,6 +23,9 @@ from app.services.mindcore.proactive_execution import (
     ProactiveExecutionError,
     execute_proactive_intention,
 )
+from app.services.mindcore.autonomy_execution_store import (
+    get_execution_gate,
+)
 from app.services.mindcore.trigger_context import get_trigger_snapshot
 
 
@@ -230,6 +233,22 @@ async def _run_cycle_once(
     ):
         return AutonomyCycleResult("skipped", "same_intention", str(decision.action_class), intention.intention_key)
 
+    durable_blocked, durable_retry_after = await get_execution_gate(
+        pool,
+        persona_id=str(settings.persona_id),
+        intention_key=intention.intention_key,
+        user_activity_anchor_message_id=durable.latest_user_message_id,
+        now=current,
+    )
+    if durable_blocked:
+        return AutonomyCycleResult(
+            "skipped", "same_intention_durable", str(decision.action_class), intention.intention_key
+        )
+    if durable_retry_after is not None and current < durable_retry_after:
+        return AutonomyCycleResult(
+            "skipped", "failure_backoff_durable", str(decision.action_class), intention.intention_key
+        )
+
     guard = lambda: _still_eligible(
         pool, settings, current, runtime, intention.intention_key,
         durable.latest_user_message_id or "",
@@ -243,8 +262,15 @@ async def _run_cycle_once(
             identity_prompt=identity_prompt,
             now=current,
             pre_provider_guard=guard,
+            autonomy_context={
+                "user_activity_anchor_message_id": durable.latest_user_message_id,
+            },
         )
     except ProactiveExecutionError as error:
+        if error.category == "autonomy_execution_duplicate":
+            return AutonomyCycleResult(
+                "skipped", "same_intention_durable", str(decision.action_class), intention.intention_key
+            )
         if error.category == "execution_gate_changed":
             return AutonomyCycleResult("skipped", "user_or_policy_changed", str(decision.action_class), intention.intention_key)
         raise

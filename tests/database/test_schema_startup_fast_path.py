@@ -76,7 +76,7 @@ class CurrentSchemaStartupFastPathTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.database.migrations.classify_turso_schema", classifier):
             result = await ensure_turso_schema_current(counted, baseline_sql=BASELINE_SQL)
 
-        self.assertEqual((result.initial_version, result.final_version), (23, 23))
+        self.assertEqual((result.initial_version, result.final_version), (24, 24))
         self.assertEqual(counted.read_round_trips, 1)
         self.assertEqual(counted.execute_round_trips, 0)
         joined = " ".join(counted.statements)
@@ -133,7 +133,7 @@ class CurrentSchemaStartupFastPathTests(unittest.IsolatedAsyncioTestCase):
 
         counted = CountingConnection(self.connection)
         result = await ensure_turso_schema_current(counted, baseline_sql=BASELINE_SQL)
-        self.assertEqual((result.initial_version, result.final_version), (23, 23))
+        self.assertEqual((result.initial_version, result.final_version), (24, 24))
         self.assertFalse(any("pragma foreign_key_check" in query for query in counted.statements))
         with self.assertRaisesRegex(SchemaMigrationError, "validation_failed"):
             await validate_turso_schema_full(self.connection)
@@ -193,7 +193,7 @@ class CurrentSchemaStartupFastPathTests(unittest.IsolatedAsyncioTestCase):
                             """insert into schema_migration_ledger(
                                 migration_id,from_version,to_version,checksum,applied_at
                             ) values($1,$2,$3,$4,$5)""",
-                            "baseline_v23", 23, 23, _baseline_checksum(23), "test",
+                            "baseline_v24", 24, 24, _baseline_checksum(24), "test",
                         )
 
                     counted = CountingConnection(connection)

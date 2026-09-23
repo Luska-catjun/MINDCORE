@@ -5,6 +5,7 @@ conversation and the active Persona-scoped database/settings explicitly.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -26,6 +27,12 @@ from app.schemas.messages import MessageCreate
 from app.services.llm import generate_reply
 from app.services.memory_service import build_dynamic_context, get_recent_conversation_messages
 from app.services.turn_durability import TurnDurability
+from app.services.mindcore.autonomy_execution_store import (
+    mark_complete as mark_autonomy_execution_complete,
+    mark_failed_safe,
+    mark_provider_started,
+    reserve_autonomy_execution,
+)
 
 
 logger = logging.getLogger("diana.autonomy.proactive")
@@ -205,6 +212,7 @@ async def execute_proactive_intention(
     identity_prompt: str,
     provider: ProviderGenerator = generate_reply,
     pre_provider_guard: ExecutionGuard | None = None,
+    autonomy_context: dict[str, str] | None = None,
     now: datetime | None = None,
 ) -> ProactiveExecutionResult:
     """Generate and durably save exactly one Persona message for an M6 intent.
@@ -233,13 +241,32 @@ async def execute_proactive_intention(
         trigger=TurnTrigger.AUTONOMY_DECISION,
         input_source=TurnInputSource.INTERNAL,
     )
-    turn_id = await durability.begin_proactive_turn(conversation_id, turn_context)
+    reservation = None
+    if autonomy_context is not None:
+        if pre_provider_guard is not None and not await pre_provider_guard():
+            raise ProactiveExecutionError("execution_gate_changed")
+        reservation = await reserve_autonomy_execution(
+            pool,
+            conversation_id=conversation_id,
+            persona_id=active_persona_id,
+            intention=intention,
+            user_activity_anchor_message_id=autonomy_context["user_activity_anchor_message_id"],
+            now=current,
+        )
+        if reservation is None:
+            raise ProactiveExecutionError("autonomy_execution_duplicate")
+        turn_id = await durability.begin_proactive_turn(
+            conversation_id, turn_context, turn_id=reservation.turn_id
+        )
+    else:
+        turn_id = await durability.begin_proactive_turn(conversation_id, turn_context)
     logger.info(
         "PROACTIVE_TURN turn=%s conversation=%s intention_type=%s status=pending",
         turn_id, conversation_id, intention.intention_type,
     )
 
     failed_stage = "context_prepare"
+    provider_error_confirmed = False
     try:
         async def prepare_context(_pool: Any) -> str:
             # Existing helper bounds history and enforces the supplied
@@ -257,17 +284,24 @@ async def execute_proactive_intention(
         )
         failed_stage = "provider_generate"
         async def generate(_pool: Any) -> str:
+            nonlocal provider_error_confirmed
             # M8 may cheaply revalidate durable user activity and Persona
             # policy after context preparation but immediately before any
             # provider request. The default M7/manual path is unchanged.
             if pre_provider_guard is not None and not await pre_provider_guard():
                 raise ProactiveExecutionError("execution_gate_changed")
-            generated = await provider(
-                settings,
-                opening_request,
-                dynamic_context=dynamic_context,
-                identity_prompt=system_instruction,
-            )
+            if reservation is not None:
+                await mark_provider_started(pool, reservation.execution_id, now=current)
+            try:
+                generated = await provider(
+                    settings,
+                    opening_request,
+                    dynamic_context=dynamic_context,
+                    identity_prompt=system_instruction,
+                )
+            except Exception:
+                provider_error_confirmed = True
+                raise
             if not isinstance(generated, str) or not generated.strip():
                 raise ProactiveExecutionError("empty_provider_response")
             try:
@@ -291,16 +325,47 @@ async def execute_proactive_intention(
                 content=response,
                 source_device="mindcore_proactive",
             ),
+            autonomy_execution_id=reservation.execution_id if reservation is not None else None,
         )
+        if reservation is not None:
+            # Turn/message persistence is already durably complete. If this
+            # separate ledger finalization fails, preserve MESSAGE_PERSISTED
+            # for startup reconciliation instead of inventing a turn stage.
+            failed_stage = "execution_finalize"
+            await mark_autonomy_execution_complete(pool, reservation.execution_id, now=current)
+    except asyncio.CancelledError:
+        # Cancellation is a crash/shutdown boundary for this lifecycle. Leave
+        # the durable state as RESERVED or PROVIDER_STARTED for startup recovery.
+        raise
     except BaseException as error:
-        # Stage failures are already marked safely by TurnDurability. This
-        # terminal core status prevents a restart/recovery path from replaying
-        # an external provider request.
-        await durability.mark_core_failed(turn_id, error, stage_name=failed_stage)
-        logger.warning(
-            "PROACTIVE_TURN turn=%s status=core_failed category=%s",
-            turn_id, type(error).__name__,
-        )
+        # Stage failures are marked by TurnDurability. Finalization occurs
+        # after the message/turn transaction and must leave that core result
+        # intact for autonomous ledger recovery.
+        if failed_stage != "execution_finalize":
+            await durability.mark_core_failed(turn_id, error, stage_name=failed_stage)
+        if reservation is not None:
+            if getattr(error, "category", None) == "execution_gate_changed":
+                await mark_failed_safe(
+                    pool, reservation.execution_id, error, now=current,
+                    safe_category="eligibility_changed",
+                )
+            elif failed_stage == "context_prepare":
+                await mark_failed_safe(
+                    pool, reservation.execution_id, error, now=current,
+                    safe_category="context_prepare_failure",
+                )
+            elif failed_stage == "provider_generate" and provider_error_confirmed:
+                await mark_failed_safe(
+                    pool, reservation.execution_id, error, now=current,
+                    safe_category="provider_failure",
+                )
+            # Assistant persistence is one transaction across message, turn,
+            # and MESSAGE_PERSISTED. Leave the last durable execution status
+            # untouched here: startup recovery can distinguish a committed
+            # transaction from a rolled-back/ambiguous provider-started turn.
+        status = "execution_finalize_failed" if failed_stage == "execution_finalize" else "core_failed"
+        logger.warning("PROACTIVE_TURN turn=%s status=%s category=%s",
+                       turn_id, status, type(error).__name__)
         raise
 
     result = ProactiveExecutionResult(

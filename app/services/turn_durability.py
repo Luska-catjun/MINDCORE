@@ -171,14 +171,15 @@ class TurnDurability:
         return message
 
     async def begin_proactive_turn(
-        self, conversation_id: UUID | str, turn_context: TurnContext
+        self, conversation_id: UUID | str, turn_context: TurnContext,
+        *, turn_id: UUID | str | None = None,
     ) -> UUID:
         """Create a persona-initiated durable turn without fabricating user input."""
         if not self.enabled:
             raise RuntimeError("proactive_turn_durability_unavailable")
         if turn_context.durable_values() != ("persona", "autonomy_decision", "internal"):
             raise ValueError("proactive_turn_context_invalid")
-        turn_id = uuid4()
+        turn_id = turn_id or uuid4()
         now = _utc_now()
         async with self.pool.acquire() as connection:
             async with connection.transaction():
@@ -204,7 +205,10 @@ class TurnDurability:
         )
         return turn_id
 
-    async def complete_proactive_core(self, turn_id: UUID | str, assistant_payload: Any) -> dict[str, Any]:
+    async def complete_proactive_core(
+        self, turn_id: UUID | str, assistant_payload: Any,
+        *, autonomy_execution_id: UUID | str | None = None,
+    ) -> dict[str, Any]:
         """Atomically persist one Persona message and complete its proactive turn."""
         if not self.enabled:
             raise RuntimeError("proactive_turn_durability_unavailable")
@@ -253,6 +257,12 @@ class TurnDurability:
                     )
                     if updated is None:
                         raise RuntimeError("proactive_turn_completion_conflict")
+                    if autonomy_execution_id is not None:
+                        from app.services.mindcore.autonomy_execution_store import mark_message_persisted
+
+                        await mark_message_persisted(
+                            connection, autonomy_execution_id, message["id"], now=now
+                        )
                     await connection.execute(
                         """update chat_turn_stages set status='completed',completed_at=$1,
                                   last_error_category=null

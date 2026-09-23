@@ -36,6 +36,7 @@ class AutonomyLifecycleTests(unittest.IsolatedAsyncioTestCase):
         scheduler_started = asyncio.Event()
         scheduler_cancelled = asyncio.Event()
         recovery_finished = False
+        autonomy_recovery_finished = False
 
         async def recovery(*_args, **_kwargs):
             nonlocal recovery_finished
@@ -43,6 +44,7 @@ class AutonomyLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         async def scheduler(**_kwargs):
             self.assertTrue(recovery_finished)
+            self.assertTrue(autonomy_recovery_finished)
             scheduler_started.set()
             try:
                 await asyncio.Event().wait()
@@ -52,9 +54,16 @@ class AutonomyLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("MINDCORE_DESKTOP_SHUTDOWN_CAPABILITY", None)
+            async def autonomy_recovery(*_args, **_kwargs):
+                nonlocal autonomy_recovery_finished
+                self.assertTrue(recovery_finished)
+                autonomy_recovery_finished = True
+                return {}
+
             with patch("app.main.hydrate_narrative_snapshot", new=AsyncMock()), \
                  patch("app.main.hydrate_self_model_snapshot", new=AsyncMock()), \
                  patch("app.main.recover_incomplete_turns", new=recovery), \
+                 patch("app.main.recover_incomplete_autonomy_executions", new=autonomy_recovery), \
                  patch("app.main.run_autonomy_scheduler", new=scheduler):
                 async with app.router.lifespan_context(app):
                     self.assertIsNone(app.state.autonomy_scheduler_task)

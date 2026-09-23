@@ -11,7 +11,7 @@ import re
 from typing import Any
 
 
-CURRENT_TURSO_BASELINE_VERSION = "23"
+CURRENT_TURSO_BASELINE_VERSION = "24"
 SCHEMA_VERSION_KEY = "turso_baseline_version"
 MIGRATION_LEDGER_TABLE = "schema_migration_ledger"
 
@@ -38,6 +38,11 @@ REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
         "turn_id conversation_id user_message_id assistant_message_id status created_at "
         "updated_at core_completed_at completed_at last_failed_stage safe_error_category "
         "initiator_actor trigger_type input_source"
+    ),
+    "autonomy_executions": _columns(
+        "execution_id turn_id conversation_id persona_id intention_key intention_type target_kind "
+        "target_key user_activity_anchor_message_id status assistant_message_id safe_error_category "
+        "provider_started_at message_persisted_at completed_at created_at updated_at"
     ),
     "conversations": _columns("conversation_id source_device started_at ended_at"),
     "decision_log": _columns(
@@ -151,6 +156,7 @@ REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
 # Unique constraints are idempotence/concurrency authorities, not merely query
 # optimizations. Named indexes below cover the current high-volume read paths.
 REQUIRED_UNIQUE_CONSTRAINTS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "autonomy_executions": (("turn_id",),),
     "chat_turn_stages": (("turn_id", "stage_name"),),
     "diana_goals": (("goal_key",),),
     "diana_knowledge": (("subject_key",),),
@@ -172,6 +178,7 @@ REQUIRED_UNIQUE_CONSTRAINTS: dict[str, tuple[tuple[str, ...], ...]] = {
 }
 
 REQUIRED_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    "autonomy_executions": ("execution_id",),
     "chat_turn_stages": ("turn_id", "stage_name"),
     "chat_turns": ("turn_id",),
     "conversations": ("conversation_id",),
@@ -205,6 +212,11 @@ REQUIRED_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 REQUIRED_READ_INDEXES: dict[str, tuple[tuple[str, ...], ...]] = {
+    "autonomy_executions": (
+        ("status", "created_at"),
+        ("conversation_id", "created_at"),
+        ("persona_id", "user_activity_anchor_message_id", "status", "created_at"),
+    ),
     "chat_turn_stages": (("status", "retry_policy", "attempt_count"),),
     "chat_turns": (("status", "updated_at"),),
     "decision_log": (("conversation_id", "decision_domain", "status", "updated_at"),),
@@ -220,6 +232,8 @@ REQUIRED_READ_INDEXES: dict[str, tuple[tuple[str, ...], ...]] = {
 
 # (child table, child column, parent table, parent column, on-delete action)
 REQUIRED_FOREIGN_KEYS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("autonomy_executions", "conversation_id", "conversations", "conversation_id", "CASCADE"),
+    ("autonomy_executions", "assistant_message_id", "messages", "id", "SET NULL"),
     ("chat_turn_stages", "turn_id", "chat_turns", "turn_id", "CASCADE"),
     ("chat_turns", "conversation_id", "conversations", "conversation_id", "CASCADE"),
     ("chat_turns", "user_message_id", "messages", "id", "SET NULL"),
@@ -329,6 +343,13 @@ REQUIRED_FOREIGN_KEYS: tuple[tuple[str, str, str, str, str], ...] = (
     ("relationship_log", "episode_id", "episodes", "episode_id", "NO ACTION"),
     ("state_log", "episode_id", "episodes", "episode_id", "NO ACTION"),
 )
+
+REQUIRED_PARTIAL_UNIQUE_INDEXES: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    "autonomy_executions": ((
+        "uq_autonomy_execution_active_dedupe",
+        ("persona_id", "intention_key", "user_activity_anchor_message_id"),
+    ),),
+}
 
 _TURN_CONTEXT_COMBINATION_CHECK = (
     "check(input_source in ('text','internal') and ("
@@ -444,6 +465,19 @@ def _report_from_metadata(
         for signature in REQUIRED_READ_INDEXES.get(table, ()):
             if signature not in indexes:
                 missing_constraints.append(f"{table} INDEX({','.join(signature)})")
+        for index_name, signature in REQUIRED_PARTIAL_UNIQUE_INDEXES.get(table, ()):
+            matching = grouped.get(index_name, [])
+            actual_signature = tuple(
+                str(item["column_name"])
+                for item in sorted(matching, key=lambda item: int(item["seqno"]))
+            )
+            if (
+                not matching
+                or not int(matching[0]["unique"])
+                or not int(matching[0]["partial"])
+                or actual_signature != signature
+            ):
+                missing_constraints.append(f"{table} PARTIAL UNIQUE INDEX({index_name})")
 
     for table, child, parent, parent_column, action in REQUIRED_FOREIGN_KEYS:
         if table not in tables:

@@ -20,6 +20,8 @@ from app.database.migrations import (
     migration_checksum,
     _apply_turn_context_v23,
     TURN_CONTEXT_V23_DEFINITION,
+    AUTONOMY_EXECUTION_V24_DEFINITION,
+    _apply_autonomy_execution_v24,
     run_forward_migrations,
 )
 from app.database.schema_contract import (
@@ -36,7 +38,7 @@ BASELINE_SQL = (ROOT / "db" / "turso" / "baseline_v1.sql").read_text(encoding="u
 
 
 def released_v22_sql() -> str:
-    sql = BASELINE_SQL.replace(
+    sql = released_v23_sql().replace(
         "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','23');",
         "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','22');",
         1,
@@ -54,6 +56,28 @@ def released_v22_sql() -> str:
         "",
         1,
     )
+    return sql
+
+
+def released_v23_sql() -> str:
+    sql = BASELINE_SQL.replace(
+        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','24');",
+        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','23');",
+        1,
+    )
+    start = sql.index("-- OBJECT table autonomy_executions (schema 24)")
+    end = sql.index("-- OBJECT table preference_evidence", start)
+    sql = sql[:start] + sql[end:]
+    for name in (
+        "uq_autonomy_execution_active_dedupe",
+        "idx_autonomy_executions_recovery",
+        "idx_autonomy_executions_conversation",
+        "idx_autonomy_executions_anchor_failures",
+    ):
+        start = sql.find(f"-- OBJECT index {name}\n")
+        if start >= 0:
+            end = sql.index(";\n", start) + 2
+            sql = sql[:start] + sql[end:]
     return sql
 
 
@@ -305,7 +329,7 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
             await self.connection.fetchval(
                 f"select migration_id from {LEDGER_TABLE} order by migration_id"
             ),
-            "baseline_v23",
+            "baseline_v24",
         )
 
     async def test_current_schema_adopts_missing_ledger_without_replaying_user_rows(self) -> None:
@@ -378,7 +402,7 @@ create table retry_marker(id integer primary key);
     async def test_compatible_legacy_schema_is_adopted_once_without_historical_replay(self) -> None:
         legacy_sql = BASELINE_SQL.replace(
             "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n"
-            "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','23');\n",
+            "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','24');\n",
             "",
             1,
         )
@@ -402,7 +426,7 @@ create table retry_marker(id integer primary key);
             1,
         )
 
-    async def test_released_v21_upgrades_through_v23_once_and_preserves_rows(self) -> None:
+    async def test_released_v21_upgrades_through_v24_once_and_preserves_rows(self) -> None:
         await execute_script(self.connection, released_v21_sql())
         await self.connection.execute(
             "insert into conversations(conversation_id,source_device,started_at,ended_at) "
@@ -413,9 +437,11 @@ create table retry_marker(id integer primary key);
         result = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
         rerun = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
 
-        self.assertEqual(result.applied_migration_ids, ("022_turn_durability", "023_turn_context"))
+        self.assertEqual(result.applied_migration_ids, (
+            "022_turn_durability", "023_turn_context", "024_autonomy_execution_persistence"
+        ))
         self.assertEqual(rerun.applied_migration_ids, ())
-        self.assertEqual((result.initial_version, result.final_version), (21, 23))
+        self.assertEqual((result.initial_version, result.final_version), (21, 24))
         self.assertEqual(
             await self.connection.fetchval(
                 "select count(*) from conversations where conversation_id=$1",
@@ -428,7 +454,7 @@ create table retry_marker(id integer primary key);
                 "select name from sqlite_master where type='table' and name='chat_turns'"
             )
         )
-        self.assertEqual(await self.connection.fetchval(f"select count(*) from {LEDGER_TABLE}"), 3)
+        self.assertEqual(await self.connection.fetchval(f"select count(*) from {LEDGER_TABLE}"), 4)
 
     async def test_unversioned_exact_v21_is_adopted_then_upgraded_once(self) -> None:
         await execute_script(self.connection, unversioned_released_v21_sql())
@@ -471,7 +497,9 @@ create table retry_marker(id integer primary key);
         )
         report = await classify_turso_schema(self.connection)
         self.assertEqual(report.state, SchemaState.PARTIAL_OR_UNKNOWN)
-        self.assertEqual(set(report.missing_tables), {"chat_turns", "chat_turn_stages"})
+        self.assertEqual(set(report.missing_tables), {
+            "chat_turns", "chat_turn_stages", "autonomy_executions"
+        })
         self.assertIsNone(await self.connection.fetchrow(
             "select name from sqlite_master where type='table' and name='schema_metadata'"
         ))
@@ -479,18 +507,20 @@ create table retry_marker(id integer primary key);
         result = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
         rerun = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
 
-        self.assertEqual((result.initial_version, result.final_version), (21, 23))
+        self.assertEqual((result.initial_version, result.final_version), (21, 24))
         self.assertTrue(result.adopted_legacy)
-        self.assertEqual(result.applied_migration_ids, ("022_turn_durability", "023_turn_context"))
+        self.assertEqual(result.applied_migration_ids, (
+            "022_turn_durability", "023_turn_context", "024_autonomy_execution_persistence"
+        ))
         self.assertEqual(rerun.applied_migration_ids, ())
         self.assertEqual(await self.connection.fetchval(
             "select value from schema_metadata where key=$1", SCHEMA_VERSION_KEY
-        ), "23")
+        ), "24")
         self.assertEqual(
             [row["migration_id"] for row in await self.connection.fetch(
                 f"select migration_id from {LEDGER_TABLE} order by to_version, migration_id"
             )],
-            ["baseline_v21", "022_turn_durability", "023_turn_context"],
+            ["baseline_v21", "022_turn_durability", "023_turn_context", "024_autonomy_execution_persistence"],
         )
         self.assertEqual(await self.connection.fetchval(
             "select count(*) from conversations where conversation_id=$1", "legacy-conversation"
@@ -565,7 +595,9 @@ create table retry_marker(id integer primary key);
             "select name from sqlite_master where type='table' and name='chat_turns'"
         ))
         retry = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
-        self.assertEqual(retry.applied_migration_ids, ("022_turn_durability", "023_turn_context"))
+        self.assertEqual(retry.applied_migration_ids, (
+            "022_turn_durability", "023_turn_context", "024_autonomy_execution_persistence"
+        ))
 
     async def test_v22_fresh_and_migrated_turn_schema_are_equivalent(self) -> None:
         await execute_script(self.connection, released_v22_sql())
@@ -620,7 +652,9 @@ create table retry_marker(id integer primary key);
         rerun = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
         row = await self.connection.fetchrow("select * from chat_turns where turn_id=$1", "legacy-turn")
 
-        self.assertEqual(result.applied_migration_ids, ("023_turn_context",))
+        self.assertEqual(result.applied_migration_ids, (
+            "023_turn_context", "024_autonomy_execution_persistence"
+        ))
         self.assertEqual(rerun.applied_migration_ids, ())
         self.assertEqual((row["user_message_id"], row["assistant_message_id"]), ("legacy-user", None))
         self.assertEqual(
@@ -651,6 +685,48 @@ create table retry_marker(id integer primary key);
             ),
             "22",
         )
+
+    async def test_released_v23_adds_autonomy_execution_authority_once(self) -> None:
+        await execute_script(self.connection, released_v23_sql())
+        await self.connection.execute(
+            "insert into conversations(conversation_id,source_device,started_at,ended_at) values($1,$2,$3,$4)",
+            "v23-conversation", "desktop", "2026-09-12T00:00:00Z", None,
+        )
+        result = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+        rerun = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+        self.assertEqual((result.initial_version, result.final_version), (23, 24))
+        self.assertEqual(result.applied_migration_ids, ("024_autonomy_execution_persistence",))
+        self.assertEqual(rerun.applied_migration_ids, ())
+        self.assertEqual(await self.connection.fetchval(
+            "select count(*) from conversations where conversation_id='v23-conversation'"
+        ), 1)
+        self.assertIsNotNone(await self.connection.fetchrow(
+            "select name from sqlite_master where type='table' and name='autonomy_executions'"
+        ))
+
+    async def test_autonomy_execution_migration_failure_rolls_back_and_retries(self) -> None:
+        await execute_script(self.connection, released_v23_sql())
+
+        async def fail_after_autonomy(connection: TursoConnection) -> None:
+            await _apply_autonomy_execution_v24(connection)
+            raise RuntimeError("intentional autonomy migration failure")
+
+        failing = MigrationDefinition(
+            "024_autonomy_execution_persistence", 23, 24,
+            AUTONOMY_EXECUTION_V24_DEFINITION, fail_after_autonomy,
+        )
+        with self.assertRaisesRegex(SchemaMigrationError, "migration_failed"):
+            await run_forward_migrations(
+                self.connection, target_version=24, registry=MigrationRegistry((failing,))
+            )
+        self.assertEqual(await self.connection.fetchval(
+            "select value from schema_metadata where key=$1", SCHEMA_VERSION_KEY
+        ), "23")
+        self.assertIsNone(await self.connection.fetchrow(
+            "select name from sqlite_master where type='table' and name='autonomy_executions'"
+        ))
+        retry = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+        self.assertEqual(retry.applied_migration_ids, ("024_autonomy_execution_persistence",))
 
     async def test_file_backed_second_runner_observes_durable_ledger(self) -> None:
         with TemporaryDirectory() as directory:

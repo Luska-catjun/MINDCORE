@@ -194,6 +194,38 @@ alter table chat_turns add column input_source text not null default 'text'
 """
 
 
+AUTONOMY_EXECUTION_V24_DEFINITION = """024_autonomy_execution_persistence
+create table autonomy_executions (
+  execution_id text primary key,
+  turn_id text not null unique,
+  conversation_id text not null references conversations(conversation_id) on delete cascade,
+  persona_id text not null,
+  intention_key text not null,
+  intention_type text not null,
+  target_kind text not null,
+  target_key text not null,
+  user_activity_anchor_message_id text not null,
+  status text not null check(status in (
+    'RESERVED','PROVIDER_STARTED','MESSAGE_PERSISTED','COMPLETE','FAILED_SAFE','INDETERMINATE'
+  )),
+  assistant_message_id text references messages(id) on delete set null,
+  safe_error_category text,
+  provider_started_at text,
+  message_persisted_at text,
+  completed_at text,
+  created_at text not null,
+  updated_at text not null
+);
+create unique index uq_autonomy_execution_active_dedupe
+  on autonomy_executions(persona_id,intention_key,user_activity_anchor_message_id)
+  where status in ('RESERVED','PROVIDER_STARTED','MESSAGE_PERSISTED','COMPLETE','INDETERMINATE');
+create index idx_autonomy_executions_recovery on autonomy_executions(status,created_at);
+create index idx_autonomy_executions_conversation on autonomy_executions(conversation_id,created_at);
+create index idx_autonomy_executions_anchor_failures
+  on autonomy_executions(persona_id,user_activity_anchor_message_id,status,created_at);
+"""
+
+
 async def _apply_turn_durability_v22(connection: Any) -> None:
     for statement in TURN_DURABILITY_V22_DEFINITION.split("\n", 1)[1].split(";"):
         if statement.strip():
@@ -202,6 +234,12 @@ async def _apply_turn_durability_v22(connection: Any) -> None:
 
 async def _apply_turn_context_v23(connection: Any) -> None:
     for statement in TURN_CONTEXT_V23_DEFINITION.split("\n", 1)[1].split(";"):
+        if statement.strip():
+            await connection.execute(statement)
+
+
+async def _apply_autonomy_execution_v24(connection: Any) -> None:
+    for statement in AUTONOMY_EXECUTION_V24_DEFINITION.split("\n", 1)[1].split(";"):
         if statement.strip():
             await connection.execute(statement)
 
@@ -223,6 +261,13 @@ FORWARD_MIGRATIONS = MigrationRegistry((
         TURN_CONTEXT_V23_DEFINITION,
         _apply_turn_context_v23,
     ),
+    MigrationDefinition(
+        "024_autonomy_execution_persistence",
+        23,
+        24,
+        AUTONOMY_EXECUTION_V24_DEFINITION,
+        _apply_autonomy_execution_v24,
+    ),
 ))
 
 
@@ -231,7 +276,9 @@ def _is_released_v21_turn_durability_upgrade(report: Any) -> bool:
     return (
         report.version == "21"
         and report.version_issue == "unsupported:21"
-        and set(report.missing_tables) == {"chat_turns", "chat_turn_stages"}
+        and set(report.missing_tables) == {
+            "chat_turns", "chat_turn_stages", "autonomy_executions"
+        }
         and not report.missing_columns
         and not report.missing_constraints
         and not report.invariant_errors
@@ -243,7 +290,7 @@ def _is_released_v22_turn_context_upgrade(report: Any) -> bool:
     return (
         report.version == "22"
         and report.version_issue == "unsupported:22"
-        and not report.missing_tables
+        and set(report.missing_tables) == {"autonomy_executions"}
         and set(report.missing_columns)
         == {
             "chat_turns.initiator_actor",
@@ -271,7 +318,21 @@ async def _is_unversioned_released_v21_turn_durability_upgrade(
         and LEDGER_TABLE not in tables
         and report.version is None
         and report.version_issue is None
-        and set(report.missing_tables) == {"chat_turns", "chat_turn_stages"}
+        and set(report.missing_tables) == {
+        "chat_turns", "chat_turn_stages", "autonomy_executions"
+        }
+        and not report.missing_columns
+        and not report.missing_constraints
+        and not report.invariant_errors
+    )
+
+
+def _is_released_v23_autonomy_upgrade(report: Any) -> bool:
+    """Accept only the exact released-v23 capability gap for migration 024."""
+    return (
+        report.version == "23"
+        and report.version_issue == "unsupported:23"
+        and set(report.missing_tables) == {"autonomy_executions"}
         and not report.missing_columns
         and not report.missing_constraints
         and not report.invariant_errors
@@ -722,6 +783,9 @@ async def ensure_turso_schema_current(
                 raise SchemaMigrationError("PARTIAL_OR_UNKNOWN database_schema_incompatible")
         elif version == 22 and target_version >= 23:
             if not _is_released_v22_turn_context_upgrade(report):
+                raise SchemaMigrationError("PARTIAL_OR_UNKNOWN database_schema_incompatible")
+        elif version == 23 and target_version >= 24:
+            if not _is_released_v23_autonomy_upgrade(report):
                 raise SchemaMigrationError("PARTIAL_OR_UNKNOWN database_schema_incompatible")
         else:
             raise SchemaMigrationError("PARTIAL_OR_UNKNOWN database_schema_incompatible")

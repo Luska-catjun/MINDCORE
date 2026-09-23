@@ -1,8 +1,8 @@
 # Forward schema migrations
 
 MindCore creates an empty local libSQL/Turso database from
-`db/turso/baseline_v1.sql`. That baseline describes released schema version
-21. It is not a replay of `db/migrations/001` through `021`; those historical
+`db/turso/baseline_v1.sql`. That baseline describes the current released
+schema (version 24). It is not a replay of `db/migrations/001` through `021`; those historical
 files must never be automatically applied to an existing user database.
 
 At backend startup and during the explicit desktop **Initialize** action,

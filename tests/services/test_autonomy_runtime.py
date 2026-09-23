@@ -30,12 +30,16 @@ class FakeConnection:
         self.fetch_calls = 0
 
     async def fetchrow(self, query, *args):
+        if "from autonomy_executions" in query:
+            return None
         self.fetchrow_calls += 1
         if self.fetchrow_calls == 1:
             return {"id": "user-1", "conversation_id": "conversation-1", "created_at": NOW - timedelta(hours=3)}
         return {"created_at": NOW - timedelta(hours=1)}
 
     async def fetch(self, query, *args):
+        if "from autonomy_executions" in query:
+            return []
         self.fetch_calls += 1
         return [
             {"id": "proactive-1", "created_at": NOW - timedelta(hours=2)},
@@ -156,7 +160,8 @@ class AutonomyRuntimeTests(unittest.IsolatedAsyncioTestCase):
              patch("app.services.mindcore.autonomy_runtime.get_trigger_snapshot",
                    new=AsyncMock(return_value=(object(), object(), object()))), \
              patch("app.services.mindcore.autonomy_runtime.decide_autonomy", return_value=decision), \
-             patch("app.services.mindcore.autonomy_runtime.derive_autonomy_intention", return_value=intention):
+             patch("app.services.mindcore.autonomy_runtime.derive_autonomy_intention", return_value=intention), \
+             patch("app.services.mindcore.autonomy_runtime.get_execution_gate", new=AsyncMock(return_value=(False, None))):
             first = await run_autonomy_cycle(
                 pool=object(), settings=settings, identity_prompt="test", now=NOW,
                 runtime=runtime, executor=executor,
