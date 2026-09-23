@@ -12,6 +12,17 @@ export interface PersonaSummary {
 }
 
 type Mode = "add" | "manage";
+interface ProactiveSettings {
+  enabled: boolean;
+  cooldown_seconds: number;
+  quiet_hours_enabled: boolean;
+  quiet_start: string;
+  quiet_end: string;
+}
+const defaultProactiveSettings: ProactiveSettings = {
+  enabled: false, cooldown_seconds: 1800, quiet_hours_enabled: true,
+  quiet_start: "23:00", quiet_end: "07:00",
+};
 
 interface PersonaManagerProps {
   mode: Mode;
@@ -104,6 +115,37 @@ function ManagePersonas({ personas, avatarRevision = 0, onClose, onChanged }: Pe
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [confirmation, setConfirmation] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const activePersona = personas.find((persona) => persona.active);
+  const [proactive, setProactive] = useState<ProactiveSettings>(defaultProactiveSettings);
+  const [proactiveLoading, setProactiveLoading] = useState(false);
+  const [proactiveSaving, setProactiveSaving] = useState(false);
+
+  useEffect(() => {
+    if (!activePersona) return;
+    setProactiveLoading(true);
+    void invoke<ProactiveSettings>("get_proactive_settings", { personaId: activePersona.persona_id })
+      .then((loaded) => setProactive(loaded ?? defaultProactiveSettings))
+      .catch(() => setError("Could not load proactive settings for the active Persona."))
+      .finally(() => setProactiveLoading(false));
+  }, [activePersona?.persona_id]);
+
+  const saveProactive = async () => {
+    if (!activePersona) return;
+    setProactiveSaving(true);
+    setError(null);
+    try {
+      const saved = await invoke<ProactiveSettings>("update_proactive_settings", {
+        personaId: activePersona.persona_id,
+        settings: proactive,
+      });
+      setProactive(saved);
+      await onChanged(activePersona.persona_id);
+    } catch {
+      setError("Could not save proactive settings. Check the cooldown and quiet-hour values.");
+    } finally {
+      setProactiveSaving(false);
+    }
+  };
 
   const setAvatar = async (persona: PersonaSummary, file: File) => {
     setError(null);
@@ -169,6 +211,18 @@ function ManagePersonas({ personas, avatarRevision = 0, onClose, onChanged }: Pe
         {deleteId === persona.persona_id && <div className="persona-action"><p>Type <code>DELETE {persona.display_name}</code>. The external database is never deleted.</p><input aria-label={`Delete ${persona.display_name}`} value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /><button type="button" disabled={confirmation !== `DELETE ${persona.display_name}`} onClick={() => void remove(persona)}>Confirm Delete</button></div>}
       </div>)}
     </div>
+    {activePersona && <section className="proactive-settings" aria-label="Proactive messages settings">
+      <h3>Proactive messages · {activePersona.display_name}</h3>
+      <p>When enabled, MindCore may start a conversation when its goals or needs make it appropriate. This works only while MindCore is running.</p>
+      {proactiveLoading ? <p className="workspace-muted">Loading settings…</p> : <>
+        <label><input type="checkbox" checked={proactive.enabled} onChange={(event) => setProactive((value) => ({ ...value, enabled: event.target.checked }))} />Allow this Persona to start conversations</label>
+        <label>Minimum time between messages<select aria-label="Proactive cooldown" value={proactive.cooldown_seconds} onChange={(event) => setProactive((value) => ({ ...value, cooldown_seconds: Number(event.target.value) }))}>{[[300,"5 minutes"],[900,"15 minutes"],[1800,"30 minutes"],[3600,"1 hour"],[14400,"4 hours"],[86400,"1 day"]].map(([seconds,label]) => <option key={seconds} value={seconds}>{label}</option>)}</select></label>
+        <label><input type="checkbox" checked={proactive.quiet_hours_enabled} onChange={(event) => setProactive((value) => ({ ...value, quiet_hours_enabled: event.target.checked }))} />Pause during quiet hours</label>
+        <div className="proactive-hours"><label>Quiet hours start<input aria-label="Quiet hours start" type="time" value={proactive.quiet_start} onChange={(event) => setProactive((value) => ({ ...value, quiet_start: event.target.value }))} /></label><label>Quiet hours end<input aria-label="Quiet hours end" type="time" value={proactive.quiet_end} onChange={(event) => setProactive((value) => ({ ...value, quiet_end: event.target.value }))} /></label></div>
+        <p className="workspace-muted">Quiet hours use your configured MindCore timezone. No messages are generated while the app is closed.</p>
+        <button type="button" disabled={proactiveSaving || proactiveLoading} onClick={() => void saveProactive()}>{proactiveSaving ? "Saving…" : "Save proactive settings"}</button>
+      </>}
+    </section>}
     {error && <p className="error-banner">{error}</p>}
     <div className="setup-navigation"><button type="button" onClick={onClose}>Close</button></div>
   </>;

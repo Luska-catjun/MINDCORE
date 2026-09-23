@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     auth_session_max_age_seconds: int = Field(default=60 * 60 * 24 * 30, gt=0)
     auth_bearer_session_max_age_seconds: int = Field(default=60 * 60 * 8, gt=0)
     diana_timezone: str = "Asia/Seoul"
+    # Persona-scoped M8 safety settings. Old profiles omit these keys and stay
+    # safely disabled until the Persona owner explicitly opts in.
+    proactive_enabled: bool = False
+    proactive_cooldown_seconds: int = Field(default=1800, ge=300, le=604800)
+    proactive_quiet_hours_enabled: bool = True
+    proactive_quiet_start: str = "23:00"
+    proactive_quiet_end: str = "07:00"
     supabase_url: str | None = None
     supabase_key: str | None = None
     supabase_db_url: str | None = Field(
@@ -135,6 +142,23 @@ class Settings(BaseSettings):
             ZoneInfo(value)
         except ZoneInfoNotFoundError as exc:
             raise ValueError("DIANA_TIMEZONE must be a valid IANA timezone.") from exc
+        return value
+
+    @field_validator("proactive_quiet_start", "proactive_quiet_end")
+    @classmethod
+    def validate_proactive_quiet_time(cls, value: str) -> str:
+        import re
+
+        normalized = value.strip()
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", normalized):
+            raise ValueError("PROACTIVE quiet hours must use strict HH:MM format.")
+        return normalized
+
+    @field_validator("proactive_quiet_end")
+    @classmethod
+    def validate_distinct_proactive_quiet_range(cls, value: str, info):
+        if info.data.get("proactive_quiet_hours_enabled", True) and value == info.data.get("proactive_quiet_start", "23:00"):
+            raise ValueError("PROACTIVE quiet-hour start and end must differ when enabled.")
         return value
 
     @field_validator("persona_display_name")

@@ -98,6 +98,59 @@ struct PersonaCreateDraft {
 struct PersonaUpdateDraft {
     display_name: String,
 }
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+struct ProactiveSettings {
+    enabled: bool,
+    cooldown_seconds: u32,
+    quiet_hours_enabled: bool,
+    quiet_start: String,
+    quiet_end: String,
+}
+impl Default for ProactiveSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cooldown_seconds: 1800,
+            quiet_hours_enabled: true,
+            quiet_start: "23:00".into(),
+            quiet_end: "07:00".into(),
+        }
+    }
+}
+
+fn parse_proactive_clock(value: &str) -> Result<u16, String> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 5 || bytes[2] != b':'
+        || !bytes[..2].iter().all(u8::is_ascii_digit)
+        || !bytes[3..].iter().all(u8::is_ascii_digit)
+    {
+        return Err("Quiet hours must use HH:MM format.".into());
+    }
+    let hour = value[..2].parse::<u16>().map_err(|_| "Quiet hours must use HH:MM format.")?;
+    let minute = value[3..].parse::<u16>().map_err(|_| "Quiet hours must use HH:MM format.")?;
+    if hour > 23 || minute > 59 { return Err("Quiet hours must use HH:MM format.".into()); }
+    Ok(hour * 60 + minute)
+}
+
+fn validate_proactive_settings(value: &ProactiveSettings) -> Result<(), String> {
+    if !(300..=604800).contains(&value.cooldown_seconds) {
+        return Err("Cooldown must be between 5 minutes and 7 days.".into());
+    }
+    let start = parse_proactive_clock(&value.quiet_start)?;
+    let end = parse_proactive_clock(&value.quiet_end)?;
+    if value.quiet_hours_enabled && start == end {
+        return Err("Quiet-hour start and end must differ.".into());
+    }
+    Ok(())
+}
+
+fn write_proactive_settings(values: &mut BTreeMap<String, String>, settings: &ProactiveSettings) {
+    values.insert("PROACTIVE_ENABLED".into(), settings.enabled.to_string());
+    values.insert("PROACTIVE_COOLDOWN_SECONDS".into(), settings.cooldown_seconds.to_string());
+    values.insert("PROACTIVE_QUIET_HOURS_ENABLED".into(), settings.quiet_hours_enabled.to_string());
+    values.insert("PROACTIVE_QUIET_START".into(), settings.quiet_start.clone());
+    values.insert("PROACTIVE_QUIET_END".into(), settings.quiet_end.clone());
+}
 
 // Tauri resolves the target-triple source binary configured in `externalBin`
 // to this packaged runtime name (and supplies `.exe` on Windows).
@@ -1159,6 +1212,63 @@ fn update_persona(
     Ok(summary)
 }
 
+fn proactive_settings_from(values: &BTreeMap<String, String>) -> Result<ProactiveSettings, String> {
+    let defaults = ProactiveSettings::default();
+    let parsed = ProactiveSettings {
+        enabled: values.get("PROACTIVE_ENABLED").is_some_and(|v| v.eq_ignore_ascii_case("true")),
+        cooldown_seconds: values.get("PROACTIVE_COOLDOWN_SECONDS")
+            .map(|value| value.parse::<u32>().map_err(|_| "Stored proactive cooldown is invalid.".to_string()))
+            .transpose()?.unwrap_or(defaults.cooldown_seconds),
+        quiet_hours_enabled: values.get("PROACTIVE_QUIET_HOURS_ENABLED")
+            .map_or(defaults.quiet_hours_enabled, |v| v.eq_ignore_ascii_case("true")),
+        quiet_start: values.get("PROACTIVE_QUIET_START").cloned().unwrap_or(defaults.quiet_start),
+        quiet_end: values.get("PROACTIVE_QUIET_END").cloned().unwrap_or(defaults.quiet_end),
+    };
+    validate_proactive_settings(&parsed)?;
+    Ok(parsed)
+}
+
+#[tauri::command]
+fn get_proactive_settings(app: AppHandle, persona_id: String) -> Result<ProactiveSettings, String> {
+    let profile = registry(&app)?
+        .and_then(|value| value.personas.into_iter().find(|item| item.persona_id == persona_id))
+        .ok_or_else(|| "Persona was not found.".to_string())?;
+    let text = fs::read_to_string(profile.config_path)
+        .map_err(|_| "Could not read the Persona configuration.".to_string())?;
+    proactive_settings_from(&persona_registry::parse_env(&text))
+}
+
+#[tauri::command]
+fn update_proactive_settings(
+    app: AppHandle,
+    persona_id: String,
+    settings: ProactiveSettings,
+) -> Result<ProactiveSettings, String> {
+    validate_proactive_settings(&settings)?;
+    let state = app.state::<PersonaRegistryLock>();
+    let _guard = state.0.lock()
+        .map_err(|_| "Persona configuration is busy.".to_string())?;
+    let registry = registry(&app)?.ok_or_else(|| "MindCore setup is incomplete.".to_string())?;
+    let profile = registry.personas.iter().find(|item| item.persona_id == persona_id)
+        .ok_or_else(|| "Persona was not found.".to_string())?;
+    let profile_path = PathBuf::from(&profile.config_path);
+    let old_text = fs::read_to_string(&profile_path)
+        .map_err(|_| "Could not read the Persona configuration.".to_string())?;
+    let mut values = persona_registry::parse_env(&old_text);
+    write_proactive_settings(&mut values, &settings);
+    persona_registry::secure_atomic_write(&profile_path, &render_env_values(values))?;
+
+    if registry.active_persona_id == persona_id {
+        stop_sidecar(&app);
+        if let Err(error) = start_sidecar(&app) {
+            let _ = persona_registry::secure_atomic_write(&profile_path, &old_text);
+            let _ = start_sidecar(&app);
+            return Err(error);
+        }
+    }
+    Ok(settings)
+}
+
 #[tauri::command]
 fn switch_active_persona(app: AppHandle, persona_id: String) -> Result<PersonaSummary, String> {
     let state = app.state::<PersonaRegistryLock>();
@@ -1512,6 +1622,53 @@ mod setup_validation_tests {
             preserve_api_key: false,
             preserve_identity: false,
         }
+    }
+
+    #[test]
+    fn proactive_settings_have_safe_backward_compatible_defaults() {
+        assert_eq!(ProactiveSettings::default(), ProactiveSettings {
+            enabled: false,
+            cooldown_seconds: 1800,
+            quiet_hours_enabled: true,
+            quiet_start: "23:00".into(),
+            quiet_end: "07:00".into(),
+        });
+    }
+
+    #[test]
+    fn proactive_settings_reject_invalid_cooldown_and_ambiguous_times() {
+        let mut settings = ProactiveSettings::default();
+        settings.cooldown_seconds = 299;
+        assert!(validate_proactive_settings(&settings).is_err());
+        settings.cooldown_seconds = 604801;
+        assert!(validate_proactive_settings(&settings).is_err());
+        settings.cooldown_seconds = 1800;
+        settings.quiet_start = "7pm".into();
+        assert!(validate_proactive_settings(&settings).is_err());
+        settings.quiet_start = "07:00".into();
+        settings.quiet_end = "07:00".into();
+        assert!(validate_proactive_settings(&settings).is_err());
+        settings.quiet_hours_enabled = false;
+        assert!(validate_proactive_settings(&settings).is_ok());
+    }
+
+    #[test]
+    fn proactive_settings_persist_per_profile_without_replacing_existing_secrets() {
+        let mut profile_a = BTreeMap::from([
+            ("DATABASE_AUTH_TOKEN".into(), "synthetic-test-secret-a".into()),
+            ("ANTHROPIC_API_KEY".into(), "synthetic-test-secret-b".into()),
+        ]);
+        let mut profile_b = BTreeMap::new();
+        let mut a = ProactiveSettings::default();
+        a.enabled = true;
+        a.cooldown_seconds = 3600;
+        write_proactive_settings(&mut profile_a, &a);
+        write_proactive_settings(&mut profile_b, &ProactiveSettings::default());
+        assert_eq!(proactive_settings_from(&profile_a).unwrap(), a);
+        assert_eq!(proactive_settings_from(&profile_b).unwrap(), ProactiveSettings::default());
+        assert_eq!(profile_a.get("DATABASE_AUTH_TOKEN").map(String::as_str), Some("synthetic-test-secret-a"));
+        assert_eq!(profile_a.get("ANTHROPIC_API_KEY").map(String::as_str), Some("synthetic-test-secret-b"));
+        assert!(!profile_b.contains_key("DATABASE_AUTH_TOKEN"));
     }
 
     #[test]
@@ -1907,7 +2064,8 @@ MINDCORE_SETUP_DIAGNOSTIC phase=database_bootstrap action=initialize category=sc
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_process::init());
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init());
     #[cfg(not(mindcore_updater_disabled))]
     let app = app.plugin(tauri_plugin_updater::Builder::new().build());
     let app = app
@@ -1931,6 +2089,8 @@ fn main() {
             set_persona_avatar,
             remove_persona_avatar,
             update_persona,
+            get_proactive_settings,
+            update_proactive_settings,
             switch_active_persona,
             delete_persona
         ])

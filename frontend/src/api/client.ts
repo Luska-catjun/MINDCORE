@@ -9,7 +9,7 @@
 //   GET  /conversations/{conversation_id}/messages?limit&offset&latest
 //   POST /messages
 //
-// 백엔드 코드는 절대 수정하지 않았고, 이 파일도 스펙에 맞춰 "따라가는" 역할만 한다.
+// Shared HTTP routes and response contracts, including incremental proactive events.
 
 import type {
   ChatRequest,
@@ -18,6 +18,7 @@ import type {
   ConversationRead,
   EpisodeRead,
   HealthResponse,
+  ProactiveEventBatch,
   DianaStateRead,
   MessageCreate,
   MessageRead,
@@ -234,6 +235,13 @@ export const api = {
   health: (): Promise<HealthResponse> => request("/health"),
 
   getState: (): Promise<DianaStateRead> => request("/state"),
+
+  proactiveEvents: (cursor?: { createdAt: string; messageId: string }): Promise<ProactiveEventBatch> => {
+    const query = cursor
+      ? `?after_created_at=${encodeURIComponent(cursor.createdAt)}&after_message_id=${encodeURIComponent(cursor.messageId)}`
+      : "";
+    return request(`/autonomy/events${query}`);
+  },
 
   me: (): Promise<{ authenticated: boolean; persona_id: string; persona_display_name: string; user_display_name: string }> =>
     request("/auth/me", { suppressAuthFailure: true }),

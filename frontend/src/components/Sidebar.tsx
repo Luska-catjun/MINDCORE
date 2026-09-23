@@ -6,6 +6,7 @@ interface SidebarProps {
   isOpen: boolean;
   onClose: () => void;
   backendStatus: "checking" | "connected" | "error";
+  unreadCount?: number;
 }
 
 const NAVIGATION: Array<{ id: WorkspaceView; label: string }> = [
@@ -33,6 +34,7 @@ export function Sidebar({
   isOpen,
   onClose,
   backendStatus,
+  unreadCount = 0,
 }: SidebarProps) {
   return (
     <>
@@ -58,7 +60,7 @@ export function Sidebar({
                 onClose();
               }}
             >
-              {item.label}
+              {item.label}{item.id === "chat" && unreadCount > 0 && <span className="proactive-unread" aria-label={`${unreadCount} unread proactive messages`}>{unreadCount}</span>}
             </button>
           ))}
         </nav>

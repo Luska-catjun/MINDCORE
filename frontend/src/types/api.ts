@@ -54,6 +54,19 @@ export interface HealthResponse {
   [key: string]: string | undefined;
 }
 
+export interface ProactiveEvent {
+  message_id: string;
+  conversation_id: string;
+  persona_id: string;
+  created_at: string;
+}
+
+export interface ProactiveEventBatch {
+  events: ProactiveEvent[];
+  latest_created_at: string | null;
+  latest_message_id: string | null;
+}
+
 export interface DianaStateRead {
   id: string | number;
   mood: string | null;

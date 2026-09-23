@@ -32,6 +32,7 @@ logger = logging.getLogger("diana.autonomy.proactive")
 INTENTION_MAX_AGE = timedelta(minutes=5)
 PROACTIVE_CONTEXT_MAX_CHARS = 16_000
 ProviderGenerator = Callable[..., Awaitable[str]]
+ExecutionGuard = Callable[[], Awaitable[bool]]
 
 _TYPE_INSTRUCTIONS = {
     IntentionType.CHECK_IN: "Open a natural, brief check-in focused only on the selected Need.",
@@ -203,6 +204,7 @@ async def execute_proactive_intention(
     intention: AutonomyIntention,
     identity_prompt: str,
     provider: ProviderGenerator = generate_reply,
+    pre_provider_guard: ExecutionGuard | None = None,
     now: datetime | None = None,
 ) -> ProactiveExecutionResult:
     """Generate and durably save exactly one Persona message for an M6 intent.
@@ -255,6 +257,11 @@ async def execute_proactive_intention(
         )
         failed_stage = "provider_generate"
         async def generate(_pool: Any) -> str:
+            # M8 may cheaply revalidate durable user activity and Persona
+            # policy after context preparation but immediately before any
+            # provider request. The default M7/manual path is unchanged.
+            if pre_provider_guard is not None and not await pre_provider_guard():
+                raise ProactiveExecutionError("execution_gate_changed")
             generated = await provider(
                 settings,
                 opening_request,

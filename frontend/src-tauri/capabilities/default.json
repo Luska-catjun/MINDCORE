@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Minimum permissions for the MindCore frontend shell.",
   "windows": ["main"],
-  "permissions": ["core:default", "updater:default", "process:default"]
+  "permissions": ["core:default", "updater:default", "process:default", "notification:default"]
 }

@@ -2,7 +2,9 @@ from contextlib import asynccontextmanager, suppress
 from collections.abc import AsyncIterator, Callable
 import asyncio
 import logging
+import os
 from time import perf_counter
+from datetime import datetime, timezone
 
 from fastapi import FastAPI,Request
 from fastapi.responses import JSONResponse
@@ -11,11 +13,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import Settings, get_settings
 from app.database.connection import close_pool, create_pool
 from app.database.migrations import ensure_turso_schema_current
-from app.routers import auth, chat, conversations, episodes, health, identity, messages, observe, relationship, state
+from app.routers import autonomy, auth, chat, conversations, episodes, health, identity, messages, observe, relationship, state
 from app.routers.auth import require_auth_settings, request_is_authenticated
 from app.services.prompt_loader import load_persona_identity_prompt
 from app.services.error_safety import safe_error_type
 from app.services.mindcore.narrative import hydrate_narrative_snapshot
+from app.services.mindcore.autonomy_runtime import (
+    AutonomyRuntimeState,
+    run_autonomy_scheduler,
+)
 from app.services.mindcore.self_model import hydrate_self_model_snapshot
 from app.services.mindcore.snapshot_scope import CognitiveSnapshotScope
 from app.services.turn_recovery import recover_incomplete_turns
@@ -130,12 +136,50 @@ def build_lifespan(
             "recovery", "recovery_task_schedule",
             round((perf_counter() - recovery_started) * 1000),
         )
+    app.state.autonomy_scheduler_task = None
+    app.state.autonomy_runtime_state = None
+    if (
+        settings.proactive_enabled
+        and bool(os.environ.get("MINDCORE_DESKTOP_SHUTDOWN_CAPABILITY"))
+        and settings.database_backend.lower() == "turso"
+        and hasattr(app.state.db_pool, "acquire")
+        and not getattr(app.state.db_pool, "isolated", False)
+    ):
+        runtime_state = AutonomyRuntimeState(started_at=datetime.now(timezone.utc))
+        app.state.autonomy_runtime_state = runtime_state
+
+        async def start_after_recovery() -> None:
+            recovery = app.state.turn_recovery_task
+            if recovery is not None:
+                try:
+                    await recovery
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logging.getLogger("diana.autonomy.runtime").warning(
+                        "AUTONOMY_CYCLE status=not_started reason=recovery_failed category=%s",
+                        type(error).__name__,
+                    )
+                    return
+            await run_autonomy_scheduler(
+                pool=app.state.db_pool,
+                settings=settings,
+                identity_prompt=app.state.diana_identity_prompt,
+                runtime=runtime_state,
+            )
+
+        app.state.autonomy_scheduler_task = asyncio.create_task(start_after_recovery())
     emit_startup_timing(
         "uvicorn", "lifespan_complete", round((perf_counter() - lifespan_started) * 1000)
     )
     try:
         yield
     finally:
+        autonomy_task = app.state.autonomy_scheduler_task
+        if autonomy_task is not None and not autonomy_task.done():
+            autonomy_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await autonomy_task
         recovery_task = app.state.turn_recovery_task
         if recovery_task is not None and not recovery_task.done():
             recovery_task.cancel()
@@ -172,6 +216,7 @@ def create_app(*, settings_override: Settings | None = None, db_pool_factory: Ca
         )
 
     app.include_router(health.router)
+    app.include_router(autonomy.router)
     app.include_router(auth.router)
     @app.middleware("http")
     async def private_access(request: Request, call_next):

@@ -96,4 +96,31 @@ describe("PersonaManager", () => {
     expect(invoke).toHaveBeenCalledWith("remove_persona_avatar", { personaId: "persona-a" });
     expect(changed).toHaveBeenCalled();
   });
+
+  it("loads and saves proactive policy for the active Persona profile", async () => {
+    const changed = vi.fn().mockResolvedValue(undefined);
+    invoke.mockImplementation((command: string, payload?: { settings?: unknown }) => {
+      if (command === "get_proactive_settings") return Promise.resolve({
+        enabled: false, cooldown_seconds: 1800, quiet_hours_enabled: true,
+        quiet_start: "23:00", quiet_end: "07:00",
+      });
+      if (command === "update_proactive_settings") return Promise.resolve(payload?.settings);
+      return Promise.resolve();
+    });
+    render(<PersonaManager mode="manage" personas={personas} onClose={vi.fn()} onChanged={changed} />);
+
+    expect(await screen.findByText("When enabled, MindCore may start a conversation when its goals or needs make it appropriate. This works only while MindCore is running.")).toBeTruthy();
+    await userEvent.click(screen.getByLabelText("Allow this Persona to start conversations"));
+    await userEvent.selectOptions(screen.getByLabelText("Proactive cooldown"), "3600");
+    await userEvent.click(screen.getByRole("button", { name: "Save proactive settings" }));
+
+    expect(invoke).toHaveBeenCalledWith("update_proactive_settings", {
+      personaId: "persona-a",
+      settings: {
+        enabled: true, cooldown_seconds: 3600, quiet_hours_enabled: true,
+        quiet_start: "23:00", quiet_end: "07:00",
+      },
+    });
+    expect(changed).toHaveBeenCalledWith("persona-a");
+  });
 });

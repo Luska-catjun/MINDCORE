@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, ApiError, isDesktopRuntime, setAuthFailureHandler, storeDesktopSession } from "./api/client";
 import {
   type ChatHistoryCache,
@@ -8,7 +10,7 @@ import {
   replaceDurableChatHistory,
   updateChatHistory,
 } from "./chatHistory";
-import type { ChatResponse } from "./types/api";
+import type { ChatResponse, ProactiveEvent } from "./types/api";
 import { Sidebar, type WorkspaceView } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
 import { WorkspacePanel } from "./components/WorkspacePanel";
@@ -19,6 +21,7 @@ import { invoke } from "@tauri-apps/api/core";
 import "./buildRevision";
 import { emitFrontendStartupTiming } from "./startupTiming";
 import { chatDebug } from "./chatDebug";
+import { proactiveDeliveryMode, proactiveUnreadKey, rememberProactiveEvent, shouldMarkProactiveUnread, shouldSendProactiveOsNotification } from "./proactiveEvents";
 import { DEFAULT_PERSONA_DISPLAY_NAME, DEFAULT_USER_DISPLAY_NAME } from "./assets";
 import { PersonaManager, type PersonaSummary } from "./components/PersonaManager";
 import { PersonaAvatar } from "./components/PersonaAvatar";
@@ -60,6 +63,15 @@ function App() {
   const [setupState, setSetupState] = useState<SetupState>(isDesktopRuntime() ? "checking" : "configured");
   const [reconfiguring, setReconfiguring] = useState(false);
   const [updaterAvailable, setUpdaterAvailable] = useState(false);
+  const [unreadByConversation, setUnreadByConversation] = useState<Record<string, number>>({});
+  const [proactiveToast, setProactiveToast] = useState<ProactiveEvent | null>(null);
+  const eventCursorRef = useRef<{ createdAt: string; messageId: string } | null>(null);
+  const eventCursorPersonaRef = useRef<string | null>(null);
+  const seenProactiveIdsRef = useRef(new Set<string>());
+  const proactivePollingRef = useRef(false);
+  const toastTimerRef = useRef<number | null>(null);
+  const chatHistoryRef = useRef(chatHistory);
+  chatHistoryRef.current = chatHistory;
 
   const clearSessionState = useCallback(() => {
     sessionGenerationRef.current += 1;
@@ -171,6 +183,100 @@ function App() {
   }, [clearSessionState, setupState, startupAttempt]);
 
   useEffect(() => {
+    if (!isDesktopRuntime() || authStatus !== "authenticated" || backendStatus !== "connected") {
+      eventCursorRef.current = null;
+      eventCursorPersonaRef.current = null;
+      return;
+    }
+    if (eventCursorPersonaRef.current !== activePersonaId) {
+      eventCursorRef.current = null;
+      eventCursorPersonaRef.current = activePersonaId;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      if (cancelled || proactivePollingRef.current) return;
+      proactivePollingRef.current = true;
+      try {
+        const batch = await api.proactiveEvents(eventCursorRef.current ?? undefined);
+        if (cancelled) return;
+        // First sync only establishes a cursor: old durable proactive turns
+        // must never replay as fresh notifications after restart.
+        const wasBaseline = eventCursorRef.current === null;
+        if (batch.latest_created_at && batch.latest_message_id) {
+          eventCursorRef.current = { createdAt: batch.latest_created_at, messageId: batch.latest_message_id };
+        }
+        if (wasBaseline) return;
+        let backgroundBatch = false;
+        for (const event of batch.events) {
+          const eventDedupeKey = `${event.persona_id}:${event.message_id}`;
+          if (cancelled || !rememberProactiveEvent(seenProactiveIdsRef.current, eventDedupeKey)) continue;
+          const visible = document.visibilityState === "visible";
+          let focused = visible && document.hasFocus();
+          if (visible && isDesktopRuntime()) {
+            try { focused = focused && await getCurrentWindow().isFocused(); } catch { /* in-app behavior remains available */ }
+          }
+          const mode = proactiveDeliveryMode({
+            conversationId: mainConversationId,
+            eventConversationId: event.conversation_id,
+            activeView,
+            visible,
+            focused,
+          });
+          if (shouldMarkProactiveUnread(mode)) {
+            const unreadKey = proactiveUnreadKey(event.persona_id, event.conversation_id);
+            setUnreadByConversation((current) => ({
+              ...current,
+              [unreadKey]: (current[unreadKey] ?? 0) + 1,
+            }));
+          }
+          setProactiveToast(event);
+          if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+          toastTimerRef.current = window.setTimeout(() => setProactiveToast(null), 6500);
+
+          backgroundBatch ||= shouldSendProactiveOsNotification(mode);
+
+          if (event.conversation_id === mainConversationId) {
+            const expectedRevision = chatHistoryRef.current[event.conversation_id]?.revision ?? 0;
+            void api.listMessages(event.conversation_id, 200, 0, true).then((messages) => {
+              if (cancelled) return;
+              setChatHistory((current) => replaceDurableChatHistory(
+                current, event.conversation_id, messages, expectedRevision,
+              ));
+            }).catch(() => undefined);
+          }
+        }
+        if (backgroundBatch) {
+          try {
+            let granted = await isPermissionGranted();
+            if (!granted) granted = (await requestPermission()) === "granted";
+            if (granted) sendNotification({ title: "MindCore", body: `${personaDisplayName}가 먼저 말을 걸었어요.` });
+          } catch {
+            // Permission/platform failures are non-fatal; in-app feedback remains available.
+          }
+        }
+      } catch {
+        // Polling is opportunistic and must not surface a runtime error.
+      } finally {
+        proactivePollingRef.current = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 10_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [activePersonaId, activeView, authStatus, backendStatus, mainConversationId, personaDisplayName]);
+
+  useEffect(() => {
+    if (activeView !== "chat" || !activePersonaId || !mainConversationId) return;
+    const unreadKey = proactiveUnreadKey(activePersonaId, mainConversationId);
+    setUnreadByConversation((current) => {
+      if (!current[unreadKey]) return current;
+      const next = { ...current };
+      delete next[unreadKey];
+      return next;
+    });
+  }, [activePersonaId, activeView, mainConversationId]);
+
+  useEffect(() => {
     if (backendStatus !== "connected") return;
     const expectedGeneration = sessionGenerationRef.current;
     setDesktopSessionError(false);
@@ -256,6 +362,21 @@ function App() {
       setStartupAttempt((value) => value + 1);
     }
   }, [activePersonaId]);
+
+  const openProactiveEvent = useCallback(async (event: ProactiveEvent) => {
+    setProactiveToast(null);
+    window.localStorage.setItem(`${MAIN_CONVERSATION_STORAGE_KEY}:${event.persona_id}`, event.conversation_id);
+    if (event.persona_id !== activePersonaId) await switchPersona(event.persona_id);
+    else { setMainConversationId(event.conversation_id); setActiveView("chat"); }
+    const unreadKey = proactiveUnreadKey(event.persona_id, event.conversation_id);
+    setUnreadByConversation((current) => { const next = { ...current }; delete next[unreadKey]; return next; });
+    try {
+      const windowHandle = getCurrentWindow();
+      await windowHandle.unminimize();
+      await windowHandle.show();
+      await windowHandle.setFocus();
+    } catch { /* already foreground or native focus denied */ }
+  }, [activePersonaId, switchPersona]);
 
   const handlePersonasChanged = useCallback(async (switchTo?: string) => {
     const loaded = await refreshPersonas();
@@ -432,6 +553,7 @@ function App() {
         isOpen={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
         backendStatus={backendStatus}
+        unreadCount={Object.values(unreadByConversation).reduce((total, count) => total + count, 0)}
       />
 
       <main className="main-area">
@@ -476,6 +598,7 @@ function App() {
         )}
       </main>
       {personaManagerMode && <PersonaManager mode={personaManagerMode} personas={personas} avatarRevision={avatarRevision} onClose={() => setPersonaManagerMode(null)} onChanged={handlePersonasChanged} />}
+      {proactiveToast && <button className="proactive-toast" type="button" onClick={() => void openProactiveEvent(proactiveToast)}>{personaDisplayName}가 새 메시지를 보냈어요. 열기</button>}
     </div>
   );
 }
