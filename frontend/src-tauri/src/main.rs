@@ -28,7 +28,7 @@ const MAX_IDENTITY_BYTES: usize = 64 * 1024;
 const SHUTDOWN_CAPABILITY_ENV: &str = "MINDCORE_DESKTOP_SHUTDOWN_CAPABILITY";
 const SHUTDOWN_CAPABILITY_HEADER: &str = "X-MindCore-Desktop-Shutdown";
 const DESKTOP_INSTANCE_HEADER: &str = "X-MindCore-Desktop-Instance";
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const UPDATER_PLUGIN_ENABLED: bool = !cfg!(mindcore_updater_disabled);
 const LLM_PROVIDERS: [&str; 5] = ["gemini", "groq", "anthropic", "xai", "openai"];
@@ -210,6 +210,18 @@ fn validate_database_draft(d: &SetupDraft) -> Result<(), String> {
     }
     Ok(())
 }
+fn validate_preserved_database_token_scope(
+    draft_url: &str,
+    preserve_token: bool,
+    configured_url: Option<&str>,
+) -> Result<(), String> {
+    if preserve_token
+        && configured_url.is_some_and(|url| url.trim() != draft_url.trim())
+    {
+        return Err("Enter the database token for the new database URL.".into());
+    }
+    Ok(())
+}
 fn validate_llm_draft(d: &SetupDraft) -> Result<(), String> {
     if !LLM_PROVIDERS.contains(&d.llm_provider.as_str()) {
         return Err("Choose a supported language model provider.".into());
@@ -338,6 +350,13 @@ fn draft_env_for_persona_name(
         .ok()
         .map(|text| persona_registry::parse_env(&text))
         .unwrap_or_default();
+    let configured_database_url = active_config_value(app, "DATABASE_URL")
+        .or_else(|| values.get("DATABASE_URL").cloned());
+    validate_preserved_database_token_scope(
+        &d.database_url,
+        d.preserve_database_auth_token,
+        configured_database_url.as_deref(),
+    )?;
     let token = if d.preserve_database_auth_token {
         active_config_value(app, "DATABASE_AUTH_TOKEN")
             .or_else(|| existing_secret(app, "DATABASE_AUTH_TOKEN"))
@@ -429,34 +448,114 @@ fn preflight_draft_env(app: &AppHandle, action: &str, d: &SetupDraft) -> Result<
 fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
     persona_registry::secure_atomic_write(path, text)
 }
-#[cfg(debug_assertions)]
-fn print_setup_failure_diagnostic(action: &str, exit_code: Option<i32>, stderr: &[u8]) {
-    // The sidecar emits this line from a fixed, secret-free formatter. Do not
-    // print arbitrary stderr: driver errors can echo a URL or other input.
-    let stderr = String::from_utf8_lossy(stderr);
-    let diagnostic = stderr
+#[derive(Debug, PartialEq)]
+struct SetupFailureDiagnostic {
+    action: String,
+    phase: String,
+    category: String,
+    statement_index: Option<u32>,
+    object: Option<String>,
+    exception_class: Option<String>,
+}
+
+fn safe_setup_identifier(value: &str, max_len: usize) -> Option<String> {
+    if value.is_empty()
+        || value.len() > max_len
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn parse_setup_failure_diagnostic(stderr: &[u8]) -> Option<SetupFailureDiagnostic> {
+    // Parse only the Python sidecar's fixed diagnostic record. Arbitrary stderr
+    // is never returned or logged because drivers may echo URLs or credentials.
+    let line = std::str::from_utf8(stderr)
+        .ok()?
         .lines()
-        .find(|line| line.starts_with("MINDCORE_SETUP_DIAGNOSTIC "));
-    if let Some(diagnostic) = diagnostic {
-        eprintln!(
-            "[MINDCORE_SETUP_DIAGNOSTIC] action={} sidecar_exit_code={} {}",
-            action,
-            exit_code
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "signal".to_string()),
-            diagnostic
-                .strip_prefix("MINDCORE_SETUP_DIAGNOSTIC ")
-                .unwrap_or_default(),
+        .find_map(|line| line.strip_prefix("MINDCORE_SETUP_DIAGNOSTIC "))?;
+    let mut fields = BTreeMap::new();
+    for field in line.split_whitespace() {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        if matches!(
+            key,
+            "action" | "phase" | "category" | "statement_index" | "object" | "exception_class"
+        ) {
+            fields.insert(key, value);
+        }
+    }
+    let action = safe_setup_identifier(fields.get("action")?, 24)?;
+    let phase = safe_setup_identifier(fields.get("phase")?, 48)?;
+    let category = safe_setup_identifier(fields.get("category")?, 48)?;
+    let statement_index = fields
+        .get("statement_index")
+        .filter(|value| **value != "unavailable")
+        .and_then(|value| value.parse::<u32>().ok());
+    let object = fields
+        .get("object")
+        .filter(|value| **value != "unavailable")
+        .and_then(|value| safe_setup_identifier(value, 96));
+    let exception_class = fields
+        .get("exception_class")
+        .and_then(|value| safe_setup_identifier(value, 96));
+    Some(SetupFailureDiagnostic {
+        action,
+        phase,
+        category,
+        statement_index,
+        object,
+        exception_class,
+    })
+}
+
+fn format_setup_failure_diagnostic(
+    requested_action: &str,
+    exit_code: Option<i32>,
+    stderr: &[u8],
+) -> String {
+    let exit_code = exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    let Some(diagnostic) = parse_setup_failure_diagnostic(stderr) else {
+        return format!(
+            "[MINDCORE_SETUP_DIAGNOSTIC] action={requested_action} sidecar_exit_code={exit_code} diagnostic=unavailable"
         );
-    } else {
-        eprintln!(
-            "[MINDCORE_SETUP_DIAGNOSTIC] action={} sidecar_exit_code={} diagnostic=unavailable",
-            action,
-            exit_code
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "signal".to_string()),
+    };
+    if diagnostic.action != requested_action {
+        return format!(
+            "[MINDCORE_SETUP_DIAGNOSTIC] action={requested_action} sidecar_exit_code={exit_code} diagnostic=unavailable"
         );
     }
+    let mut safe = format!(
+        "[MINDCORE_SETUP_DIAGNOSTIC] action={} phase={} category={} sidecar_exit_code={}",
+        diagnostic.action, diagnostic.phase, diagnostic.category, exit_code
+    );
+    if let Some(statement_index) = diagnostic.statement_index {
+        safe.push_str(&format!(" statement_index={statement_index}"));
+    }
+    if let Some(object) = diagnostic.object {
+        safe.push_str(&format!(" object={object}"));
+    }
+    if let Some(exception_class) = diagnostic.exception_class {
+        safe.push_str(&format!(" exception_class={exception_class}"));
+    }
+    safe
+}
+
+fn print_setup_failure_diagnostic(action: &str, exit_code: Option<i32>, stderr: &[u8]) {
+    eprintln!("{}", format_setup_failure_diagnostic(action, exit_code, stderr));
+}
+fn setup_failure_is_schema_incompatible(stderr: &[u8]) -> bool {
+    // Python emits this fixed, secret-free diagnostic line for setup actions.
+    // Never surface arbitrary stderr: libSQL and provider failures may include
+    // credentials or connection URLs.
+    parse_setup_failure_diagnostic(stderr)
+        .is_some_and(|diagnostic| diagnostic.category == "schema")
 }
 fn setup_action(app: &AppHandle, action: &str, draft: &SetupDraft) -> Result<String, String> {
     validate_setup_action(action, draft)?;
@@ -478,43 +577,73 @@ fn setup_action(app: &AppHandle, action: &str, draft: &SetupDraft) -> Result<Str
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
-        #[cfg(debug_assertions)]
         print_setup_failure_diagnostic(action, output.status.code(), &output.stderr);
+        if action == "initialize" && setup_failure_is_schema_incompatible(&output.stderr) {
+            return Err("SETUP_SCHEMA_INCOMPATIBLE".into());
+        }
+        if action == "initialize" {
+            return Err("SETUP_DATABASE_INITIALIZE_FAILED".into());
+        }
         Err("Setup validation failed. Check the values and try again.".into())
     }
 }
 fn ensure_desktop_auth(app: &AppHandle) -> Result<(), String> {
     let config = config_path(app)?;
-    let output = tauri::async_runtime::block_on(
-        sidecar(app)?
-            .args(["--desktop-ensure-auth", "--config"])
-            .arg(&config)
-            .output(),
-    )
-    .map_err(|_| "MindCore desktop authentication could not be prepared.".to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err("MindCore desktop authentication could not be prepared.".into())
-    }
+    ensure_desktop_auth_config(&config)
 }
-fn desktop_session(app: &AppHandle) -> Result<String, String> {
-    ensure_desktop_auth(app)?;
-    let config = config_path(app)?;
-    let output = tauri::async_runtime::block_on(
-        sidecar(app)?
-            .args(["--desktop-print-session", "--config"])
-            .arg(&config)
-            .output(),
-    )
-    .map_err(|_| "MindCore desktop session could not start.".to_string())?;
-    if output.status.success() {
-        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !token.is_empty() {
-            return Ok(token);
+
+fn ensure_desktop_auth_config(config: &Path) -> Result<(), String> {
+    let text = fs::read_to_string(config)
+        .map_err(|_| "MindCore desktop authentication could not be prepared.".to_string())?;
+    let keys: std::collections::HashSet<&str> = text
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(key, _)| key))
+        .collect();
+    let mut additions = Vec::new();
+    for key in ["PRIVATE_ACCESS_PASSWORD", "AUTH_SIGNING_SECRET"] {
+        if !keys.contains(key) {
+            additions.push(format!("{key}={}", new_auth_secret()?));
         }
     }
-    Err("MindCore desktop session could not start.".into())
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(config, fs::Permissions::from_mode(0o600))
+            .map_err(|_| "MindCore desktop authentication could not be prepared.".to_string())?;
+    }
+    if additions.is_empty() {
+        return Ok(());
+    }
+    let mut updated = text;
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&additions.join("\n"));
+    updated.push('\n');
+    atomic_write(config, &updated)
+}
+
+fn new_auth_secret() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|_| "MindCore desktop authentication could not be prepared.".to_string())?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+fn desktop_session(app: &AppHandle) -> Result<String, String> {
+    let session_started = Instant::now();
+    startup_timing("desktop_session_enter", session_started);
+    let capability = app
+        .state::<Sidecar>()
+        .lifecycle
+        .lock()
+        .map_err(|_| "MindCore desktop session could not start.".to_string())?
+        .current_capability()
+        .ok_or_else(|| "MindCore desktop session could not start.".to_string())?;
+    startup_timing("desktop_session_capability_ready", session_started);
+    let token = request_desktop_session(&capability)
+        .ok_or_else(|| "MindCore desktop session could not start.".to_string())?;
+    startup_timing("desktop_session_process_done", session_started);
+    Ok(token)
 }
 fn new_shutdown_capability() -> Result<String, String> {
     let mut bytes = [0_u8; 32];
@@ -524,6 +653,32 @@ fn new_shutdown_capability() -> Result<String, String> {
 }
 fn lifecycle_request(method: &str, path: &str, capability: &str) -> String {
     format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{SHUTDOWN_CAPABILITY_HEADER}: {capability}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+}
+fn desktop_session_response_token(response: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct SessionResponse {
+        access_token: String,
+    }
+    let text = std::str::from_utf8(response).ok()?;
+    let (headers, body) = text.split_once("\r\n\r\n")?;
+    let status_ok = headers.lines().next()?.split_whitespace().nth(1) == Some("200");
+    if !status_ok || body.len() > 4096 {
+        return None;
+    }
+    let parsed: SessionResponse = serde_json::from_str(body).ok()?;
+    (!parsed.access_token.is_empty()).then_some(parsed.access_token)
+}
+fn request_desktop_session(capability: &str) -> Option<String> {
+    let address = SocketAddr::from(([127, 0, 0, 1], DESKTOP_PORT));
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream
+        .write_all(lifecycle_request("GET", "/_desktop/session", capability).as_bytes())
+        .ok()?;
+    let mut response = Vec::with_capacity(512);
+    stream.take(8192).read_to_end(&mut response).ok()?;
+    desktop_session_response_token(&response)
 }
 fn readiness_response_is_current(response: &[u8], capability: &str) -> bool {
     let Ok(text) = std::str::from_utf8(response) else {
@@ -538,10 +693,14 @@ fn readiness_response_is_current(response: &[u8], capability: &str) -> bool {
             })
         })
 }
-fn request_instance_readiness(capability: &str) -> bool {
+struct ReadinessAttempt {
+    tcp_connected: bool,
+    ready: bool,
+}
+fn request_instance_readiness(capability: &str) -> ReadinessAttempt {
     let address = SocketAddr::from(([127, 0, 0, 1], DESKTOP_PORT));
     let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(150)) else {
-        return false;
+        return ReadinessAttempt { tcp_connected: false, ready: false };
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(150)));
@@ -549,7 +708,7 @@ fn request_instance_readiness(capability: &str) -> bool {
         .write_all(lifecycle_request("GET", "/_desktop/ready", capability).as_bytes())
         .is_err()
     {
-        return false;
+        return ReadinessAttempt { tcp_connected: true, ready: false };
     }
     let mut response = Vec::with_capacity(256);
     let mut chunk = [0_u8; 128];
@@ -562,21 +721,63 @@ fn request_instance_readiness(capability: &str) -> bool {
                     break;
                 }
             }
-            Err(_) => return false,
+            Err(_) => return ReadinessAttempt { tcp_connected: true, ready: false },
         }
     }
-    readiness_response_is_current(&response, capability)
+    ReadinessAttempt {
+        tcp_connected: true,
+        ready: readiness_response_is_current(&response, capability),
+    }
+}
+fn local_backend_port_is_occupied() -> bool {
+    local_backend_port_is_occupied_at(DESKTOP_PORT)
+}
+fn local_backend_port_is_occupied_at(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(150),
+    )
+    .is_ok()
+}
+fn startup_timing(operation: &str, started: Instant) {
+    // Fixed operation labels only; never include config, profile, or child output.
+    eprintln!(
+        "MINDCORE_STARTUP_TIMING phase=native operation={} elapsed_ms={}",
+        operation,
+        started.elapsed().as_millis()
+    );
+}
+fn safe_python_startup_timing_line(line: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(line);
+    let marker = "MINDCORE_STARTUP_TIMING ";
+    let payload = text.split_once(marker)?.1.trim();
+    let mut fields = payload.split_whitespace();
+    let phase = fields.next()?.strip_prefix("phase=")?;
+    let operation = fields.next()?.strip_prefix("operation=")?;
+    let elapsed = fields.next()?.strip_prefix("elapsed_ms=")?;
+    if fields.next().is_some() || elapsed.is_empty() || !elapsed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let allowed = matches!(
+        (phase, operation),
+        ("settings", "settings_load")
+            | ("identity", "identity_load")
+            | ("database_connect", "pool_create" | "pool_acquire" | "select_1")
+            | ("schema", "fast_schema_snapshot_start" | "fast_schema_snapshot_end" | "ledger_validation" | "fallback_full_classify_start" | "fallback_full_classify_end" | "schema_authority_complete")
+            | ("hydration", "narrative_start" | "narrative_end" | "self_model_start" | "self_model_end")
+            | ("recovery", "recovery_task_schedule")
+            | ("uvicorn", "lifespan_complete" | "ready_route_registered")
+            | ("health", "database_check")
+    );
+    allowed.then(|| {
+        format!(
+            "MINDCORE_STARTUP_TIMING phase={phase} operation={operation} elapsed_ms={elapsed}"
+        )
+    })
 }
 fn start_sidecar(app: &AppHandle) -> Result<(), String> {
-    if !config_is_complete(app)? {
-        return Err("MindCore setup is incomplete.".into());
-    }
-    ensure_desktop_auth(app)?;
-    let profile = active_profile(app)?;
-    let overrides = persona_registry::profile_overrides(&profile)?;
-    let mut command = sidecar(app)?;
-    let config = config_path(app)?;
-    let shutdown_capability = new_shutdown_capability()?;
+    let startup_started = Instant::now();
+    startup_timing("start_sidecar_enter", startup_started);
     let state = app.state::<Sidecar>();
     let generation = match state
         .lifecycle
@@ -586,10 +787,68 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
     {
         StartDecision::AlreadyRunning => return Ok(()),
         StartDecision::InProgress => {
-            return Err("MindCore backend lifecycle operation is already in progress.".into())
+            // Concurrent callers share the in-flight readiness result rather
+            // than returning success before the managed child is usable.
+            let deadline = Instant::now() + STARTUP_TIMEOUT;
+            loop {
+                let lifecycle = state.lifecycle.lock().expect("sidecar lifecycle lock");
+                if lifecycle.is_running() {
+                    return Ok(());
+                }
+                if lifecycle.is_inactive() {
+                    return Err("MindCore backend exited before becoming ready.".into());
+                }
+                drop(lifecycle);
+                if Instant::now() >= deadline {
+                    return Err("MindCore backend startup timed out before readiness.".into());
+                }
+                thread::sleep(STARTUP_POLL_INTERVAL);
+            }
         }
         StartDecision::Spawn { generation } => generation,
     };
+    let prepared = (|| {
+        if !config_is_complete(app)? {
+            return Err("MindCore setup is incomplete.".to_string());
+        }
+        startup_timing("config_complete_done", startup_started);
+        startup_timing("desktop_auth_start", startup_started);
+        ensure_desktop_auth(app)?;
+        startup_timing("desktop_auth_end", startup_started);
+        let profile = active_profile(app)?;
+        startup_timing("profile_load_done", startup_started);
+        let overrides = persona_registry::profile_overrides(&profile)?;
+        startup_timing("profile_overrides_done", startup_started);
+        let command = sidecar(app)?;
+        let config = config_path(app)?;
+        startup_timing("config_path_done", startup_started);
+        let shutdown_capability = new_shutdown_capability()?;
+        startup_timing("capability_generated", startup_started);
+        Ok((profile, overrides, command, config, shutdown_capability))
+    })();
+    let (profile, overrides, mut command, config, shutdown_capability) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            state
+                .lifecycle
+                .lock()
+                .expect("sidecar lifecycle lock")
+                .fail_start(generation);
+            return Err(error);
+        }
+    };
+    if local_backend_port_is_occupied() {
+        state
+            .lifecycle
+            .lock()
+            .expect("sidecar lifecycle lock")
+            .fail_start(generation);
+        return Err(
+            "MindCore backend could not claim its local port. Another application may be using port 8765."
+                .into(),
+        );
+    }
+    startup_timing("port_check_done", startup_started);
     for (key, value) in overrides {
         command = command.env(key, value);
     }
@@ -597,15 +856,20 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
         .env("PERSONA_ID", &profile.persona_id)
         .env("PERSONA_DISPLAY_NAME", &profile.display_name)
         .env("PERSONA_IDENTITY_PATH", &profile.identity_path);
+    startup_timing("sidecar_command_prepared", startup_started);
     let port = DESKTOP_PORT.to_string();
     let pid = std::process::id().to_string();
+    startup_timing("sidecar_spawn_start", startup_started);
     let spawned = command
         .args(["--port", &port, "--parent-pid", &pid])
         .env("MINDCORE_ENV_FILE", config)
         .env(SHUTDOWN_CAPABILITY_ENV, &shutdown_capability)
         .spawn();
     let (mut events, child) = match spawned {
-        Ok(spawned) => spawned,
+        Ok(spawned) => {
+            startup_timing("sidecar_spawn_success", startup_started);
+            spawned
+        }
         Err(_) => {
             state
                 .lifecycle
@@ -628,6 +892,11 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn(async move {
         while let Some(event) = events.recv().await {
             match event {
+                CommandEvent::Stdout(line) | CommandEvent::Stderr(line) => {
+                    if let Some(safe_line) = safe_python_startup_timing_line(&line) {
+                        eprintln!("{safe_line}");
+                    }
+                }
                 CommandEvent::Terminated(_) => {
                     let _ = lifecycle
                         .lock()
@@ -647,6 +916,8 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
         }
     });
     let deadline = Instant::now() + STARTUP_TIMEOUT;
+    startup_timing("ready_poll_start", startup_started);
+    let mut tcp_accept_logged = false;
     loop {
         if !state
             .lifecycle
@@ -656,7 +927,14 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
         {
             return Err("MindCore backend exited before becoming ready.".into());
         }
-        if request_instance_readiness(&shutdown_capability) {
+        let readiness = request_instance_readiness(&shutdown_capability);
+        if readiness.tcp_connected && !tcp_accept_logged {
+            startup_timing("port_listen_detected", startup_started);
+            startup_timing("first_tcp_accept", startup_started);
+            tcp_accept_logged = true;
+        }
+        if readiness.ready {
+            startup_timing("ready_success", startup_started);
             if state
                 .lifecycle
                 .lock()
@@ -680,7 +958,8 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
     {
         let _ = child.kill();
     }
-    Err("MindCore backend could not claim its local port. Another application may be using port 8765.".into())
+    startup_timing("ready_timeout", startup_started);
+    Err("MindCore backend startup timed out before readiness.".into())
 }
 
 fn run_setup_with_config(app: &AppHandle, action: &str, config: &Path) -> Result<String, String> {
@@ -945,11 +1224,14 @@ fn delete_persona(
 
 #[tauri::command]
 fn get_setup_status(app: AppHandle) -> Result<SetupStatus, String> {
-    Ok(SetupStatus {
+    let started = Instant::now();
+    let status = SetupStatus {
         configured: config_is_complete(&app)?,
         config_path: config_path(&app)?.to_string_lossy().into(),
         identity_path: identity_path(&app)?.to_string_lossy().into(),
-    })
+    };
+    startup_timing("setup_status_done", started);
+    Ok(status)
 }
 #[tauri::command]
 fn get_runtime_capabilities() -> RuntimeCapabilities {
@@ -1018,22 +1300,34 @@ fn generic_identity_template(app: AppHandle) -> Result<String, String> {
 }
 #[tauri::command]
 fn save_mindcore_config(app: AppHandle, draft: SetupDraft, identity: String) -> Result<(), String> {
+    save_mindcore_config_inner(&app, &draft, &identity).map_err(|_| {
+        eprintln!(
+            "[MINDCORE_SETUP_DIAGNOSTIC] action=save phase=config_save category=config"
+        );
+        "SETUP_CONFIG_SAVE_FAILED".to_string()
+    })
+}
+fn save_mindcore_config_inner(
+    app: &AppHandle,
+    draft: &SetupDraft,
+    identity: &str,
+) -> Result<(), String> {
     if !draft.preserve_identity
         && (identity.is_empty() || identity.len() > MAX_IDENTITY_BYTES || identity.contains('\0'))
     {
         return Err("Identity must be UTF-8 plain text under 64 KB.".into());
     }
-    validate_draft(&draft)?;
-    let config = config_path(&app)?;
-    let identity_path = identity_path(&app)?;
-    let existing_registry = registry(&app)?;
-    let full_values = persona_registry::parse_env(&draft_env(&app, &draft)?);
+    validate_draft(draft)?;
+    let config = config_path(app)?;
+    let identity_path = identity_path(app)?;
+    let existing_registry = registry(app)?;
+    let full_values = persona_registry::parse_env(&draft_env(app, draft)?);
     let global = render_env_values(persona_registry::global_config_values(&full_values));
     if !draft.preserve_identity {
         atomic_write(&identity_path, &identity)?;
     }
     if existing_registry.is_some() {
-        persist_active_draft(&app, &draft)?;
+        persist_active_draft(app, draft)?;
         atomic_write(&config, &global)?;
     } else {
         atomic_write(&config, &global)?;
@@ -1050,11 +1344,57 @@ fn save_mindcore_config(app: AppHandle, draft: SetupDraft, identity: String) -> 
 }
 #[tauri::command]
 fn start_mindcore_backend(app: AppHandle) -> Result<(), String> {
-    start_sidecar(&app)
+    start_sidecar(&app).map_err(|error| {
+        // Keep the user-facing error generic, but make direct-upgrade reports
+        // distinguishable in native logs without exposing config or secrets.
+        eprintln!(
+            "[MINDCORE_STARTUP_DIAGNOSTIC] category={}",
+            startup_failure_category(&error)
+        );
+        "SETUP_BACKEND_START_FAILED".to_string()
+    })
+}
+fn startup_failure_category(error: &str) -> &'static str {
+    if error.contains("setup is incomplete") || error.contains("Persona") {
+        "config_or_persona"
+    } else if error.contains("sidecar") && error.contains("unavailable") {
+        "sidecar_spawn"
+    } else if error.contains("exited before becoming ready") {
+        "sidecar_exit"
+    } else if error.contains("startup timed out") {
+        "startup_timeout"
+    } else if error.contains("local port") {
+        "port_conflict"
+    } else if error.contains("lifecycle") {
+        "lifecycle"
+    } else {
+        "startup"
+    }
 }
 #[tauri::command]
 fn get_desktop_session(app: AppHandle) -> Result<String, String> {
-    desktop_session(&app)
+    let started = Instant::now();
+    let result = desktop_session(&app);
+    startup_timing("desktop_session_done", started);
+    result
+}
+#[tauri::command]
+fn report_frontend_startup_stage(operation: String, elapsed_ms: u64) {
+    if matches!(
+        operation.as_str(),
+        "native_ready"
+            | "authenticated_session"
+            | "conversation_load_start"
+            | "conversation_load_end"
+            | "chat_history_start"
+            | "chat_history_end"
+            | "chat_ready"
+    ) {
+        eprintln!(
+            "MINDCORE_STARTUP_TIMING phase=frontend operation={} elapsed_ms={}",
+            operation, elapsed_ms
+        );
+    }
 }
 fn open_managed_path(path: &Path) -> Result<(), String> {
     let mut command = if cfg!(target_os = "windows") {
@@ -1350,12 +1690,149 @@ mod setup_validation_tests {
     }
 
     #[test]
+    fn preserved_database_token_cannot_be_reused_for_a_different_url() {
+        assert!(validate_preserved_database_token_scope(
+            "libsql://same.example",
+            true,
+            Some("libsql://same.example"),
+        )
+        .is_ok());
+        assert_eq!(
+            validate_preserved_database_token_scope(
+                "libsql://new.example",
+                true,
+                Some("libsql://old.example"),
+            ),
+            Err("Enter the database token for the new database URL.".into()),
+        );
+        assert!(validate_preserved_database_token_scope(
+            "libsql://new.example",
+            false,
+            Some("libsql://old.example"),
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn classify_and_initialize_still_reject_an_empty_persona_name() {
         let mut draft = database_step_draft();
         draft.api_key = "test-provider-key".into();
         draft.preserve_identity = true;
         assert!(validate_setup_action("classify", &draft).is_err());
         assert!(validate_setup_action("initialize", &draft).is_err());
+    }
+
+    #[test]
+    fn only_the_fixed_safe_schema_diagnostic_maps_to_the_schema_ui_category() {
+        assert!(setup_failure_is_schema_incompatible(
+            b"MINDCORE_SETUP_DIAGNOSTIC action=initialize phase=schema_migration category=schema exception_class=SchemaMigrationError\n"
+        ));
+        assert!(!setup_failure_is_schema_incompatible(
+            b"MINDCORE_SETUP_DIAGNOSTIC action=initialize phase=database_initialize category=driver_or_configuration database_url_present=true\n"
+        ));
+        assert!(!setup_failure_is_schema_incompatible(
+            b"driver error with a database URL that must not be parsed\n"
+        ));
+    }
+
+    #[test]
+    fn release_safe_setup_diagnostic_parser_accepts_reordered_allowlisted_fields() {
+        let parsed = parse_setup_failure_diagnostic(
+            b"ignored raw stderr libsql://private.example token=secret\n\
+MINDCORE_SETUP_DIAGNOSTIC object=emotion_attributions unknown=secret category=schema_or_driver action=initialize exception_class=OperationalError phase=database_bootstrap statement_index=20\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.action, "initialize");
+        assert_eq!(parsed.phase, "database_bootstrap");
+        assert_eq!(parsed.category, "schema_or_driver");
+        assert_eq!(parsed.statement_index, Some(20));
+        assert_eq!(parsed.object.as_deref(), Some("emotion_attributions"));
+        assert_eq!(parsed.exception_class.as_deref(), Some("OperationalError"));
+
+        let formatted = format_setup_failure_diagnostic(
+            "initialize",
+            Some(1),
+            b"driver failed at libsql://private.example token=secret\n\
+MINDCORE_SETUP_DIAGNOSTIC phase=database_bootstrap action=initialize category=schema_or_driver unknown=secret\n",
+        );
+        assert!(formatted.contains("action=initialize phase=database_bootstrap category=schema_or_driver"));
+        assert!(!formatted.contains("private.example"));
+        assert!(!formatted.contains("token"));
+        assert!(!formatted.contains("secret"));
+        assert!(!formatted.contains("unknown"));
+    }
+
+    #[test]
+    fn release_safe_setup_diagnostic_parser_requires_core_fields_and_ignores_raw_stderr() {
+        assert!(parse_setup_failure_diagnostic(
+            b"MINDCORE_SETUP_DIAGNOSTIC action=initialize category=schema\n"
+        )
+        .is_none());
+        let formatted = format_setup_failure_diagnostic(
+            "initialize",
+            Some(1),
+            b"raw URL libsql://private.example token=secret",
+        );
+        assert_eq!(
+            formatted,
+            "[MINDCORE_SETUP_DIAGNOSTIC] action=initialize sidecar_exit_code=1 diagnostic=unavailable"
+        );
+
+        let mismatched_action = format_setup_failure_diagnostic(
+            "database",
+            Some(1),
+            b"MINDCORE_SETUP_DIAGNOSTIC action=llm phase=provider_connection category=provider exception_class=RuntimeError\n",
+        );
+        assert_eq!(
+            mismatched_action,
+            "[MINDCORE_SETUP_DIAGNOSTIC] action=database sidecar_exit_code=1 diagnostic=unavailable"
+        );
+    }
+
+    #[test]
+    fn startup_diagnostics_use_only_safe_categories() {
+        assert_eq!(STARTUP_TIMEOUT, Duration::from_secs(45));
+        assert_eq!(startup_failure_category("MindCore setup is incomplete."), "config_or_persona");
+        assert_eq!(startup_failure_category("MindCore backend exited before becoming ready."), "sidecar_exit");
+        assert_eq!(startup_failure_category("MindCore backend could not claim its local port. Another application may be using port 8765."), "port_conflict");
+        assert_eq!(startup_failure_category("MindCore backend startup timed out before readiness."), "startup_timeout");
+        assert_eq!(startup_failure_category("MindCore backend lifecycle changed during startup."), "lifecycle");
+        assert_eq!(startup_failure_category("unexpected secret-looking input"), "startup");
+    }
+
+    #[test]
+    fn an_occupied_local_port_is_classified_as_port_conflict() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind test port");
+        let port = listener.local_addr().expect("test port address").port();
+        assert!(local_backend_port_is_occupied_at(port));
+        assert_eq!(
+            startup_failure_category(
+                "MindCore backend could not claim its local port. Another application may be using port 8765."
+            ),
+            "port_conflict"
+        );
+    }
+
+    #[test]
+    fn python_startup_timing_forwarder_only_accepts_fixed_safe_fields() {
+        assert_eq!(
+            safe_python_startup_timing_line(
+                b"INFO diana.startup MINDCORE_STARTUP_TIMING phase=database_connect operation=pool_acquire elapsed_ms=123\n"
+            ),
+            Some("MINDCORE_STARTUP_TIMING phase=database_connect operation=pool_acquire elapsed_ms=123".into())
+        );
+        assert_eq!(
+            safe_python_startup_timing_line(
+                b"MINDCORE_STARTUP_TIMING phase=database_connect operation=pool_acquire elapsed_ms=123 token=secret"
+            ),
+            None
+        );
+        assert_eq!(
+            safe_python_startup_timing_line(
+                b"MINDCORE_STARTUP_TIMING phase=database_connect operation=secret elapsed_ms=123"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1387,6 +1864,45 @@ mod setup_validation_tests {
             capability,
         ));
     }
+
+    #[test]
+    fn desktop_session_response_requires_success_and_nonempty_token() {
+        let accepted = desktop_session_response_token(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 24\r\n\r\n{\"access_token\":\"abc\"}",
+        );
+        assert_eq!(accepted.as_deref(), Some("abc"));
+        assert!(desktop_session_response_token(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\n\r\n{}"
+        )
+        .is_none());
+        assert!(desktop_session_response_token(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\n{\"access_token\":\"\"}"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn desktop_auth_config_adds_only_missing_secrets_and_is_owner_only() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config = directory.path().join("mindcore.env");
+        fs::write(&config, "DATABASE_URL=libsql://example\nPRIVATE_ACCESS_PASSWORD=existing\n")
+            .expect("write config");
+        ensure_desktop_auth_config(&config).expect("provision auth");
+        let content = fs::read_to_string(&config).expect("read config");
+        assert!(content.contains("PRIVATE_ACCESS_PASSWORD=existing\n"));
+        let signing_secret = content
+            .lines()
+            .find_map(|line| line.strip_prefix("AUTH_SIGNING_SECRET="))
+            .expect("new signing secret");
+        assert_eq!(signing_secret.len(), 64);
+        ensure_desktop_auth_config(&config).expect("idempotent auth provisioning");
+        assert_eq!(fs::read_to_string(&config).expect("reread config"), content);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&config).expect("metadata").permissions().mode() & 0o777, 0o600);
+        }
+    }
 }
 fn main() {
     let app = tauri::Builder::default()
@@ -1404,6 +1920,7 @@ fn main() {
             save_mindcore_config,
             start_mindcore_backend,
             get_desktop_session,
+            report_frontend_startup_stage,
             stop_mindcore_backend,
             open_configuration_folder,
             open_identity_file,
@@ -1422,9 +1939,9 @@ fn main() {
                 lifecycle: Arc::new(Mutex::new(SidecarLifecycle::new())),
             });
             app.manage(PersonaRegistryLock(Mutex::new(())));
-            if config_is_complete(&app.handle())? {
-                let _ = start_sidecar(&app.handle());
-            }
+            // start_sidecar owns the completeness check; avoid reading and
+            // migrating the same registry twice during native startup.
+            let _ = start_sidecar(&app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())

@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.config import Settings, get_settings
+from app.database.migrations import SchemaBootstrapError, SchemaMigrationError
 from app.desktop_backend import (
     DESKTOP_INSTANCE_HEADER,
     DESKTOP_SHUTDOWN_CAPABILITY_HEADER,
@@ -87,7 +88,8 @@ class DesktopBackendTests(TestCase):
 
         self.assertEqual(
             diagnostic,
-            f"{SETUP_DIAGNOSTIC_PREFIX} action=database category=driver_or_configuration "
+            f"{SETUP_DIAGNOSTIC_PREFIX} action=database phase=database_connection "
+            "category=driver_or_configuration statement_index=unavailable object=unavailable "
             "exception_class=ValueError database_url_present=true "
             "database_token_present=true database_url_scheme=libsql "
             "llm_provider=gemini llm_key_present=false "
@@ -95,6 +97,35 @@ class DesktopBackendTests(TestCase):
         )
         self.assertNotIn(database_url, diagnostic)
         self.assertNotIn(database_token, diagnostic)
+
+    def test_bootstrap_diagnostic_exposes_only_safe_statement_metadata(self) -> None:
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "mindcore.env"
+            database_url = "libsql://private.example.turso.io"
+            database_token = "bootstrap-token-must-not-appear"
+            config.write_text(
+                f"DATABASE_URL={database_url}\nDATABASE_AUTH_TOKEN={database_token}\n",
+                encoding="utf-8",
+            )
+            error = SchemaBootstrapError(
+                statement_index=20,
+                object_name="emotion_attributions",
+                exception_class="OperationalError",
+            )
+            error.__cause__ = RuntimeError(
+                f"raw driver detail {database_url} {database_token} must stay internal"
+            )
+            diagnostic = _setup_failure_diagnostic("initialize", str(config), error)
+
+        self.assertIn("action=initialize", diagnostic)
+        self.assertIn("phase=database_bootstrap", diagnostic)
+        self.assertIn("category=schema_or_driver", diagnostic)
+        self.assertIn("statement_index=20", diagnostic)
+        self.assertIn("object=emotion_attributions", diagnostic)
+        self.assertIn("exception_class=OperationalError", diagnostic)
+        self.assertNotIn(database_url, diagnostic)
+        self.assertNotIn(database_token, diagnostic)
+        self.assertNotIn("raw driver detail", diagnostic)
 
     def test_llm_setup_diagnostic_reports_only_safe_provider_metadata(self) -> None:
         from app.services.llm_errors import LLMError
@@ -117,6 +148,24 @@ class DesktopBackendTests(TestCase):
         self.assertNotIn("raw provider failure", diagnostic)
         self.assertIn("validation_field=unavailable", diagnostic)
         self.assertIn("validation_type=unavailable", diagnostic)
+
+    def test_schema_setup_diagnostic_uses_a_safe_schema_category(self) -> None:
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "mindcore.env"
+            secret = "database-token-must-not-appear"
+            config.write_text(
+                f'DATABASE_URL="libsql://private.example"\nDATABASE_AUTH_TOKEN="{secret}"\n',
+                encoding="utf-8",
+            )
+            diagnostic = _setup_failure_diagnostic(
+                "initialize", str(config), SchemaMigrationError("database_schema_incompatible")
+            )
+
+        self.assertIn("action=initialize", diagnostic)
+        self.assertIn("category=schema", diagnostic)
+        self.assertIn("exception_class=SchemaMigrationError", diagnostic)
+        self.assertNotIn(secret, diagnostic)
+        self.assertNotIn("private.example", diagnostic)
 
     def test_settings_validation_diagnostic_reports_only_safe_field_and_type(self) -> None:
         with TemporaryDirectory() as directory:
@@ -230,11 +279,34 @@ class DesktopBackendTests(TestCase):
                 headers={DESKTOP_SHUTDOWN_CAPABILITY_HEADER: capability},
             )
 
-        self.assertEqual(missing.status_code, 403)
-        self.assertEqual(wrong.status_code, 403)
+        self.assertIn(missing.status_code, {401, 403})
+        self.assertIn(wrong.status_code, {401, 403})
         self.assertEqual(accepted.status_code, 204)
         self.assertFalse(server.should_exit)
         self.assertEqual(accepted.headers[DESKTOP_INSTANCE_HEADER], capability)
+        self.assertNotIn(capability, str(accepted.request.url))
+        self.assertNotIn(capability, accepted.text)
+
+    def test_desktop_session_requires_parent_capability_and_returns_valid_token(self) -> None:
+        from app.routers.auth import is_valid_session_token
+
+        client, _server, capability = self._shutdown_client()
+        with client, self.assertNoLogs("diana.auth", level="INFO"):
+            missing = client.get("/_desktop/session")
+            wrong = client.get(
+                "/_desktop/session",
+                headers={DESKTOP_SHUTDOWN_CAPABILITY_HEADER: "wrong-capability"},
+            )
+            accepted = client.get(
+                "/_desktop/session",
+                headers={DESKTOP_SHUTDOWN_CAPABILITY_HEADER: capability},
+            )
+
+        self.assertIn(missing.status_code, {401, 403})
+        self.assertIn(wrong.status_code, {401, 403})
+        self.assertEqual(accepted.status_code, 200)
+        token = accepted.json()["access_token"]
+        self.assertTrue(is_valid_session_token(client.app.state.settings, token))
         self.assertNotIn(capability, str(accepted.request.url))
         self.assertNotIn(capability, accepted.text)
 

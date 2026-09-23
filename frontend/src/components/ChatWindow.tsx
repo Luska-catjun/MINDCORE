@@ -1,13 +1,14 @@
 // src/components/ChatWindow.tsx
 
 import { useEffect, useRef, useState } from "react";
-import { api, ApiError } from "../api/client";
+import { api, ApiError, isDesktopRuntime } from "../api/client";
 import type { LocalMessage, PendingChatSend } from "../chatHistory";
 import type { ChatResponse } from "../types/api";
 import { chatDebug } from "../chatDebug";
 import { MessageBubble } from "./MessageBubble";
 import { MessageInput } from "./MessageInput";
 import { PersonaAvatar } from "./PersonaAvatar";
+import { emitFrontendStartupTiming } from "../startupTiming";
 
 interface ChatWindowProps {
   personaDisplayName: string;
@@ -49,12 +50,14 @@ export function ChatWindow({
   onSendFailed,
 }: ChatWindowProps) {
   const [loading, setLoading] = useState(false);
+  const [historyReady, setHistoryReady] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const sendingRef = useRef(sending);
   sendingRef.current = sending;
   const historyRef = useRef({ historyRevision, onDurableMessagesLoaded });
+  const chatReadyReportedRef = useRef(false);
   historyRef.current = { historyRevision, onDurableMessagesLoaded };
 
   useEffect(() => {
@@ -65,7 +68,9 @@ export function ChatWindow({
     let cancelled = false;
     const expectedRevision = historyRef.current.historyRevision;
     setLoading(true);
+    setHistoryReady(false);
     setLoadError(null);
+    if (isDesktopRuntime()) emitFrontendStartupTiming("chat_history_start");
 
     api
       .listMessages(conversationId, 200, 0, true)
@@ -85,13 +90,27 @@ export function ChatWindow({
         }
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+          setHistoryReady(true);
+          if (isDesktopRuntime()) emitFrontendStartupTiming("chat_history_end");
+        }
       });
 
     return () => {
       cancelled = true;
     };
   }, [conversationId]);
+
+  useEffect(() => {
+    if (
+      isDesktopRuntime() && conversationId && !loadingConversation && historyReady &&
+      !loadError && !chatReadyReportedRef.current
+    ) {
+      chatReadyReportedRef.current = true;
+      emitFrontendStartupTiming("chat_ready");
+    }
+  }, [conversationId, historyReady, loadError, loadingConversation]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });

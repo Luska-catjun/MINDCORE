@@ -3,12 +3,16 @@ from __future__ import annotations
 from contextlib import asynccontextmanager, redirect_stdout
 import io
 from pathlib import Path
+import subprocess
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
 import libsql
+from fastapi.testclient import TestClient
 
+from app.config import Settings
+from app.database.migrations import SchemaMigrationError
 from app.database.schema_contract import (
     CURRENT_TURSO_BASELINE_VERSION,
     SchemaState,
@@ -16,15 +20,39 @@ from app.database.schema_contract import (
 )
 from app.database.turso import TursoConnection
 from app.desktop_backend import _setup_action
+from app.main import create_app
 from scripts.bootstrap_turso import bootstrap
 from scripts.verify_schema_invariants import verify
 
 
 ROOT = Path(__file__).resolve().parents[2]
 BASELINE_SQL = (ROOT / "db" / "turso" / "baseline_v1.sql").read_text(encoding="utf-8")
+V020_BASELINE_OBJECT = "v0.2.0:db/turso/baseline_v1.sql"
+V020_BASELINE_SHA256 = "9572b4ce3d028739e356385c089aafebd1920a3066a18b455a5d83348476afb5"
+
+
+def released_v020_baseline_sql() -> str:
+    """Read the released v0.2.0 baseline rather than synthesizing a v21 DB."""
+    result = subprocess.run(
+        ["git", "show", V020_BASELINE_OBJECT],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        raise unittest.SkipTest("released v0.2.0 fixture is unavailable in this shallow checkout")
+    import hashlib
+
+    sql = result.stdout
+    if hashlib.sha256(sql.encode("utf-8")).hexdigest() != V020_BASELINE_SHA256:
+        raise AssertionError("released v0.2.0 baseline fixture checksum changed")
+    return sql
 
 
 class LocalPool:
+    isolated = True
+
     def __init__(self) -> None:
         self.connection = TursoConnection(libsql.connect(":memory:"))
         self.closed = False
@@ -43,6 +71,34 @@ async def apply_sql(connection: TursoConnection, sql: str) -> None:
         for statement in sql.split(";"):
             if statement.strip():
                 await connection.execute(statement)
+
+
+def unversioned_released_v21_sql() -> str:
+    sql = BASELINE_SQL.replace(
+        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','23');",
+        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','21');",
+        1,
+    )
+    start = sql.index("-- OBJECT table chat_turns (schema 23)")
+    end = sql.index("-- OBJECT table preference_evidence", start)
+    sql = sql[:start] + sql[end:]
+    sql = sql.replace(
+        "-- OBJECT index idx_chat_turns_recovery\n"
+        "CREATE INDEX idx_chat_turns_recovery ON chat_turns (status, updated_at);\n",
+        "",
+        1,
+    ).replace(
+        "-- OBJECT index idx_chat_turn_stages_recovery\n"
+        "CREATE INDEX idx_chat_turn_stages_recovery ON chat_turn_stages (status, retry_policy, attempt_count);\n",
+        "",
+        1,
+    )
+    return sql.replace(
+        "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n"
+        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','21');\n",
+        "",
+        1,
+    )
 
 
 class TursoSchemaContractTests(unittest.IsolatedAsyncioTestCase):
@@ -92,7 +148,10 @@ class TursoSchemaContractTests(unittest.IsolatedAsyncioTestCase):
                 patch("app.database.connection.close_pool", return_value=None),
             ):
                 self.assertEqual(await _setup_action("classify", str(config)), "PARTIAL_OR_UNKNOWN")
-                with self.assertRaisesRegex(RuntimeError, "partial_or_unknown"):
+                # Desktop delegates all mutation policy to the migration
+                # authority. An arbitrary partial schema remains rejected
+                # there, rather than by an early desktop-only rule.
+                with self.assertRaisesRegex(SchemaMigrationError, "database_schema_incompatible"):
                     await _setup_action("initialize", str(config))
 
         self.assertFalse(self.pool.closed)
@@ -198,6 +257,104 @@ class TursoSchemaContractTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await _setup_action("initialize", str(config)), "BOOTSTRAPPED")
                 self.assertEqual(await _setup_action("classify", str(config)), "INITIALIZED")
                 self.assertEqual(await _setup_action("initialize", str(config)), "INITIALIZED")
+
+    async def test_desktop_initialize_adopts_exact_unversioned_v21(self) -> None:
+        await apply_sql(self.pool.connection, unversioned_released_v21_sql())
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "mindcore.env"
+            config.write_text("DATABASE_BACKEND=turso\n", encoding="utf-8")
+            with (
+                patch("app.desktop_backend._settings_from", return_value=object()),
+                patch("app.database.connection.create_pool", return_value=self.pool),
+                patch("app.database.connection.close_pool", return_value=None),
+            ):
+                self.assertEqual(await _setup_action("classify", str(config)), "PARTIAL_OR_UNKNOWN")
+                self.assertEqual(await _setup_action("initialize", str(config)), "INITIALIZED")
+
+        report = await classify_turso_schema(self.pool.connection)
+        self.assertEqual(report.state, SchemaState.CURRENT)
+
+    async def test_desktop_initialize_directly_upgrades_the_released_v020_versioned_baseline(self) -> None:
+        await apply_sql(self.pool.connection, released_v020_baseline_sql())
+        await self.pool.connection.execute(
+            "insert into conversations(conversation_id,source_device,started_at,ended_at) "
+            "values ($1,$2,$3,$4)",
+            "v020-preserved-conversation", "desktop", "2026-09-19T00:00:00+00:00", None,
+        )
+        self.assertEqual(
+            await self.pool.connection.fetchval(
+                "select value from schema_metadata where key='turso_baseline_version'"
+            ),
+            "21",
+        )
+        with TemporaryDirectory() as directory:
+            config = Path(directory) / "mindcore.env"
+            config.write_text("DATABASE_BACKEND=turso\n", encoding="utf-8")
+            with (
+                patch("app.desktop_backend._settings_from", return_value=object()),
+                patch("app.database.connection.create_pool", return_value=self.pool),
+                patch("app.database.connection.close_pool", return_value=None),
+            ):
+                self.assertEqual(await _setup_action("classify", str(config)), "PARTIAL_OR_UNKNOWN")
+                self.assertEqual(await _setup_action("initialize", str(config)), "INITIALIZED")
+
+        report = await classify_turso_schema(self.pool.connection)
+        self.assertEqual(report.state, SchemaState.CURRENT)
+        self.assertEqual(
+            await self.pool.connection.fetchval(
+                "select count(*) from conversations where conversation_id=$1",
+                "v020-preserved-conversation",
+            ),
+            1,
+        )
+        self.assertIsNotNone(
+            await self.pool.connection.fetchrow(
+                "select name from sqlite_master where type='table' and name='chat_turns'"
+            )
+        )
+
+    async def test_current_backend_startup_upgrades_released_v020_before_runtime_hydration(self) -> None:
+        await apply_sql(self.pool.connection, released_v020_baseline_sql())
+        await self.pool.connection.execute(
+            "insert into conversations(conversation_id,source_device,started_at,ended_at) "
+            "values ($1,$2,$3,$4)",
+            "v020-startup-preserved", "desktop", "2026-09-19T00:00:00+00:00", None,
+        )
+        with TemporaryDirectory() as directory:
+            identity = Path(directory) / "identity.txt"
+            identity.write_text("generic identity", encoding="utf-8")
+            settings = Settings(
+                database_backend="turso",
+                database_url="file::memory:",
+                database_auth_token="test-token",
+                persona_identity_path=str(identity),
+            )
+            async def create_local_pool(_settings: Settings) -> LocalPool:
+                return self.pool
+
+            async def do_not_close(_pool: LocalPool) -> None:
+                return None
+
+            with (
+                patch("app.main.create_pool", create_local_pool),
+                patch("app.main.close_pool", do_not_close),
+            ):
+                app = create_app(settings_override=settings)
+                with TestClient(app) as client:
+                    self.assertEqual(client.get("/health").json(), {"status": "ok", "db": "connected"})
+
+        self.assertEqual(
+            await self.pool.connection.fetchval(
+                "select value from schema_metadata where key='turso_baseline_version'"
+            ),
+            "23",
+        )
+        self.assertEqual(
+            await self.pool.connection.fetchval(
+                "select count(*) from conversations where conversation_id=$1", "v020-startup-preserved"
+            ),
+            1,
+        )
 
     async def test_desktop_database_preflight_remains_read_only(self) -> None:
         await self.pool.connection.execute("create table preflight_probe (id text primary key)")

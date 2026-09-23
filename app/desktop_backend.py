@@ -12,16 +12,28 @@ import sys
 import tempfile
 import threading
 import time
+from time import perf_counter
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response, status
 
 from app.database.schema_contract import (
     CURRENT_TURSO_BASELINE_VERSION,
+    SCHEMA_VERSION_KEY,
     SchemaState,
     classify_turso_schema,
 )
-from app.database.migrations import ensure_turso_schema_current
+from app.database.migrations import (
+    FORWARD_MIGRATIONS,
+    SchemaBootstrapError,
+    SchemaMigrationError,
+    _current_schema_fast_path,
+    _ledger_rows,
+    _schema_version,
+    _validate_ledger_rows,
+    ensure_turso_schema_current,
+)
 from app.main import create_app
+from app.services.startup_timing import emit_startup_timing
 
 
 RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
@@ -93,19 +105,51 @@ def _setup_failure_diagnostic(action: str, config_path: str, error: Exception) -
                 character for character in error_type if character.isalnum() or character in "._"
             ) or "unavailable"
 
-    if isinstance(error, LLMError):
+    statement_index = "unavailable"
+    object_name = "unavailable"
+    if isinstance(error, SchemaBootstrapError):
+        phase = "database_bootstrap"
+        category = "schema_or_driver"
+        statement_index = str(error.statement_index)
+        object_name = "".join(
+            character
+            for character in error.object_name
+            if character.isalnum() or character in "._-"
+        ) or "unknown"
+        error_class = error.exception_class
+    elif isinstance(error, SchemaMigrationError):
+        # The schema authority already reduces its errors to structural,
+        # metadata-only identifiers.  Keep that classification available to
+        # the native shell without disclosing the underlying database input.
+        phase = "schema_migration"
+        category = "schema"
+    elif isinstance(error, LLMError):
+        phase = "llm_preflight"
         category = error.category
     elif isinstance(error, (TimeoutError, ConnectionError)):
+        phase = "database_connection" if action == "database" else "database_initialize"
         category = "connection"
     elif isinstance(error, OSError):
+        phase = "database_connection" if action == "database" else "database_initialize"
         category = "native_or_network"
     elif isinstance(error, ValueError):
+        phase = "database_connection" if action == "database" else "database_initialize"
         category = "driver_or_configuration"
     else:
+        phase = {
+            "database": "database_connection",
+            "llm": "llm_preflight",
+            "classify": "schema_classification",
+            "initialize": "database_initialize",
+        }.get(action, "setup")
         category = "setup"
-    error_class = "".join(character for character in type(error).__name__ if character.isalnum() or character in "._")
+    if not isinstance(error, SchemaBootstrapError):
+        error_class = "".join(
+            character for character in type(error).__name__ if character.isalnum() or character in "._"
+        )
     return (
-        f"{SETUP_DIAGNOSTIC_PREFIX} action={action} category={category} "
+        f"{SETUP_DIAGNOSTIC_PREFIX} action={action} phase={phase} category={category} "
+        f"statement_index={statement_index} object={object_name} "
         f"exception_class={error_class or 'Unknown'} "
         f"database_url_present={str(database_url_present).lower()} "
         f"database_token_present={str(database_token_present).lower()} "
@@ -200,6 +244,20 @@ def _register_desktop_shutdown_route(app: FastAPI, server: object, capability: s
             headers={DESKTOP_INSTANCE_HEADER: capability},
         )
 
+    @app.get("/_desktop/session", include_in_schema=False)
+    async def desktop_session(request: Request) -> dict[str, str]:
+        require_parent_capability(request)
+        from app.routers.auth import create_session_token, require_auth_settings
+
+        settings = request.app.state.settings
+        require_auth_settings(settings)
+        return {
+            "access_token": create_session_token(
+                settings,
+                max_age_seconds=settings.auth_bearer_session_max_age_seconds,
+            )
+        }
+
     @app.post("/_desktop/shutdown", include_in_schema=False)
     async def shutdown(request: Request) -> Response:
         require_parent_capability(request)
@@ -253,17 +311,94 @@ async def _setup_action(action: str, config_path: str) -> str:
                 return classification
             if action != "initialize":
                 raise RuntimeError("unsupported_setup_action")
-            if report.state == SchemaState.PARTIAL_OR_UNKNOWN and (
-                report.version is None
-                or not report.version.isdecimal()
-                or int(report.version) >= int(CURRENT_TURSO_BASELINE_VERSION)
-            ):
-                raise RuntimeError(f"partial_or_unknown: {report.details()}")
             baseline = RESOURCE_ROOT / "db" / "turso" / "baseline_v1.sql"
             result = await ensure_turso_schema_current(
                 connection, baseline_sql=baseline.read_text(encoding="utf-8")
             )
             return "BOOTSTRAPPED" if result.bootstrapped else "INITIALIZED"
+    finally:
+        await close_pool(pool)
+
+
+def _benchmark_record(operation: str, started: float) -> None:
+    """Print a fixed operation label and duration only."""
+    allowed = {
+        "select_1", "version_lookup", "ledger_validation", "fast_startup_schema",
+        "integrity_check", "foreign_key_check", "full_classifier",
+    }
+    if operation in allowed:
+        print(
+            f"MINDCORE_STARTUP_BENCHMARK operation={operation} "
+            f"elapsed_ms={round((perf_counter() - started) * 1000)}"
+        )
+
+
+async def _startup_readonly_benchmark(config_path: str) -> None:
+    """Explicit schema-only benchmark. It performs no writes and prints no values."""
+    from app.database.connection import close_pool, create_pool
+
+    settings = _settings_from(config_path)
+    if settings.database_backend.lower() != "turso":
+        raise RuntimeError("benchmark_requires_turso")
+    pool_started = perf_counter()
+    pool = await create_pool(settings)
+    print(
+        "MINDCORE_STARTUP_BENCHMARK operation=pool_create "
+        f"elapsed_ms={round((perf_counter() - pool_started) * 1000)}"
+    )
+    if pool is None:
+        raise RuntimeError("database_not_configured")
+    try:
+        acquire_started = perf_counter()
+        async with pool.acquire() as connection:
+            print(
+                "MINDCORE_STARTUP_BENCHMARK operation=pool_acquire "
+                f"elapsed_ms={round((perf_counter() - acquire_started) * 1000)}"
+            )
+
+            started = perf_counter()
+            await connection.fetchval("select 1")
+            _benchmark_record("select_1", started)
+
+            started = perf_counter()
+            version_value = await connection.fetchval(
+                "select value from schema_metadata where key=$1", SCHEMA_VERSION_KEY
+            )
+            _benchmark_record("version_lookup", started)
+            safe_version = str(version_value) if str(version_value).isdecimal() else "unavailable"
+            print(f"MINDCORE_STARTUP_BENCHMARK schema_version={safe_version}")
+
+            started = perf_counter()
+            version = await _schema_version(connection)
+            rows = await _ledger_rows(connection)
+            if version is None or not rows:
+                raise RuntimeError("schema_authority_unavailable")
+            _validate_ledger_rows(
+                rows, registry=FORWARD_MIGRATIONS, current_version=version
+            )
+            _benchmark_record("ledger_validation", started)
+
+            started = perf_counter()
+            result = await _current_schema_fast_path(
+                connection,
+                registry=FORWARD_MIGRATIONS,
+                target_version=int(CURRENT_TURSO_BASELINE_VERSION),
+            )
+            _benchmark_record("fast_startup_schema", started)
+            print(f"MINDCORE_STARTUP_BENCHMARK current_schema={str(result is not None).lower()}")
+
+            started = perf_counter()
+            await connection.fetchval("pragma integrity_check")
+            _benchmark_record("integrity_check", started)
+
+            started = perf_counter()
+            await connection.fetch("pragma foreign_key_check")
+            _benchmark_record("foreign_key_check", started)
+
+            started = perf_counter()
+            report = await classify_turso_schema(connection)
+            _benchmark_record("full_classifier", started)
+            print(f"MINDCORE_STARTUP_BENCHMARK classifier_state={report.state.value}")
     finally:
         await close_pool(pool)
 
@@ -277,7 +412,23 @@ def main() -> None:
     parser.add_argument("--setup-print-generic-identity", action="store_true")
     parser.add_argument("--desktop-ensure-auth", action="store_true")
     parser.add_argument("--desktop-print-session", action="store_true")
+    parser.add_argument(
+        "--startup-readonly-benchmark",
+        action="store_true",
+        help="Explicitly benchmark read-only Turso schema startup operations using --config.",
+    )
     args = parser.parse_args()
+    if args.startup_readonly_benchmark:
+        if not args.config:
+            raise SystemExit("--startup-readonly-benchmark requires an explicit --config path")
+        try:
+            asyncio.run(_startup_readonly_benchmark(args.config))
+        except Exception as error:
+            error_name = type(error).__name__
+            safe_name = "".join(char for char in error_name if char.isalnum() or char == "_") or "Exception"
+            print(f"MINDCORE_STARTUP_BENCHMARK status=failed error_type={safe_name}", file=sys.stderr)
+            raise SystemExit(1) from None
+        return
     if args.setup_print_generic_identity:
         print((RESOURCE_ROOT / "app" / "prompts" / "identity_template.txt").read_text(encoding="utf-8"), end="")
         return
@@ -315,6 +466,7 @@ def main() -> None:
         server,
         os.environ.get(DESKTOP_SHUTDOWN_CAPABILITY_ENV),
     )
+    emit_startup_timing("uvicorn", "ready_route_registered", 0)
 
     # Loopback only: the packaged desktop backend is never a LAN server.
     server.run()

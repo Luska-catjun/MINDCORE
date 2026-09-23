@@ -12,7 +12,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
+import re
 import sys
+from time import perf_counter
 from typing import Any
 
 from app.database.schema_contract import (
@@ -20,7 +22,9 @@ from app.database.schema_contract import (
     SCHEMA_VERSION_KEY,
     SchemaState,
     classify_turso_schema,
+    inspect_current_turso_schema,
 )
+from app.services.startup_timing import emit_startup_timing
 
 
 LEDGER_TABLE = "schema_migration_ledger"
@@ -29,6 +33,22 @@ MigrationApply = Callable[[Any], Awaitable[None]]
 
 class SchemaMigrationError(RuntimeError):
     """A safe, metadata-only database schema migration failure."""
+
+
+class SchemaBootstrapError(SchemaMigrationError):
+    """A fresh-baseline failure described only by safe structural metadata."""
+
+    def __init__(
+        self,
+        *,
+        statement_index: int,
+        object_name: str,
+        exception_class: str,
+    ) -> None:
+        super().__init__("database_bootstrap_failed")
+        self.statement_index = statement_index
+        self.object_name = object_name
+        self.exception_class = exception_class
 
 
 class MigrationRegistryError(SchemaMigrationError):
@@ -235,6 +255,29 @@ def _is_released_v22_turn_context_upgrade(report: Any) -> bool:
     )
 
 
+async def _is_unversioned_released_v21_turn_durability_upgrade(
+    connection: Any, report: Any
+) -> bool:
+    """Recognize only the exact metadata-less released-v21 capability gap.
+
+    ``classify_turso_schema`` remains read-only and intentionally reports this
+    shape as partial against the v22 contract.  Adoption is allowed only here,
+    at the mutating migration boundary, after proving that the missing
+    durability tables are the sole contract gap and no legacy ledger exists.
+    """
+    tables = await _tables(connection)
+    return (
+        "schema_metadata" not in tables
+        and LEDGER_TABLE not in tables
+        and report.version is None
+        and report.version_issue is None
+        and set(report.missing_tables) == {"chat_turns", "chat_turn_stages"}
+        and not report.missing_columns
+        and not report.missing_constraints
+        and not report.invariant_errors
+    )
+
+
 def _baseline_checksum(version: int) -> str:
     return migration_checksum(f"MindCore released schema baseline v{version}")
 
@@ -293,8 +336,19 @@ async def _validate_ledger(
     current_version: int,
 ) -> list[dict[str, Any]]:
     rows = await _ledger_rows(connection)
+    _validate_ledger_rows(rows, registry=registry, current_version=current_version)
+    return rows
+
+
+def _validate_ledger_rows(
+    rows: Iterable[dict[str, Any]],
+    *,
+    registry: MigrationRegistry,
+    current_version: int,
+) -> None:
+    rows = list(rows)
     if not rows:
-        return rows
+        return
     highest_version = -1
     for index, row in enumerate(rows):
         migration_id = str(row["migration_id"])
@@ -323,7 +377,72 @@ async def _validate_ledger(
         highest_version = to_version
     if highest_version != current_version:
         raise SchemaMigrationDriftError("database_migration_ledger_version_mismatch")
-    return rows
+
+
+async def _current_schema_fast_path(
+    connection: Any,
+    *,
+    registry: MigrationRegistry,
+    target_version: int,
+) -> MigrationRunResult | None:
+    """Return current after a schema-only snapshot and ledger validation.
+
+    The startup path checks every required table, column, key, index,
+    FK/nullability rule, schema version, and immutable migration ledger. It
+    deliberately does not scan user data with integrity_check or
+    foreign_key_check; those remain in full validation after migrations and
+    in explicit diagnostics.
+    """
+    snapshot_started = perf_counter()
+    emit_startup_timing("schema", "fast_schema_snapshot_start", 0)
+    inspection = await inspect_current_turso_schema(connection)
+    snapshot_elapsed = round((perf_counter() - snapshot_started) * 1000)
+    emit_startup_timing("schema", "fast_schema_snapshot_end", snapshot_elapsed)
+    if inspection is None or inspection.report.state != SchemaState.CURRENT:
+        return None
+    if inspection.report.version != str(target_version) or not inspection.ledger_rows:
+        return None
+    ledger_started = perf_counter()
+    _validate_ledger_rows(
+        inspection.ledger_rows,
+        registry=registry,
+        current_version=target_version,
+    )
+    emit_startup_timing(
+        "schema", "ledger_validation", round((perf_counter() - ledger_started) * 1000)
+    )
+    return MigrationRunResult(target_version, target_version, ())
+
+
+async def validate_turso_schema_full(
+    connection: Any,
+    *,
+    registry: MigrationRegistry = FORWARD_MIGRATIONS,
+    target_version: int = int(CURRENT_TURSO_BASELINE_VERSION),
+) -> None:
+    """Run the full read-only structural, FK, integrity, version, and ledger checks."""
+    report = await classify_turso_schema(connection)
+    if report.state != SchemaState.CURRENT:
+        raise SchemaMigrationError("database_schema_migration_validation_failed")
+    version = await _schema_version(connection)
+    if version != target_version:
+        raise SchemaMigrationError("database_schema_migration_validation_failed")
+    rows = await _ledger_rows(connection)
+    if not rows:
+        raise SchemaMigrationError("database_migration_ledger_missing")
+    _validate_ledger_rows(rows, registry=registry, current_version=target_version)
+
+
+async def _validate_schema_postcondition(
+    connection: Any,
+    *,
+    registry: MigrationRegistry,
+    target_version: int,
+) -> None:
+    """After a write, verify full data and schema invariants before returning."""
+    await validate_turso_schema_full(
+        connection, registry=registry, target_version=target_version
+    )
 
 
 async def _adopt_version_into_ledger(
@@ -426,10 +545,50 @@ def _baseline_path() -> Path:
 
 
 async def _bootstrap_empty_database(connection: Any, baseline_sql: str) -> None:
-    async with connection.transaction():
-        for statement in baseline_sql.split(";"):
-            if statement.strip():
-                await connection.execute(statement)
+    current_index = 0
+    try:
+        async with connection.transaction():
+            for current_index, (statement, object_name) in enumerate(
+                _baseline_statements(baseline_sql), start=1
+            ):
+                try:
+                    await connection.execute(statement)
+                except Exception as error:
+                    raise SchemaBootstrapError(
+                        statement_index=current_index,
+                        object_name=object_name,
+                        exception_class=_safe_exception_class(error),
+                    ) from error
+    except SchemaBootstrapError:
+        raise
+    except Exception as error:
+        # BEGIN/COMMIT/ROLLBACK failures have no trustworthy SQL statement.
+        raise SchemaBootstrapError(
+            statement_index=0,
+            object_name="transaction",
+            exception_class=_safe_exception_class(error),
+        ) from error
+
+
+_BASELINE_OBJECT = re.compile(
+    r"(?m)^-- OBJECT\s+(?:table|index|metadata)\s+([A-Za-z0-9_]+)(?:\s+\([^\n]*\))?\s*$"
+)
+
+
+def _baseline_statements(baseline_sql: str) -> tuple[tuple[str, str], ...]:
+    """Return static baseline statements with a non-secret structural label."""
+    statements: list[tuple[str, str]] = []
+    for statement in baseline_sql.split(";"):
+        if not statement.strip():
+            continue
+        markers = _BASELINE_OBJECT.findall(statement)
+        statements.append((statement, markers[-1] if markers else "unknown"))
+    return tuple(statements)
+
+
+def _safe_exception_class(error: BaseException) -> str:
+    name = type(error).__name__
+    return name if name.replace("_", "").isalnum() else "Exception"
 
 
 async def _adopt_compatible_legacy_database(
@@ -461,6 +620,41 @@ async def _adopt_compatible_legacy_database(
         await _validate_ledger(connection, registry=registry, current_version=target_version)
 
 
+async def _adopt_unversioned_released_v21_database(
+    connection: Any,
+    *,
+    registry: MigrationRegistry,
+) -> None:
+    """Create durable v21 metadata, then let the normal 021→022 path run.
+
+    This intentionally commits the adoption separately from migration 022.
+    A crash after adoption leaves an ordinary versioned v21 database, which the
+    existing forward runner can safely resume on the next initialize.
+    """
+    legacy_version = 21
+    async with connection.transaction():
+        await connection.execute(
+            "create table schema_metadata (key text primary key, value text not null)"
+        )
+        await connection.execute(
+            "insert into schema_metadata(key,value) values ($1,$2)",
+            SCHEMA_VERSION_KEY,
+            str(legacy_version),
+        )
+        await _ensure_ledger_table(connection)
+        await connection.execute(
+            f"""insert into {LEDGER_TABLE}(
+                migration_id, from_version, to_version, checksum, applied_at
+            ) values ($1,$2,$3,$4,$5)""",
+            "baseline_v21",
+            legacy_version,
+            legacy_version,
+            _baseline_checksum(legacy_version),
+            datetime.now(timezone.utc),
+        )
+        await _validate_ledger(connection, registry=registry, current_version=legacy_version)
+
+
 async def ensure_turso_schema_current(
     connection: Any,
     *,
@@ -473,7 +667,23 @@ async def ensure_turso_schema_current(
     This is intentionally a mutating startup/initialize operation. Connection
     preflight must continue to use ``SELECT 1`` only.
     """
+    authority_started = perf_counter()
+    fast_result = await _current_schema_fast_path(
+        connection, registry=registry, target_version=target_version
+    )
+    if fast_result is not None:
+        emit_startup_timing(
+            "schema", "schema_authority_complete",
+            round((perf_counter() - authority_started) * 1000),
+        )
+        return fast_result
+
+    emit_startup_timing("schema", "fallback_full_classify_start", 0)
+    classify_started = perf_counter()
     report = await classify_turso_schema(connection)
+    emit_startup_timing(
+        "schema", "fallback_full_classify_end", round((perf_counter() - classify_started) * 1000)
+    )
     bootstrapped = False
     adopted_legacy = False
     if report.state == SchemaState.EMPTY:
@@ -482,22 +692,33 @@ async def ensure_turso_schema_current(
             baseline_sql if baseline_sql is not None else _baseline_path().read_text(encoding="utf-8"),
         )
         bootstrapped = True
-        report = await classify_turso_schema(connection)
-    if report.state == SchemaState.COMPATIBLE_LEGACY:
+        # The baseline is static release input. Its structural and ledger
+        # postconditions are checked once after ledger adoption below.
+        report = None
+    if report is not None and report.state == SchemaState.COMPATIBLE_LEGACY:
         await _adopt_compatible_legacy_database(
             connection, target_version=target_version, registry=registry
         )
         adopted_legacy = True
-    elif report.state == SchemaState.PARTIAL_OR_UNKNOWN:
+    elif report is not None and report.state == SchemaState.PARTIAL_OR_UNKNOWN:
         version = await _schema_version(connection)
         if version is None:
-            raise SchemaMigrationError("database_schema_incompatible")
+            if not await _is_unversioned_released_v21_turn_durability_upgrade(connection, report):
+                raise SchemaMigrationError("database_schema_incompatible")
+            await _adopt_unversioned_released_v21_database(connection, registry=registry)
+            adopted_legacy = True
+            version = 21
+            # The exact unversioned-v21 shape was already fully classified
+            # before adoption; recording metadata does not change that shape.
         if version > target_version:
             raise UnsupportedSchemaVersionError("unsupported_newer_schema_version")
         if version == target_version:
             raise SchemaMigrationError("database_schema_incompatible")
         if version == 21 and target_version >= 22:
-            if not _is_released_v21_turn_durability_upgrade(report):
+            if not (
+                _is_released_v21_turn_durability_upgrade(report)
+                or adopted_legacy
+            ):
                 raise SchemaMigrationError("PARTIAL_OR_UNKNOWN database_schema_incompatible")
         elif version == 22 and target_version >= 23:
             if not _is_released_v22_turn_context_upgrade(report):
@@ -510,13 +731,18 @@ async def ensure_turso_schema_current(
     result = await run_forward_migrations(
         connection, target_version=target_version, registry=registry
     )
-    final_report = await classify_turso_schema(connection)
-    if final_report.state != SchemaState.CURRENT:
-        raise SchemaMigrationError("database_schema_migration_validation_failed")
-    return MigrationRunResult(
+    await _validate_schema_postcondition(
+        connection, registry=registry, target_version=target_version
+    )
+    result = MigrationRunResult(
         result.initial_version,
         result.final_version,
         result.applied_migration_ids,
         adopted_legacy=adopted_legacy,
         bootstrapped=bootstrapped,
     )
+    emit_startup_timing(
+        "schema", "schema_authority_complete",
+        round((perf_counter() - authority_started) * 1000),
+    )
+    return result

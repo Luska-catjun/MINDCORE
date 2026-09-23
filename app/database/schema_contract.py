@@ -7,11 +7,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import re
 from typing import Any
 
 
 CURRENT_TURSO_BASELINE_VERSION = "23"
 SCHEMA_VERSION_KEY = "turso_baseline_version"
+MIGRATION_LEDGER_TABLE = "schema_migration_ledger"
 
 
 class SchemaState(str, Enum):
@@ -328,6 +330,17 @@ REQUIRED_FOREIGN_KEYS: tuple[tuple[str, str, str, str, str], ...] = (
     ("state_log", "episode_id", "episodes", "episode_id", "NO ACTION"),
 )
 
+_TURN_CONTEXT_COMBINATION_CHECK = (
+    "check(input_source in ('text','internal') and ("
+    "(initiator_actor='user' and trigger_type='user_message' and input_source='text') or "
+    "(initiator_actor='persona' and trigger_type='autonomy_decision' and input_source='internal') or "
+    "(initiator_actor='system' and trigger_type='system_event' and input_source='internal')))"
+)
+
+
+def _normalize_schema_sql(value: str) -> str:
+    return re.sub(r'[\s"`]+', "", value).lower()
+
 
 @dataclass(frozen=True)
 class SchemaReport:
@@ -355,36 +368,29 @@ class SchemaReport:
         return " ".join(parts)
 
 
+@dataclass(frozen=True)
+class CurrentSchemaInspection:
+    """One-round-trip structural snapshot for the normal current-schema path."""
+
+    report: SchemaReport
+    ledger_rows: tuple[dict[str, Any], ...]
+
+
 def _quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
-async def _index_signatures(connection: Any, table: str) -> tuple[set[tuple[str, ...]], set[tuple[str, ...]]]:
-    indexes: set[tuple[str, ...]] = set()
-    unique_indexes: set[tuple[str, ...]] = set()
-    for item in await connection.fetch(f"pragma index_list({_quote_identifier(table)})"):
-        if int(item["partial"]):
-            continue
-        name = str(item["name"])
-        columns = tuple(
-            str(column["name"])
-            for column in sorted(
-                await connection.fetch(f"pragma index_info({_quote_identifier(name)})"),
-                key=lambda column: int(column["seqno"]),
-            )
-        )
-        indexes.add(columns)
-        if int(item["unique"]):
-            unique_indexes.add(columns)
-    return indexes, unique_indexes
-
-
-async def classify_turso_schema(connection: Any) -> SchemaReport:
-    """Classify a connected libSQL database without changing it."""
-    table_rows = await connection.fetch(
-        "select name from sqlite_master where type='table' and name not like 'sqlite_%'"
-    )
-    tables = {str(row["name"]) for row in table_rows}
+def _report_from_metadata(
+    *,
+    tables: set[str],
+    table_info: dict[str, list[dict[str, Any]]],
+    table_sql: dict[str, str],
+    index_info: dict[str, list[dict[str, Any]]],
+    foreign_keys: dict[str, list[dict[str, Any]]],
+    version: str | None,
+    data_invariant_errors: tuple[str, ...] = (),
+) -> SchemaReport:
+    """Evaluate the schema contract from an already materialized snapshot."""
     if not tables:
         return SchemaReport(SchemaState.EMPTY)
 
@@ -392,9 +398,9 @@ async def classify_turso_schema(connection: Any) -> SchemaReport:
     missing_tables = tuple(sorted(required_tables - tables))
     missing_columns: list[str] = []
     missing_constraints: list[str] = []
-    invariant_errors: list[str] = []
+    invariant_errors = list(data_invariant_errors)
     for table in sorted(required_tables & tables):
-        info = await connection.fetch(f"pragma table_info({_quote_identifier(table)})")
+        info = table_info.get(table, [])
         columns = {str(item["name"]): int(item["notnull"]) for item in info}
         missing_columns.extend(
             f"{table}.{column}" for column in sorted(REQUIRED_COLUMNS[table] - columns.keys())
@@ -410,7 +416,28 @@ async def classify_turso_schema(connection: Any) -> SchemaReport:
         if primary_key != expected_primary_key:
             missing_constraints.append(f"{table} PRIMARY KEY({','.join(expected_primary_key)})")
 
-        indexes, unique_indexes = await _index_signatures(connection, table)
+        turn_context_columns = {"initiator_actor", "trigger_type", "input_source"}
+        if table == "chat_turns" and turn_context_columns.issubset(columns):
+            if _normalize_schema_sql(_TURN_CONTEXT_COMBINATION_CHECK) not in _normalize_schema_sql(
+                table_sql.get(table, "")
+            ):
+                missing_constraints.append("chat_turns CHECK(turn_context_combination)")
+
+        indexes: set[tuple[str, ...]] = set()
+        unique_indexes: set[tuple[str, ...]] = set()
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for item in index_info.get(table, []):
+            grouped.setdefault(str(item["index_name"]), []).append(item)
+        for items in grouped.values():
+            if int(items[0]["partial"]):
+                continue
+            columns_signature = tuple(
+                str(item["column_name"])
+                for item in sorted(items, key=lambda item: int(item["seqno"]))
+            )
+            indexes.add(columns_signature)
+            if int(items[0]["unique"]):
+                unique_indexes.add(columns_signature)
         for signature in REQUIRED_UNIQUE_CONSTRAINTS.get(table, ()):
             if signature not in unique_indexes:
                 missing_constraints.append(f"{table} UNIQUE({','.join(signature)})")
@@ -428,7 +455,7 @@ async def classify_turso_schema(connection: Any) -> SchemaReport:
                 str(item["to"]),
                 str(item["on_delete"]).upper(),
             )
-            for item in await connection.fetch(f"pragma foreign_key_list({_quote_identifier(table)})")
+            for item in foreign_keys.get(table, [])
         }
         expected = (child, parent, parent_column, action)
         if expected not in actual:
@@ -436,37 +463,22 @@ async def classify_turso_schema(connection: Any) -> SchemaReport:
                 f"{table}.{child} FK({parent}.{parent_column}) ON DELETE {action}"
             )
 
-    # Every SET NULL link must target a nullable child, including additive
-    # future tables not yet named by this contract.
     for table in sorted(tables):
         if table.endswith(("__cascade", "_new", "_old")):
             invariant_errors.append(f"temporary_table:{table}")
-
-    for table in sorted(tables):
-        info = await connection.fetch(f"pragma table_info({_quote_identifier(table)})")
-        nullable = {str(item["name"]): not bool(item["notnull"]) for item in info}
-        for item in await connection.fetch(f"pragma foreign_key_list({_quote_identifier(table)})"):
+        nullable = {
+            str(item["name"]): not bool(int(item["notnull"]))
+            for item in table_info.get(table, [])
+        }
+        for item in foreign_keys.get(table, []):
             child = str(item["from"])
             if str(item["on_delete"]).upper() == "SET NULL" and not nullable.get(child, False):
                 invariant_errors.append(f"set_null_not_nullable:{table}.{child}")
 
-    try:
-        if await connection.fetch("pragma foreign_key_check"):
-            invariant_errors.append("foreign_key_check")
-    except Exception:
-        invariant_errors.append("foreign_key_check_error")
-    try:
-        integrity = await connection.fetchval("pragma integrity_check")
-        if integrity != "ok":
-            invariant_errors.append("integrity_check")
-    except Exception:
-        invariant_errors.append("integrity_check_error")
-
-    version: str | None = None
     version_issue: str | None = None
     has_metadata = "schema_metadata" in tables
     if has_metadata:
-        metadata_info = await connection.fetch('pragma table_info("schema_metadata")')
+        metadata_info = table_info.get("schema_metadata", [])
         metadata_columns = {str(item["name"]) for item in metadata_info}
         missing_columns.extend(
             f"schema_metadata.{column}"
@@ -483,15 +495,10 @@ async def classify_turso_schema(connection: Any) -> SchemaReport:
             missing_constraints.append("schema_metadata PRIMARY KEY(key)")
         if not {"key", "value"}.issubset(metadata_columns):
             version_issue = "invalid_metadata_table"
-        else:
-            version_value = await connection.fetchval(
-                "select value from schema_metadata where key=$1", SCHEMA_VERSION_KEY
-            )
-            version = str(version_value) if version_value is not None else None
-            if version is None:
-                version_issue = "missing"
-            elif version != CURRENT_TURSO_BASELINE_VERSION:
-                version_issue = f"unsupported:{version}"
+        elif version is None:
+            version_issue = "missing"
+        elif version != CURRENT_TURSO_BASELINE_VERSION:
+            version_issue = f"unsupported:{version}"
 
     contract_errors = bool(
         missing_tables or missing_columns or missing_constraints or invariant_errors or version_issue
@@ -502,7 +509,6 @@ async def classify_turso_schema(connection: Any) -> SchemaReport:
         state = SchemaState.CURRENT
     else:
         state = SchemaState.COMPATIBLE_LEGACY
-
     return SchemaReport(
         state=state,
         version=version,
@@ -511,4 +517,177 @@ async def classify_turso_schema(connection: Any) -> SchemaReport:
         missing_columns=tuple(sorted(missing_columns)),
         missing_constraints=tuple(sorted(missing_constraints)),
         invariant_errors=tuple(sorted(set(invariant_errors))),
+    )
+
+
+_BATCHED_COLUMNS_SQL = """
+select m.name as table_name, m.sql as table_sql, p.name, p.[notnull], p.pk
+from sqlite_master m, pragma_table_info(m.name) p
+where m.type='table' and m.name not like 'sqlite_%'
+"""
+_BATCHED_INDEXES_SQL = """
+select m.name as table_name, il.name as index_name, il.[unique], il.partial,
+       ii.seqno, ii.name as column_name
+from sqlite_master m, pragma_index_list(m.name) il, pragma_index_info(il.name) ii
+where m.type='table' and m.name not like 'sqlite_%'
+"""
+_BATCHED_FOREIGN_KEYS_SQL = """
+select m.name as table_name, fk.[from], fk.[table], fk.[to], fk.on_delete
+from sqlite_master m, pragma_foreign_key_list(m.name) fk
+where m.type='table' and m.name not like 'sqlite_%'
+"""
+
+
+async def _batched_metadata(connection: Any, tables: set[str]) -> tuple[
+    dict[str, list[dict[str, Any]]],
+    dict[str, str],
+    dict[str, list[dict[str, Any]]],
+    dict[str, list[dict[str, Any]]],
+]:
+    columns = await connection.fetch(_BATCHED_COLUMNS_SQL)
+    indexes = await connection.fetch(_BATCHED_INDEXES_SQL)
+    foreign_keys = await connection.fetch(_BATCHED_FOREIGN_KEYS_SQL)
+    table_info = {table: [] for table in tables}
+    table_sql: dict[str, str] = {}
+    index_info = {table: [] for table in tables}
+    foreign_key_info = {table: [] for table in tables}
+    for item in columns:
+        table = str(item["table_name"])
+        table_info.setdefault(table, []).append(item)
+        if item.get("table_sql") is not None:
+            table_sql[table] = str(item["table_sql"])
+    for item in indexes:
+        index_info.setdefault(str(item["table_name"]), []).append(item)
+    for item in foreign_keys:
+        foreign_key_info.setdefault(str(item["table_name"]), []).append(item)
+    return table_info, table_sql, index_info, foreign_key_info
+
+
+async def inspect_current_turso_schema(connection: Any) -> CurrentSchemaInspection | None:
+    """Inspect current schema structure without scanning user data.
+
+    Missing metadata/ledger tables make the UNION fail; callers then use the
+    general classifier. This startup snapshot checks schema metadata only:
+    integrity_check and foreign_key_check scan durable user data and are kept
+    in the explicit full classifier path. The query never reads row content.
+    """
+    query = f"""
+    select 'table' as kind, name as owner, type as name, sql as v1, '' as v2,
+       '' as v3, '' as v4, '' as v5
+from sqlite_master where type='table' and name not like 'sqlite_%'
+union all
+select 'column', m.name, p.name, cast(p.[notnull] as text), cast(p.pk as text),
+       '', '', ''
+from sqlite_master m, pragma_table_info(m.name) p
+where m.type='table' and m.name not like 'sqlite_%'
+union all
+select 'index', m.name, il.name, cast(il.[unique] as text), cast(il.partial as text),
+       cast(ii.seqno as text), ii.name, ''
+from sqlite_master m, pragma_index_list(m.name) il, pragma_index_info(il.name) ii
+where m.type='table' and m.name not like 'sqlite_%'
+union all
+select 'fk', m.name, fk.[from], fk.[table], fk.[to], upper(fk.on_delete), '', ''
+from sqlite_master m, pragma_foreign_key_list(m.name) fk
+where m.type='table' and m.name not like 'sqlite_%'
+union all
+select 'version', 'schema_metadata', value, '', '', '', '', ''
+from schema_metadata where key='{SCHEMA_VERSION_KEY}'
+union all
+select 'ledger', '{MIGRATION_LEDGER_TABLE}', migration_id, cast(from_version as text),
+       cast(to_version as text), checksum, applied_at, ''
+from {MIGRATION_LEDGER_TABLE}
+"""
+    try:
+        rows = await connection.fetch(query)
+    except Exception:
+        return None
+    tables: set[str] = set()
+    table_info: dict[str, list[dict[str, Any]]] = {}
+    table_sql: dict[str, str] = {}
+    index_info: dict[str, list[dict[str, Any]]] = {}
+    foreign_keys: dict[str, list[dict[str, Any]]] = {}
+    version: str | None = None
+    ledger_rows: list[dict[str, Any]] = []
+    for row in rows:
+        kind = str(row["kind"])
+        owner = str(row["owner"])
+        if kind == "table":
+            tables.add(owner)
+            table_sql[owner] = str(row["v1"] or "")
+        elif kind == "column":
+            table_info.setdefault(owner, []).append(
+                {"name": row["name"], "notnull": row["v1"], "pk": row["v2"]}
+            )
+        elif kind == "index":
+            index_info.setdefault(owner, []).append(
+                {
+                    "index_name": row["name"], "unique": row["v1"],
+                    "partial": row["v2"], "seqno": row["v3"],
+                    "column_name": row["v4"],
+                }
+            )
+        elif kind == "fk":
+            foreign_keys.setdefault(owner, []).append(
+                {"from": row["name"], "table": row["v1"], "to": row["v2"], "on_delete": row["v3"]}
+            )
+        elif kind == "version":
+            version = str(row["name"])
+        elif kind == "ledger":
+            ledger_rows.append(
+                {
+                    "migration_id": row["name"], "from_version": row["v1"],
+                    "to_version": row["v2"], "checksum": row["v3"],
+                    "applied_at": row["v4"],
+                }
+            )
+    report = _report_from_metadata(
+        tables=tables,
+        table_info=table_info,
+        table_sql=table_sql,
+        index_info=index_info,
+        foreign_keys=foreign_keys,
+        version=version,
+        data_invariant_errors=(),
+    )
+    return CurrentSchemaInspection(report, tuple(ledger_rows))
+
+
+async def classify_turso_schema(connection: Any) -> SchemaReport:
+    """Classify a connected libSQL database without changing it."""
+    table_rows = await connection.fetch(
+        "select name from sqlite_master where type='table' and name not like 'sqlite_%'"
+    )
+    tables = {str(row["name"]) for row in table_rows}
+    if not tables:
+        return SchemaReport(SchemaState.EMPTY)
+
+    table_info, table_sql, index_info, foreign_keys = await _batched_metadata(connection, tables)
+    invariant_errors: list[str] = []
+
+    try:
+        if await connection.fetch("pragma foreign_key_check"):
+            invariant_errors.append("foreign_key_check")
+    except Exception:
+        invariant_errors.append("foreign_key_check_error")
+    try:
+        integrity = await connection.fetchval("pragma integrity_check")
+        if integrity != "ok":
+            invariant_errors.append("integrity_check")
+    except Exception:
+        invariant_errors.append("integrity_check_error")
+
+    version: str | None = None
+    if "schema_metadata" in tables and {str(item["name"]) for item in table_info.get("schema_metadata", [])} >= {"key", "value"}:
+        version_value = await connection.fetchval(
+            "select value from schema_metadata where key=$1", SCHEMA_VERSION_KEY
+        )
+        version = str(version_value) if version_value is not None else None
+    return _report_from_metadata(
+        tables=tables,
+        table_info=table_info,
+        table_sql=table_sql,
+        index_info=index_info,
+        foreign_keys=foreign_keys,
+        version=version,
+        data_invariant_errors=tuple(invariant_errors),
     )

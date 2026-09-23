@@ -11,9 +11,11 @@ from app.database.migrations import (
     MigrationDefinition,
     MigrationRegistry,
     MigrationRegistryError,
+    SchemaBootstrapError,
     SchemaMigrationDriftError,
     SchemaMigrationError,
     UnsupportedSchemaVersionError,
+    _bootstrap_empty_database,
     ensure_turso_schema_current,
     migration_checksum,
     _apply_turn_context_v23,
@@ -77,6 +79,15 @@ def released_v21_sql() -> str:
         1,
     )
     return sql
+
+
+def unversioned_released_v21_sql() -> str:
+    return released_v21_sql().replace(
+        "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);\n"
+        "INSERT INTO schema_metadata(key,value) VALUES ('turso_baseline_version','21');\n",
+        "",
+        1,
+    )
 
 
 async def execute_script(connection: TursoConnection, sql: str) -> None:
@@ -283,6 +294,7 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_empty_bootstrap_records_baseline_ledger_and_validates_contract(self) -> None:
+        self.assertNotIn("ON DELETE SET NULL ON DELETE SET NULL", BASELINE_SQL)
         result = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
 
         self.assertTrue(result.bootstrapped)
@@ -316,6 +328,52 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
         self.assertEqual(await self.connection.fetchval(f"select count(*) from {LEDGER_TABLE}"), 1)
+
+    async def test_fresh_bootstrap_failure_reports_safe_structure_and_rolls_back(self) -> None:
+        sql = """-- OBJECT table schema_metadata
+create table schema_metadata(key text primary key, value text not null);
+-- OBJECT table schema_migration_ledger
+create table schema_migration_ledger(migration_id text primary key);
+-- OBJECT table retry_marker
+create table retry_marker(id integer primary key);
+"""
+
+        class FailingConnection:
+            def __init__(self, connection: TursoConnection) -> None:
+                self.connection = connection
+                self.execute_count = 0
+
+            def transaction(self):
+                return self.connection.transaction()
+
+            async def execute(self, statement: str) -> None:
+                self.execute_count += 1
+                if self.execute_count == 2:
+                    raise RuntimeError("secret-bearing driver detail must stay internal")
+                await self.connection.execute(statement)
+
+        with self.assertRaises(SchemaBootstrapError) as caught:
+            await _bootstrap_empty_database(FailingConnection(self.connection), sql)
+
+        self.assertEqual(caught.exception.statement_index, 2)
+        self.assertEqual(caught.exception.object_name, "schema_migration_ledger")
+        self.assertEqual(caught.exception.exception_class, "RuntimeError")
+        self.assertEqual(str(caught.exception), "database_bootstrap_failed")
+        self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+        self.assertEqual(
+            await self.connection.fetch(
+                "select name from sqlite_master where type='table' and name not like 'sqlite_%'"
+            ),
+            [],
+        )
+
+        await _bootstrap_empty_database(self.connection, sql)
+        self.assertEqual(
+            {row["name"] for row in await self.connection.fetch(
+                "select name from sqlite_master where type='table' and name not like 'sqlite_%'"
+            )},
+            {"schema_metadata", "schema_migration_ledger", "retry_marker"},
+        )
 
     async def test_compatible_legacy_schema_is_adopted_once_without_historical_replay(self) -> None:
         legacy_sql = BASELINE_SQL.replace(
@@ -371,6 +429,143 @@ class ForwardMigrationTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(await self.connection.fetchval(f"select count(*) from {LEDGER_TABLE}"), 3)
+
+    async def test_unversioned_exact_v21_is_adopted_then_upgraded_once(self) -> None:
+        await execute_script(self.connection, unversioned_released_v21_sql())
+        await self.connection.execute(
+            "insert into conversations(conversation_id,source_device,started_at,ended_at) values($1,$2,$3,$4)",
+            "legacy-conversation", "desktop", "2026-09-12T00:00:00+00:00", None,
+        )
+        await self.connection.execute(
+            "insert into messages(id,conversation_id,sequence,role,content,source_device,created_at) values($1,$2,$3,$4,$5,$6,$7)",
+            "legacy-message", "legacy-conversation", 1, "user", "preserved", "desktop", "2026-09-12T00:00:00+00:00",
+        )
+        await self.connection.execute(
+            "insert into diana_needs(need_key,value,baseline,updated_at,last_triggered_at,metadata) values($1,$2,$3,$4,$5,$6)",
+            "curiosity", 0.6, 0.5, "2026-09-12T00:00:00+00:00", None, "{}",
+        )
+        await self.connection.execute(
+            "insert into diana_goals(id,goal_key,goal_type,summary,origin_need,priority,status,progress,confidence,conversation_id,source_type,source_id,created_at,updated_at,expires_at,metadata) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,$14,$15)",
+            "legacy-goal", "legacy-goal-key", "conversation", "preserved", "curiosity", 0.5,
+            "active", 0.1, 0.8, "legacy-conversation", "message", "legacy-message",
+            "2026-09-12T00:00:00+00:00", None, "{}",
+        )
+        await self.connection.execute(
+            "insert into episodes(episode_id,conversation_id,sequence,summary,recall_frequency,source_device,created_at,user_message_id,episode_type,provenance,is_grounded,updated_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$7)",
+            "legacy-episode", "legacy-conversation", 1, "preserved", 0, "desktop",
+            "2026-09-12T00:00:00+00:00", "legacy-message", "conversation", "runtime", 1,
+        )
+        await self.connection.execute(
+            "insert into memories(memory_id,content,normalized_content,memory_type,importance,source_conversation_id,source_message_id,created_at,updated_at,recall_frequency,memory_strength,source_episode_id) values($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10,$11)",
+            "legacy-memory", "preserved", "preserved", "fact", 0.8, "legacy-conversation",
+            "legacy-message", "2026-09-12T00:00:00+00:00", 0, 0.8, "legacy-episode",
+        )
+        await self.connection.execute(
+            "insert into preferences(preference_id,owner_type,subject,value,preference_type,status,confidence,evidence_count,first_seen_at,last_seen_at,created_at,updated_at) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$9,$9)",
+            "legacy-preference", "user", "tea", "green", "like", "active", 0.8, 1,
+            "2026-09-12T00:00:00+00:00",
+        )
+        await self.connection.execute(
+            "insert into relationship(id,familiarity,trust,affection,shared_experience,conflict_history,updated_at,conflict) values($1,$2,$3,$4,$5,$6,$7,$8)",
+            1, 0.8, 0.8, 0.8, 1.0, "[]", "2026-09-12T00:00:00+00:00", 0.0,
+        )
+        report = await classify_turso_schema(self.connection)
+        self.assertEqual(report.state, SchemaState.PARTIAL_OR_UNKNOWN)
+        self.assertEqual(set(report.missing_tables), {"chat_turns", "chat_turn_stages"})
+        self.assertIsNone(await self.connection.fetchrow(
+            "select name from sqlite_master where type='table' and name='schema_metadata'"
+        ))
+
+        result = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+        rerun = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+
+        self.assertEqual((result.initial_version, result.final_version), (21, 23))
+        self.assertTrue(result.adopted_legacy)
+        self.assertEqual(result.applied_migration_ids, ("022_turn_durability", "023_turn_context"))
+        self.assertEqual(rerun.applied_migration_ids, ())
+        self.assertEqual(await self.connection.fetchval(
+            "select value from schema_metadata where key=$1", SCHEMA_VERSION_KEY
+        ), "23")
+        self.assertEqual(
+            [row["migration_id"] for row in await self.connection.fetch(
+                f"select migration_id from {LEDGER_TABLE} order by to_version, migration_id"
+            )],
+            ["baseline_v21", "022_turn_durability", "023_turn_context"],
+        )
+        self.assertEqual(await self.connection.fetchval(
+            "select count(*) from conversations where conversation_id=$1", "legacy-conversation"
+        ), 1)
+        self.assertEqual(await self.connection.fetchval(
+            "select count(*) from messages where id=$1", "legacy-message"
+        ), 1)
+        self.assertEqual(await self.connection.fetchval(
+            "select value from diana_needs where need_key='curiosity'"
+        ), 0.6)
+        self.assertEqual(await self.connection.fetchval(
+            "select summary from diana_goals where id='legacy-goal'"
+        ), "preserved")
+        self.assertEqual(await self.connection.fetchval(
+            "select content from memories where memory_id='legacy-memory'"
+        ), "preserved")
+        self.assertEqual(await self.connection.fetchval(
+            "select summary from episodes where episode_id='legacy-episode'"
+        ), "preserved")
+        self.assertEqual(await self.connection.fetchval(
+            "select value from preferences where preference_id='legacy-preference'"
+        ), "green")
+        self.assertEqual(await self.connection.fetchval(
+            "select trust from relationship where id=1"
+        ), 0.8)
+
+    async def test_unversioned_v21_with_extra_contract_drift_is_refused_without_adoption(self) -> None:
+        for damaged in ("table", "index", "constraint", "ledger"):
+            with self.subTest(damaged=damaged):
+                raw = libsql.connect(":memory:")
+                connection = TursoConnection(raw)
+                try:
+                    sql = unversioned_released_v21_sql()
+                    if damaged == "constraint":
+                        sql = sql.replace(
+                            'UNIQUE ("conversation_id", "sequence"), ', "", 1
+                        )
+                    await execute_script(connection, sql)
+                    if damaged == "table":
+                        await connection.execute("drop table diana_identity")
+                    elif damaged == "index":
+                        await connection.execute("drop index idx_wm_conversation_active")
+                    else:
+                        await connection.execute(
+                            f"create table {LEDGER_TABLE}(migration_id text primary key, from_version integer, to_version integer, checksum text, applied_at text)"
+                        )
+
+                    with self.assertRaisesRegex(SchemaMigrationError, "database_schema_incompatible"):
+                        await ensure_turso_schema_current(connection, baseline_sql=BASELINE_SQL)
+                    self.assertIsNone(await connection.fetchrow(
+                        "select name from sqlite_master where type='table' and name='schema_metadata'"
+                    ))
+                finally:
+                    raw.close()
+
+    async def test_unversioned_v21_adoption_failure_leaves_retryable_versioned_v21(self) -> None:
+        await execute_script(self.connection, unversioned_released_v21_sql())
+        failing = migration("022_turn_durability", 21, 22, "create table failure_marker(id integer)", fail=True)
+        with self.assertRaisesRegex(SchemaMigrationError, "migration_failed"):
+            await ensure_turso_schema_current(
+                self.connection, baseline_sql=BASELINE_SQL, target_version=22,
+                registry=MigrationRegistry((failing,))
+            )
+
+        self.assertEqual(await self.connection.fetchval(
+            "select value from schema_metadata where key=$1", SCHEMA_VERSION_KEY
+        ), "21")
+        self.assertEqual(await self.connection.fetchval(
+            f"select count(*) from {LEDGER_TABLE} where migration_id='baseline_v21'"
+        ), 1)
+        self.assertIsNone(await self.connection.fetchrow(
+            "select name from sqlite_master where type='table' and name='chat_turns'"
+        ))
+        retry = await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+        self.assertEqual(retry.applied_migration_ids, ("022_turn_durability", "023_turn_context"))
 
     async def test_v22_fresh_and_migrated_turn_schema_are_equivalent(self) -> None:
         await execute_script(self.connection, released_v22_sql())

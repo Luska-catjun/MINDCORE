@@ -34,6 +34,24 @@ describe("SetupWizard validation", () => {
     await waitFor(expectContinueEnabled);
   }
 
+  async function reachReview(onComplete = vi.fn()) {
+    render(<SetupWizard onComplete={onComplete} />);
+    await userEvent.click(screen.getByRole("button", { name: "Get Started" }));
+    await validateDatabase();
+    await userEvent.click(continueButton());
+    fireEvent.change(screen.getByPlaceholderText("Gemini API Key"), { target: { value: "key-a" } });
+    await userEvent.click(screen.getByRole("button", { name: "Test Connection" }));
+    await waitFor(expectContinueEnabled);
+    await userEvent.click(continueButton());
+    await screen.findByRole("heading", { name: "Persona Setup" });
+    fireEvent.change(screen.getByPlaceholderText("Your display name"), { target: { value: "Luska" } });
+    fireEvent.change(screen.getByPlaceholderText("Persona name"), { target: { value: "Jarvis" } });
+    await waitFor(expectContinueEnabled);
+    await userEvent.click(continueButton());
+    await screen.findByRole("heading", { name: "Review / Initialize" });
+    return onComplete;
+  }
+
   it("blocks untested and failed database Next, then invalidates on edit", async () => {
     await enterDatabase();
     expectContinueDisabled();
@@ -177,6 +195,40 @@ describe("SetupWizard validation", () => {
     expectContinueEnabled();
   });
 
+  it("requires a new token when reconfigure changes the database URL", async () => {
+    invoke.mockImplementation((name: string) => {
+      if (name === "get_config_metadata") {
+        return Promise.resolve({
+          database_url: "libsql://existing",
+          llm_provider: "gemini",
+          user_display_name: "Luska",
+          persona_display_name: "Jarvis",
+          turso_token_configured: true,
+          provider_models: providerModels,
+          provider_key_configured: { gemini: true, groq: false, anthropic: false, xai: false, openai: false },
+        });
+      }
+      return Promise.resolve("Connected");
+    });
+    render(<SetupWizard onComplete={vi.fn()} reconfigure />);
+    await userEvent.click(screen.getByRole("button", { name: "Edit configuration" }));
+    await waitFor(() => expect((databaseUrl() as HTMLInputElement).value).toBe("libsql://existing"));
+
+    fireEvent.change(databaseUrl(), { target: { value: "libsql://new-database" } });
+    const token = screen.getByPlaceholderText("Turso Auth Token");
+    fireEvent.change(token, { target: { value: "new-token" } });
+    await userEvent.click(screen.getByRole("button", { name: "Test Connection" }));
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("run_setup_action", {
+      action: "database",
+      draft: expect.objectContaining({
+        database_url: "libsql://new-database",
+        database_auth_token: "new-token",
+        preserve_database_auth_token: false,
+      }),
+    }));
+  });
+
   it("renders five providers with a separate editable model field", async () => {
     await enterDatabase();
     await validateDatabase();
@@ -235,5 +287,99 @@ describe("SetupWizard validation", () => {
     await userEvent.click(continueButton());
     expect(screen.getByText("User: Luska")).toBeTruthy();
     expect(screen.getByText("Persona: Jarvis")).toBeTruthy();
+  });
+
+  it("delegates a PARTIAL_OR_UNKNOWN schema classification to initialize authority", async () => {
+    invoke.mockImplementation((name: string, args?: { action?: string }) => {
+      if (name === "generic_identity_template") return Promise.resolve("IDENTITY");
+      if (name === "run_setup_action" && args?.action === "classify") return Promise.resolve("PARTIAL_OR_UNKNOWN");
+      return Promise.resolve("Connected");
+    });
+    const onComplete = await reachReview();
+
+    await userEvent.click(screen.getByRole("button", { name: "Initialize MindCore" }));
+
+    await waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
+    expect(invoke).not.toHaveBeenCalledWith("run_setup_action", expect.objectContaining({ action: "classify" }));
+    expect(invoke).toHaveBeenCalledWith("run_setup_action", expect.objectContaining({ action: "initialize" }));
+    expect(invoke).toHaveBeenCalledWith("save_mindcore_config", expect.anything());
+    expect(invoke).toHaveBeenCalledWith("start_mindcore_backend");
+    expect(screen.queryByText(/incomplete or unsupported MindCore schema/i)).toBeNull();
+  });
+
+  it("shows a safe unsupported-schema message only when initialize rejects the database", async () => {
+    invoke.mockImplementation((name: string, args?: { action?: string }) => {
+      if (name === "generic_identity_template") return Promise.resolve("IDENTITY");
+      if (name === "run_setup_action" && args?.action === "initialize") {
+        return Promise.reject(new Error("SETUP_SCHEMA_INCOMPATIBLE raw details must not render"));
+      }
+      return Promise.resolve("Connected");
+    });
+    const onComplete = await reachReview();
+
+    await userEvent.click(screen.getByRole("button", { name: "Initialize MindCore" }));
+
+    await screen.findByText("This database contains an incomplete or unsupported MindCore schema. It will not be overwritten.");
+    expect(onComplete).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalledWith("save_mindcore_config", expect.anything());
+    expect(invoke).not.toHaveBeenCalledWith("start_mindcore_backend");
+    expect(screen.queryByText(/raw details must not render/i)).toBeNull();
+  });
+
+  it("stops before saving when database initialize fails and hides raw details", async () => {
+    invoke.mockImplementation((name: string, args?: { action?: string }) => {
+      if (name === "generic_identity_template") return Promise.resolve("IDENTITY");
+      if (name === "run_setup_action" && args?.action === "initialize") {
+        return Promise.reject(new Error("SETUP_DATABASE_INITIALIZE_FAILED token=must-not-render"));
+      }
+      return Promise.resolve("Connected");
+    });
+    const onComplete = await reachReview();
+
+    await userEvent.click(screen.getByRole("button", { name: "Initialize MindCore" }));
+
+    await screen.findByText("MindCore could not initialize the database. Test Connection only verifies connectivity; no configuration was saved.");
+    expect(onComplete).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalledWith("save_mindcore_config", expect.anything());
+    expect(invoke).not.toHaveBeenCalledWith("start_mindcore_backend");
+    expect(screen.queryByText(/must-not-render/i)).toBeNull();
+  });
+
+  it("stops before backend start when config save fails", async () => {
+    invoke.mockImplementation((name: string) => {
+      if (name === "generic_identity_template") return Promise.resolve("IDENTITY");
+      if (name === "save_mindcore_config") {
+        return Promise.reject(new Error("SETUP_CONFIG_SAVE_FAILED secret=must-not-render"));
+      }
+      return Promise.resolve("Connected");
+    });
+    const onComplete = await reachReview();
+
+    await userEvent.click(screen.getByRole("button", { name: "Initialize MindCore" }));
+
+    await screen.findByText("MindCore initialized the database, but could not save this configuration.");
+    expect(onComplete).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalledWith("start_mindcore_backend");
+    expect(screen.queryByText(/must-not-render/i)).toBeNull();
+  });
+
+  it("reports backend start separately after initialize and config save succeed", async () => {
+    invoke.mockImplementation((name: string) => {
+      if (name === "generic_identity_template") return Promise.resolve("IDENTITY");
+      if (name === "start_mindcore_backend") {
+        return Promise.reject(new Error("SETUP_BACKEND_START_FAILED secret=must-not-render"));
+      }
+      return Promise.resolve("Connected");
+    });
+    const onComplete = await reachReview();
+
+    await userEvent.click(screen.getByRole("button", { name: "Initialize MindCore" }));
+
+    await screen.findByText("MindCore was configured, but the local backend could not start.");
+    expect(invoke).toHaveBeenCalledWith("run_setup_action", expect.objectContaining({ action: "initialize" }));
+    expect(invoke).toHaveBeenCalledWith("save_mindcore_config", expect.anything());
+    expect(invoke).toHaveBeenCalledWith("start_mindcore_backend");
+    expect(onComplete).not.toHaveBeenCalled();
+    expect(screen.queryByText(/must-not-render/i)).toBeNull();
   });
 });
