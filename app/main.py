@@ -218,7 +218,7 @@ def create_app(*, settings_override: Settings | None = None, db_pool_factory: Ca
     emit_startup_timing(
         "settings", "settings_load", round((perf_counter() - settings_started) * 1000)
     )
-    app = FastAPI(title=settings.app_name, version="0.2.6", lifespan=build_lifespan(settings_override, db_pool_factory))
+    app = FastAPI(title=settings.app_name, version="0.3.0", lifespan=build_lifespan(settings_override, db_pool_factory))
 
     @app.exception_handler(Exception)
     async def safe_unhandled_error(request: Request, exc: Exception):
