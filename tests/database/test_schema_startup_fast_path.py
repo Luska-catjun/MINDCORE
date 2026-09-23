@@ -1,0 +1,121 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from time import perf_counter
+import unittest
+from unittest.mock import AsyncMock, patch
+
+import libsql
+
+from app.database.migrations import (
+    SchemaMigrationDriftError,
+    SchemaMigrationError,
+    ensure_turso_schema_current,
+)
+from app.database.schema_contract import classify_turso_schema
+from app.database.turso import TursoConnection
+
+
+ROOT = Path(__file__).resolve().parents[2]
+BASELINE_SQL = (ROOT / "db" / "turso" / "baseline_v1.sql").read_text(encoding="utf-8")
+
+
+class CountingConnection:
+    def __init__(self, connection: TursoConnection, *, latency: float = 0.0) -> None:
+        self.connection = connection
+        self.latency = latency
+        self.read_round_trips = 0
+        self.execute_round_trips = 0
+
+    async def _wait(self) -> None:
+        if self.latency:
+            await asyncio.sleep(self.latency)
+
+    async def fetch(self, statement: str, *args):
+        self.read_round_trips += 1
+        await self._wait()
+        return await self.connection.fetch(statement, *args)
+
+    async def fetchval(self, statement: str, *args):
+        self.read_round_trips += 1
+        await self._wait()
+        return await self.connection.fetchval(statement, *args)
+
+    async def fetchrow(self, statement: str, *args):
+        self.read_round_trips += 1
+        await self._wait()
+        return await self.connection.fetchrow(statement, *args)
+
+    async def execute(self, statement: str, *args):
+        self.execute_round_trips += 1
+        return await self.connection.execute(statement, *args)
+
+    def transaction(self):
+        return self.connection.transaction()
+
+
+class CurrentSchemaStartupFastPathTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.raw = libsql.connect(":memory:")
+        self.connection = TursoConnection(self.raw)
+        await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+
+    async def asyncTearDown(self) -> None:
+        self.raw.close()
+
+    async def test_current_restart_uses_one_snapshot_and_no_full_classifier(self) -> None:
+        counted = CountingConnection(self.connection)
+        classifier = AsyncMock(side_effect=AssertionError("full classifier must not run"))
+        with patch("app.database.migrations.classify_turso_schema", classifier):
+            result = await ensure_turso_schema_current(counted, baseline_sql=BASELINE_SQL)
+
+        self.assertEqual((result.initial_version, result.final_version), (22, 22))
+        self.assertEqual(counted.read_round_trips, 1)
+        self.assertEqual(counted.execute_round_trips, 0)
+        classifier.assert_not_awaited()
+
+    async def test_full_classifier_batches_metadata_round_trips(self) -> None:
+        counted = CountingConnection(self.connection)
+        report = await classify_turso_schema(counted)
+        self.assertEqual(report.state.value, "CURRENT")
+        self.assertLessEqual(counted.read_round_trips, 7)
+
+    async def test_simulated_remote_latency_is_paid_once_on_current_restart(self) -> None:
+        counted = CountingConnection(self.connection, latency=0.01)
+        started = perf_counter()
+        await ensure_turso_schema_current(counted, baseline_sql=BASELINE_SQL)
+        elapsed = perf_counter() - started
+
+        self.assertEqual(counted.read_round_trips, 1)
+        self.assertGreaterEqual(elapsed, 0.01)
+        self.assertLess(elapsed, 0.25)
+
+    async def test_structural_drift_falls_back_and_is_rejected(self) -> None:
+        await self.connection.execute("alter table decision_log drop column resolved_at")
+        with self.assertRaisesRegex(SchemaMigrationError, "schema_incompatible"):
+            await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+
+    async def test_ledger_checksum_drift_is_rejected_by_fast_path(self) -> None:
+        await self.connection.execute(
+            "update schema_migration_ledger set checksum='drifted'"
+        )
+        with self.assertRaisesRegex(SchemaMigrationDriftError, "ledger_drift"):
+            await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+
+    async def test_foreign_key_violation_is_not_hidden_by_fast_path(self) -> None:
+        await self.connection.execute("pragma foreign_keys=off")
+        await self.connection.execute(
+            "insert into messages(id,conversation_id,sequence,role,content,source_device,created_at) "
+            "values($1,$2,$3,$4,$5,$6,$7)",
+            "orphan", "missing-conversation", 1, "user", "test", "test",
+            "2026-09-23T00:00:00+00:00",
+        )
+        await self.connection.execute("pragma foreign_keys=on")
+
+        with self.assertRaisesRegex(SchemaMigrationError, "schema_incompatible"):
+            await ensure_turso_schema_current(self.connection, baseline_sql=BASELINE_SQL)
+
+
+if __name__ == "__main__":
+    unittest.main()

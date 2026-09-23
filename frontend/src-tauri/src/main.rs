@@ -671,6 +671,13 @@ fn request_instance_readiness(capability: &str) -> bool {
     }
     readiness_response_is_current(&response, capability)
 }
+fn local_backend_port_is_occupied() -> bool {
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], DESKTOP_PORT)),
+        Duration::from_millis(150),
+    )
+    .is_ok()
+}
 fn start_sidecar(app: &AppHandle) -> Result<(), String> {
     if !config_is_complete(app)? {
         return Err("MindCore setup is incomplete.".into());
@@ -690,10 +697,25 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
     {
         StartDecision::AlreadyRunning => return Ok(()),
         StartDecision::InProgress => {
-            return Err("MindCore backend lifecycle operation is already in progress.".into())
+            // The native setup start is authoritative. A frontend start call
+            // arriving while that generation is still becoming ready should
+            // poll health, not surface a false lifecycle failure or spawn a
+            // second child.
+            return Ok(());
         }
         StartDecision::Spawn { generation } => generation,
     };
+    if local_backend_port_is_occupied() {
+        state
+            .lifecycle
+            .lock()
+            .expect("sidecar lifecycle lock")
+            .fail_start(generation);
+        return Err(
+            "MindCore backend could not claim its local port. Another application may be using port 8765."
+                .into(),
+        );
+    }
     for (key, value) in overrides {
         command = command.env(key, value);
     }
@@ -784,7 +806,7 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
     {
         let _ = child.kill();
     }
-    Err("MindCore backend could not claim its local port. Another application may be using port 8765.".into())
+    Err("MindCore backend startup timed out before readiness.".into())
 }
 
 fn run_setup_with_config(app: &AppHandle, action: &str, config: &Path) -> Result<String, String> {
@@ -1183,6 +1205,8 @@ fn startup_failure_category(error: &str) -> &'static str {
         "sidecar_spawn"
     } else if error.contains("exited before becoming ready") {
         "sidecar_exit"
+    } else if error.contains("startup timed out") {
+        "startup_timeout"
     } else if error.contains("local port") {
         "port_conflict"
     } else if error.contains("lifecycle") {
@@ -1593,6 +1617,7 @@ MINDCORE_SETUP_DIAGNOSTIC phase=database_bootstrap action=initialize category=sc
         assert_eq!(startup_failure_category("MindCore setup is incomplete."), "config_or_persona");
         assert_eq!(startup_failure_category("MindCore backend exited before becoming ready."), "sidecar_exit");
         assert_eq!(startup_failure_category("MindCore backend could not claim its local port."), "port_conflict");
+        assert_eq!(startup_failure_category("MindCore backend startup timed out before readiness."), "startup_timeout");
         assert_eq!(startup_failure_category("unexpected secret-looking input"), "startup");
     }
 

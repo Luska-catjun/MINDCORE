@@ -21,6 +21,7 @@ from app.database.schema_contract import (
     SCHEMA_VERSION_KEY,
     SchemaState,
     classify_turso_schema,
+    inspect_current_turso_schema,
 )
 
 
@@ -287,8 +288,19 @@ async def _validate_ledger(
     current_version: int,
 ) -> list[dict[str, Any]]:
     rows = await _ledger_rows(connection)
+    _validate_ledger_rows(rows, registry=registry, current_version=current_version)
+    return rows
+
+
+def _validate_ledger_rows(
+    rows: Iterable[dict[str, Any]],
+    *,
+    registry: MigrationRegistry,
+    current_version: int,
+) -> None:
+    rows = list(rows)
     if not rows:
-        return rows
+        return
     highest_version = -1
     for index, row in enumerate(rows):
         migration_id = str(row["migration_id"])
@@ -317,7 +329,57 @@ async def _validate_ledger(
         highest_version = to_version
     if highest_version != current_version:
         raise SchemaMigrationDriftError("database_migration_ledger_version_mismatch")
-    return rows
+
+
+async def _current_schema_fast_path(
+    connection: Any,
+    *,
+    registry: MigrationRegistry,
+    target_version: int,
+) -> MigrationRunResult | None:
+    """Return a current result after one structural metadata round trip.
+
+    The normal path validates every required table, column, key, index,
+    FK/nullability rule, schema version, immutable migration ledger, and the
+    FK/integrity checks in the same server-side metadata snapshot.
+    """
+    inspection = await inspect_current_turso_schema(connection)
+    if inspection is None or inspection.report.state != SchemaState.CURRENT:
+        return None
+    if inspection.report.version != str(target_version) or not inspection.ledger_rows:
+        return None
+    _validate_ledger_rows(
+        inspection.ledger_rows,
+        registry=registry,
+        current_version=target_version,
+    )
+    return MigrationRunResult(target_version, target_version, ())
+
+
+async def _validate_schema_postcondition(
+    connection: Any,
+    *,
+    registry: MigrationRegistry,
+    target_version: int,
+) -> None:
+    """Validate bootstrap/migration output without a second full classifier."""
+    result = await _current_schema_fast_path(
+        connection, registry=registry, target_version=target_version
+    )
+    if result is not None:
+        return
+    # Compatibility fallback for a libSQL build without table-valued PRAGMA
+    # support. This is not used by the supported driver but preserves safety.
+    report = await classify_turso_schema(connection)
+    if report.state != SchemaState.CURRENT:
+        raise SchemaMigrationError("database_schema_migration_validation_failed")
+    version = await _schema_version(connection)
+    if version != target_version:
+        raise SchemaMigrationError("database_schema_migration_validation_failed")
+    rows = await _ledger_rows(connection)
+    if not rows:
+        raise SchemaMigrationError("database_migration_ledger_missing")
+    _validate_ledger_rows(rows, registry=registry, current_version=target_version)
 
 
 async def _adopt_version_into_ledger(
@@ -542,6 +604,12 @@ async def ensure_turso_schema_current(
     This is intentionally a mutating startup/initialize operation. Connection
     preflight must continue to use ``SELECT 1`` only.
     """
+    fast_result = await _current_schema_fast_path(
+        connection, registry=registry, target_version=target_version
+    )
+    if fast_result is not None:
+        return fast_result
+
     report = await classify_turso_schema(connection)
     bootstrapped = False
     adopted_legacy = False
@@ -551,13 +619,15 @@ async def ensure_turso_schema_current(
             baseline_sql if baseline_sql is not None else _baseline_path().read_text(encoding="utf-8"),
         )
         bootstrapped = True
-        report = await classify_turso_schema(connection)
-    if report.state == SchemaState.COMPATIBLE_LEGACY:
+        # The baseline is static release input. Its structural and ledger
+        # postconditions are checked once after ledger adoption below.
+        report = None
+    if report is not None and report.state == SchemaState.COMPATIBLE_LEGACY:
         await _adopt_compatible_legacy_database(
             connection, target_version=target_version, registry=registry
         )
         adopted_legacy = True
-    elif report.state == SchemaState.PARTIAL_OR_UNKNOWN:
+    elif report is not None and report.state == SchemaState.PARTIAL_OR_UNKNOWN:
         version = await _schema_version(connection)
         if version is None:
             if not await _is_unversioned_released_v21_turn_durability_upgrade(connection, report):
@@ -565,16 +635,17 @@ async def ensure_turso_schema_current(
             await _adopt_unversioned_released_v21_database(connection, registry=registry)
             adopted_legacy = True
             version = 21
-            # The pre-adoption report intentionally has no version. Reclassify
-            # after recording v21 so the established released-v21 guard, not a
-            # metadata-less snapshot, authorizes the forward migration.
-            report = await classify_turso_schema(connection)
+            # The exact unversioned-v21 shape was already fully classified
+            # before adoption; recording metadata does not change that shape.
         if version > target_version:
             raise UnsupportedSchemaVersionError("unsupported_newer_schema_version")
         if version == target_version:
             raise SchemaMigrationError("database_schema_incompatible")
         if version == 21 and target_version == 22:
-            if not _is_released_v21_turn_durability_upgrade(report):
+            if not (
+                _is_released_v21_turn_durability_upgrade(report)
+                or adopted_legacy
+            ):
                 raise SchemaMigrationError("PARTIAL_OR_UNKNOWN database_schema_incompatible")
         else:
             raise SchemaMigrationError("PARTIAL_OR_UNKNOWN database_schema_incompatible")
@@ -584,9 +655,9 @@ async def ensure_turso_schema_current(
     result = await run_forward_migrations(
         connection, target_version=target_version, registry=registry
     )
-    final_report = await classify_turso_schema(connection)
-    if final_report.state != SchemaState.CURRENT:
-        raise SchemaMigrationError("database_schema_migration_validation_failed")
+    await _validate_schema_postcondition(
+        connection, registry=registry, target_version=target_version
+    )
     return MigrationRunResult(
         result.initial_version,
         result.final_version,
