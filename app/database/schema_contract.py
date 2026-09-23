@@ -351,6 +351,17 @@ REQUIRED_PARTIAL_UNIQUE_INDEXES: dict[str, tuple[tuple[str, tuple[str, ...]], ..
     ),),
 }
 
+REQUIRED_PARTIAL_INDEX_PREDICATES: dict[str, str] = {
+    "uq_autonomy_execution_active_dedupe": (
+        "status in ('RESERVED','PROVIDER_STARTED','MESSAGE_PERSISTED','COMPLETE','INDETERMINATE')"
+    ),
+}
+
+_AUTONOMY_EXECUTION_STATUS_CHECK = (
+    "check(status in ('RESERVED','PROVIDER_STARTED','MESSAGE_PERSISTED','COMPLETE',"
+    "'FAILED_SAFE','INDETERMINATE'))"
+)
+
 _TURN_CONTEXT_COMBINATION_CHECK = (
     "check(input_source in ('text','internal') and ("
     "(initiator_actor='user' and trigger_type='user_message' and input_source='text') or "
@@ -360,7 +371,7 @@ _TURN_CONTEXT_COMBINATION_CHECK = (
 
 
 def _normalize_schema_sql(value: str) -> str:
-    return re.sub(r'[\s"`]+', "", value).lower()
+    return re.sub(r"""[\s'"`\[\]]+""", "", value).lower()
 
 
 @dataclass(frozen=True)
@@ -407,6 +418,7 @@ def _report_from_metadata(
     table_info: dict[str, list[dict[str, Any]]],
     table_sql: dict[str, str],
     index_info: dict[str, list[dict[str, Any]]],
+    index_sql: dict[str, str],
     foreign_keys: dict[str, list[dict[str, Any]]],
     version: str | None,
     data_invariant_errors: tuple[str, ...] = (),
@@ -443,6 +455,11 @@ def _report_from_metadata(
                 table_sql.get(table, "")
             ):
                 missing_constraints.append("chat_turns CHECK(turn_context_combination)")
+        if table == "autonomy_executions" and (
+            _normalize_schema_sql(_AUTONOMY_EXECUTION_STATUS_CHECK)
+            not in _normalize_schema_sql(table_sql.get(table, ""))
+        ):
+            missing_constraints.append("autonomy_executions CHECK(status_lifecycle)")
 
         indexes: set[tuple[str, ...]] = set()
         unique_indexes: set[tuple[str, ...]] = set()
@@ -478,6 +495,16 @@ def _report_from_metadata(
                 or actual_signature != signature
             ):
                 missing_constraints.append(f"{table} PARTIAL UNIQUE INDEX({index_name})")
+                continue
+            normalized_sql = _normalize_schema_sql(index_sql.get(index_name, ""))
+            actual_predicate = normalized_sql.split("where", 1)[1] if "where" in normalized_sql else ""
+            expected_predicate = _normalize_schema_sql(
+                REQUIRED_PARTIAL_INDEX_PREDICATES[index_name]
+            )
+            if actual_predicate != expected_predicate:
+                missing_constraints.append(
+                    f"{table} PARTIAL UNIQUE INDEX({index_name}) PREDICATE"
+                )
 
     for table, child, parent, parent_column, action in REQUIRED_FOREIGN_KEYS:
         if table not in tables:
@@ -561,7 +588,8 @@ where m.type='table' and m.name not like 'sqlite_%'
 """
 _BATCHED_INDEXES_SQL = """
 select m.name as table_name, il.name as index_name, il.[unique], il.partial,
-       ii.seqno, ii.name as column_name
+       ii.seqno, ii.name as column_name,
+       (select x.sql from sqlite_master x where x.type='index' and x.name=il.name) as index_sql
 from sqlite_master m, pragma_index_list(m.name) il, pragma_index_info(il.name) ii
 where m.type='table' and m.name not like 'sqlite_%'
 """
@@ -576,6 +604,7 @@ async def _batched_metadata(connection: Any, tables: set[str]) -> tuple[
     dict[str, list[dict[str, Any]]],
     dict[str, str],
     dict[str, list[dict[str, Any]]],
+    dict[str, str],
     dict[str, list[dict[str, Any]]],
 ]:
     columns = await connection.fetch(_BATCHED_COLUMNS_SQL)
@@ -584,6 +613,7 @@ async def _batched_metadata(connection: Any, tables: set[str]) -> tuple[
     table_info = {table: [] for table in tables}
     table_sql: dict[str, str] = {}
     index_info = {table: [] for table in tables}
+    index_sql: dict[str, str] = {}
     foreign_key_info = {table: [] for table in tables}
     for item in columns:
         table = str(item["table_name"])
@@ -592,9 +622,11 @@ async def _batched_metadata(connection: Any, tables: set[str]) -> tuple[
             table_sql[table] = str(item["table_sql"])
     for item in indexes:
         index_info.setdefault(str(item["table_name"]), []).append(item)
+        if item.get("index_sql") is not None:
+            index_sql[str(item["index_name"])] = str(item["index_sql"])
     for item in foreign_keys:
         foreign_key_info.setdefault(str(item["table_name"]), []).append(item)
-    return table_info, table_sql, index_info, foreign_key_info
+    return table_info, table_sql, index_info, index_sql, foreign_key_info
 
 
 async def inspect_current_turso_schema(connection: Any) -> CurrentSchemaInspection | None:
@@ -616,7 +648,8 @@ from sqlite_master m, pragma_table_info(m.name) p
 where m.type='table' and m.name not like 'sqlite_%'
 union all
 select 'index', m.name, il.name, cast(il.[unique] as text), cast(il.partial as text),
-       cast(ii.seqno as text), ii.name, ''
+       cast(ii.seqno as text), ii.name,
+       coalesce((select x.sql from sqlite_master x where x.type='index' and x.name=il.name),'')
 from sqlite_master m, pragma_index_list(m.name) il, pragma_index_info(il.name) ii
 where m.type='table' and m.name not like 'sqlite_%'
 union all
@@ -639,6 +672,7 @@ from {MIGRATION_LEDGER_TABLE}
     table_info: dict[str, list[dict[str, Any]]] = {}
     table_sql: dict[str, str] = {}
     index_info: dict[str, list[dict[str, Any]]] = {}
+    index_sql: dict[str, str] = {}
     foreign_keys: dict[str, list[dict[str, Any]]] = {}
     version: str | None = None
     ledger_rows: list[dict[str, Any]] = []
@@ -660,6 +694,8 @@ from {MIGRATION_LEDGER_TABLE}
                     "column_name": row["v4"],
                 }
             )
+            if row["v5"]:
+                index_sql[str(row["name"])] = str(row["v5"])
         elif kind == "fk":
             foreign_keys.setdefault(owner, []).append(
                 {"from": row["name"], "table": row["v1"], "to": row["v2"], "on_delete": row["v3"]}
@@ -679,6 +715,7 @@ from {MIGRATION_LEDGER_TABLE}
         table_info=table_info,
         table_sql=table_sql,
         index_info=index_info,
+        index_sql=index_sql,
         foreign_keys=foreign_keys,
         version=version,
         data_invariant_errors=(),
@@ -695,7 +732,7 @@ async def classify_turso_schema(connection: Any) -> SchemaReport:
     if not tables:
         return SchemaReport(SchemaState.EMPTY)
 
-    table_info, table_sql, index_info, foreign_keys = await _batched_metadata(connection, tables)
+    table_info, table_sql, index_info, index_sql, foreign_keys = await _batched_metadata(connection, tables)
     invariant_errors: list[str] = []
 
     try:
@@ -721,6 +758,7 @@ async def classify_turso_schema(connection: Any) -> SchemaReport:
         table_info=table_info,
         table_sql=table_sql,
         index_info=index_info,
+        index_sql=index_sql,
         foreign_keys=foreign_keys,
         version=version,
         data_invariant_errors=tuple(invariant_errors),

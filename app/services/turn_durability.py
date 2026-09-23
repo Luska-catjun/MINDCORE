@@ -183,27 +183,86 @@ class TurnDurability:
         now = _utc_now()
         async with self.pool.acquire() as connection:
             async with connection.transaction():
-                await connection.execute(
-                    """insert into chat_turns(
-                         turn_id,conversation_id,user_message_id,assistant_message_id,status,
-                         created_at,updated_at,core_completed_at,completed_at,last_failed_stage,safe_error_category,
-                         initiator_actor,trigger_type,input_source
-                       ) values($1,$2,null,null,'pending',$3,$3,null,null,null,null,$4,$5,$6)""",
-                    turn_id, conversation_id, now, *turn_context.durable_values(),
+                await self._insert_proactive_turn_with_connection(
+                    connection, conversation_id, turn_context, turn_id, now
                 )
-                for stage in PROACTIVE_TURN_STAGES:
-                    await connection.execute(
-                        """insert into chat_turn_stages(
-                             turn_id,stage_name,status,retry_policy,attempt_count,
-                             started_at,completed_at,last_error_category
-                           ) values($1,$2,'pending',$3,0,null,null,null)""",
-                        turn_id, stage.name, stage.retry_policy,
-                    )
         logger.info(
             "TURN_LIFECYCLE turn=%s status=pending initiator=persona trigger=autonomy_decision input_source=internal",
             turn_id,
         )
         return turn_id
+
+    async def begin_autonomous_proactive_turn(
+        self,
+        conversation_id: UUID | str,
+        turn_context: TurnContext,
+        *,
+        persona_id: str,
+        intention: Any,
+        user_activity_anchor_message_id: str,
+        now: datetime,
+    ) -> Any | None:
+        """Atomically reserve autonomy authority and create its turn/stages."""
+        if not self.enabled:
+            raise RuntimeError("proactive_turn_durability_unavailable")
+        if turn_context.durable_values() != ("persona", "autonomy_decision", "internal"):
+            raise ValueError("proactive_turn_context_invalid")
+        from app.services.mindcore.autonomy_execution_store import (
+            reserve_autonomy_execution_with_connection,
+        )
+
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("autonomy_execution_time_must_be_aware")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                reservation = await reserve_autonomy_execution_with_connection(
+                    connection,
+                    conversation_id=conversation_id,
+                    persona_id=persona_id,
+                    intention=intention,
+                    user_activity_anchor_message_id=user_activity_anchor_message_id,
+                    now=now,
+                )
+                if reservation is None:
+                    return None
+                await self._insert_proactive_turn_with_connection(
+                    connection, conversation_id, turn_context, reservation.turn_id, now
+                )
+        logger.info(
+            "TURN_LIFECYCLE turn=%s status=pending initiator=persona trigger=autonomy_decision input_source=internal",
+            reservation.turn_id,
+        )
+        return reservation
+
+    async def _insert_proactive_turn_with_connection(
+        self,
+        connection: Any,
+        conversation_id: UUID | str,
+        turn_context: TurnContext,
+        turn_id: UUID | str,
+        now: datetime,
+    ) -> None:
+        await connection.execute(
+            """insert into chat_turns(
+                 turn_id,conversation_id,user_message_id,assistant_message_id,status,
+                 created_at,updated_at,core_completed_at,completed_at,last_failed_stage,safe_error_category,
+                 initiator_actor,trigger_type,input_source
+               ) values($1,$2,null,null,'pending',$3,$3,null,null,null,null,$4,$5,$6)""",
+            turn_id, conversation_id, now, *turn_context.durable_values(),
+        )
+        await self._insert_proactive_stages_with_connection(connection, turn_id)
+
+    async def _insert_proactive_stages_with_connection(
+        self, connection: Any, turn_id: UUID | str,
+    ) -> None:
+        for stage in PROACTIVE_TURN_STAGES:
+            await connection.execute(
+                """insert into chat_turn_stages(
+                     turn_id,stage_name,status,retry_policy,attempt_count,
+                     started_at,completed_at,last_error_category
+                   ) values($1,$2,'pending',$3,0,null,null,null)""",
+                turn_id, stage.name, stage.retry_policy,
+            )
 
     async def complete_proactive_core(
         self, turn_id: UUID | str, assistant_payload: Any,

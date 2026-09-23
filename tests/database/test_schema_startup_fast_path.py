@@ -15,7 +15,7 @@ from app.database.migrations import (
     _baseline_checksum,
     validate_turso_schema_full,
 )
-from app.database.schema_contract import classify_turso_schema
+from app.database.schema_contract import SchemaState, classify_turso_schema, inspect_current_turso_schema
 from app.database.turso import TursoConnection
 
 
@@ -206,6 +206,25 @@ class CurrentSchemaStartupFastPathTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(expected_detail, detail)
                 finally:
                     raw.close()
+
+    async def test_current_autonomy_predicate_drift_is_rejected_in_single_snapshot(self) -> None:
+        await self.connection.execute("drop index uq_autonomy_execution_active_dedupe")
+        await self.connection.execute(
+            """create unique index uq_autonomy_execution_active_dedupe
+               on autonomy_executions(persona_id,intention_key,user_activity_anchor_message_id)
+               where status='COMPLETE'"""
+        )
+        counted = CountingConnection(self.connection)
+        snapshot = await inspect_current_turso_schema(counted)
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.report.state, SchemaState.PARTIAL_OR_UNKNOWN)
+        self.assertTrue(any("PREDICATE" in item for item in snapshot.report.missing_constraints))
+        self.assertEqual(counted.read_round_trips, 1)
+        counted.read_round_trips = 0
+        with self.assertRaisesRegex(SchemaMigrationError, "schema_incompatible"):
+            await ensure_turso_schema_current(counted, baseline_sql=BASELINE_SQL)
+        self.assertGreater(counted.read_round_trips, 1)
+        self.assertEqual(counted.execute_round_trips, 0)
 
 
 if __name__ == "__main__":

@@ -226,6 +226,55 @@ class TursoSchemaContractTests(unittest.IsolatedAsyncioTestCase):
             report.missing_constraints,
         )
 
+    async def test_autonomy_dedupe_index_requires_exact_active_predicate(self) -> None:
+        await apply_sql(self.pool.connection, BASELINE_SQL)
+        await self.pool.connection.execute("drop index uq_autonomy_execution_active_dedupe")
+        await self.pool.connection.execute(
+            """create unique index uq_autonomy_execution_active_dedupe
+               on autonomy_executions(persona_id,intention_key,user_activity_anchor_message_id)
+               where status='COMPLETE'"""
+        )
+        report = await classify_turso_schema(self.pool.connection)
+        self.assertEqual(report.state, SchemaState.PARTIAL_OR_UNKNOWN)
+        self.assertIn(
+            "autonomy_executions PARTIAL UNIQUE INDEX(uq_autonomy_execution_active_dedupe) PREDICATE",
+            report.missing_constraints,
+        )
+
+    async def test_autonomy_dedupe_predicate_must_not_include_failed_safe(self) -> None:
+        await apply_sql(self.pool.connection, BASELINE_SQL)
+        await self.pool.connection.execute("drop index uq_autonomy_execution_active_dedupe")
+        await self.pool.connection.execute(
+            """create unique index uq_autonomy_execution_active_dedupe
+               on autonomy_executions(persona_id,intention_key,user_activity_anchor_message_id)
+               where status in ('RESERVED','PROVIDER_STARTED','MESSAGE_PERSISTED','COMPLETE',
+                                'FAILED_SAFE','INDETERMINATE')"""
+        )
+        report = await classify_turso_schema(self.pool.connection)
+        self.assertEqual(report.state, SchemaState.PARTIAL_OR_UNKNOWN)
+        self.assertTrue(any("PREDICATE" in item for item in report.missing_constraints))
+
+    async def test_autonomy_status_check_drift_is_rejected(self) -> None:
+        await apply_sql(self.pool.connection, BASELINE_SQL)
+        await self.pool.connection.execute("pragma foreign_keys=off")
+        await self.pool.connection.execute("alter table autonomy_executions rename to autonomy_executions_old")
+        await self.pool.connection.execute(
+            """create table autonomy_executions (
+                 execution_id text primary key, turn_id text not null unique,
+                 conversation_id text not null references conversations(conversation_id) on delete cascade,
+                 persona_id text not null, intention_key text not null, intention_type text not null,
+                 target_kind text not null, target_key text not null,
+                 user_activity_anchor_message_id text not null,
+                 status text not null check(status in ('COMPLETE')),
+                 assistant_message_id text references messages(id) on delete set null,
+                 safe_error_category text, provider_started_at text, message_persisted_at text,
+                 completed_at text, created_at text not null, updated_at text not null)"""
+        )
+        await self.pool.connection.execute("drop table autonomy_executions_old")
+        report = await classify_turso_schema(self.pool.connection)
+        self.assertEqual(report.state, SchemaState.PARTIAL_OR_UNKNOWN)
+        self.assertIn("autonomy_executions CHECK(status_lifecycle)", report.missing_constraints)
+
     async def test_partial_migration_is_rejected_without_mutation(self) -> None:
         await self.pool.connection.execute("create table schema_metadata (key text primary key, value text not null)")
         await self.pool.connection.execute(

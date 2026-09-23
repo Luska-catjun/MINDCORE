@@ -34,7 +34,7 @@ def _safe_error_category(error: BaseException) -> str:
     category = getattr(error, "category", None)
     allowed = {
         "provider_failure", "context_prepare_failure", "eligibility_changed",
-        "execution_failure", "execution_gate_changed",
+        "execution_failure", "execution_gate_changed", "provider_invalid_response",
     }
     return category if isinstance(category, str) and category in allowed else "execution_failure"
 
@@ -56,24 +56,47 @@ async def reserve_autonomy_execution(
 ) -> AutonomyExecutionReservation | None:
     """Atomically reserve a durable execution key before creating its turn."""
     execution_id, turn_id = uuid4(), uuid4()
-    timestamp = _stamp(now)
     async with pool.acquire() as connection:
-        # This single INSERT is the atomic reservation transaction. Avoid a
-        # deferred BEGIN/COMMIT window; uniqueness is arbitrated by the index.
-        cursor = await connection.execute(
-            """insert into autonomy_executions(
-                 execution_id,turn_id,conversation_id,persona_id,intention_key,
-                 intention_type,target_kind,target_key,user_activity_anchor_message_id,
-                 status,assistant_message_id,safe_error_category,provider_started_at,
-                 message_persisted_at,completed_at,created_at,updated_at
-               ) values($1,$2,$3,$4,$5,$6,$7,$8,$9,'RESERVED',null,null,null,null,null,$10,$10)
-               on conflict do nothing""",
-            execution_id, turn_id, conversation_id, persona_id,
-            intention.intention_key, str(intention.intention_type),
-            str(intention.target_kind), intention.target_key,
-            user_activity_anchor_message_id, timestamp,
+        return await reserve_autonomy_execution_with_connection(
+            connection,
+            conversation_id=conversation_id,
+            persona_id=persona_id,
+            intention=intention,
+            user_activity_anchor_message_id=user_activity_anchor_message_id,
+            now=now,
+            execution_id=execution_id,
+            turn_id=turn_id,
         )
-        inserted = getattr(cursor, "rowcount", None)
+
+
+async def reserve_autonomy_execution_with_connection(
+    connection: Any,
+    *,
+    conversation_id: UUID | str,
+    persona_id: str,
+    intention: Any,
+    user_activity_anchor_message_id: str,
+    now: datetime,
+    execution_id: UUID | None = None,
+    turn_id: UUID | None = None,
+) -> AutonomyExecutionReservation | None:
+    """Insert a reservation on a caller-owned connection/transaction."""
+    execution_id, turn_id = execution_id or uuid4(), turn_id or uuid4()
+    timestamp = _stamp(now)
+    cursor = await connection.execute(
+        """insert into autonomy_executions(
+             execution_id,turn_id,conversation_id,persona_id,intention_key,
+             intention_type,target_kind,target_key,user_activity_anchor_message_id,
+             status,assistant_message_id,safe_error_category,provider_started_at,
+             message_persisted_at,completed_at,created_at,updated_at
+           ) values($1,$2,$3,$4,$5,$6,$7,$8,$9,'RESERVED',null,null,null,null,null,$10,$10)
+           on conflict do nothing""",
+        execution_id, turn_id, conversation_id, persona_id,
+        intention.intention_key, str(intention.intention_type),
+        str(intention.target_kind), intention.target_key,
+        user_activity_anchor_message_id, timestamp,
+    )
+    inserted = getattr(cursor, "rowcount", None)
     if inserted not in (0, 1):
         raise RuntimeError("autonomy_execution_reservation_rowcount_unavailable")
     if inserted == 0:
@@ -99,7 +122,8 @@ async def mark_failed_safe(
 ) -> None:
     category = safe_category or _safe_error_category(error)
     if category not in {
-        "provider_failure", "context_prepare_failure", "eligibility_changed", "execution_failure"
+        "provider_failure", "provider_invalid_response", "turn_creation_failure",
+        "context_prepare_failure", "eligibility_changed", "execution_failure"
     }:
         category = "execution_failure"
     async with pool.acquire() as connection:
@@ -175,21 +199,21 @@ async def get_execution_gate(
             persona_id, intention_key, user_activity_anchor_message_id,
         )
         failures = await connection.fetch(
-            """select created_at,safe_error_category from autonomy_executions
+            """select updated_at,safe_error_category from autonomy_executions
                where persona_id=$1 and user_activity_anchor_message_id=$2
                  and status='FAILED_SAFE'
                  and coalesce(safe_error_category,'') not in ('eligibility_changed')
-               order by created_at desc,execution_id desc limit $3""",
+               order by updated_at desc,execution_id desc limit $3""",
             persona_id, user_activity_anchor_message_id, len(FAILURE_BACKOFF_SECONDS),
         )
     retry_after = None
     if failures:
         count = len(failures)
         delay = FAILURE_BACKOFF_SECONDS[min(count - 1, len(FAILURE_BACKOFF_SECONDS) - 1)]
-        created = datetime.fromisoformat(str(failures[0]["created_at"]).replace("Z", "+00:00"))
-        if created.tzinfo is None or created.utcoffset() is None:
-            created = created.replace(tzinfo=timezone.utc)
-        retry_after = created.astimezone(timezone.utc) + timedelta(seconds=delay)
+        failed_at = datetime.fromisoformat(str(failures[0]["updated_at"]).replace("Z", "+00:00"))
+        if failed_at.tzinfo is None or failed_at.utcoffset() is None:
+            failed_at = failed_at.replace(tzinfo=timezone.utc)
+        retry_after = failed_at.astimezone(timezone.utc) + timedelta(seconds=delay)
         if retry_after <= now.astimezone(timezone.utc):
             retry_after = None
     return active is not None, retry_after
@@ -221,14 +245,38 @@ async def recover_incomplete_autonomy_executions(
         async with pool.acquire() as connection:
             turn = await connection.fetchrow(
                 """select turn_id,conversation_id,user_message_id,assistant_message_id,status,
-                          initiator_actor,trigger_type,input_source
+                          core_completed_at,initiator_actor,trigger_type,input_source
                    from chat_turns where turn_id=$1""",
                 execution["turn_id"],
             )
             if current_status == "RESERVED":
-                # A stale intent is never resumed. If the turn was not yet
-                # created, this is also a safely recoverable orphan reservation.
-                outcome = "FAILED_SAFE"
+                # A stale intent is never resumed. A valid pre-provider turn
+                # is terminalized below; malformed linkage remains ambiguous.
+                if turn is None:
+                    outcome = "FAILED_SAFE"
+                elif (
+                    str(turn["conversation_id"]) == str(execution["conversation_id"])
+                    and turn["user_message_id"] is None
+                    and turn["assistant_message_id"] is None
+                    and turn["core_completed_at"] is None
+                    and str(turn["status"]) == "pending"
+                    and (turn["initiator_actor"], turn["trigger_type"], turn["input_source"])
+                        == ("persona", "autonomy_decision", "internal")
+                ):
+                    stages = await connection.fetch(
+                        "select stage_name,status from chat_turn_stages where turn_id=$1",
+                        execution["turn_id"],
+                    )
+                    stage_statuses = {str(row["stage_name"]): str(row["status"]) for row in stages}
+                    valid_stages = (
+                        set(stage_statuses) == {"context_prepare", "provider_generate", "assistant_persist"}
+                        and stage_statuses["provider_generate"] in {"pending", "running", "failed"}
+                        and stage_statuses["assistant_persist"] in {"pending", "failed"}
+                        and stage_statuses["context_prepare"] in {"pending", "running", "completed", "failed"}
+                    )
+                    outcome = "FAILED_SAFE" if valid_stages else "INDETERMINATE"
+                else:
+                    outcome = "INDETERMINATE"
             elif (
                 turn is not None
                 and str(turn["conversation_id"]) == str(execution["conversation_id"])
@@ -274,11 +322,26 @@ async def recover_incomplete_autonomy_executions(
                            where execution_id=$2 and status='RESERVED'""",
                         timestamp, execution_id,
                     )
+                    if current_status == "RESERVED" and turn is not None:
+                        await connection.execute(
+                            """update chat_turn_stages set status='failed',
+                                      completed_at=coalesce(completed_at,$1),
+                                      last_error_category='recovered_before_provider'
+                               where turn_id=$2 and status in ('pending','running')""",
+                            timestamp, execution["turn_id"],
+                        )
+                        await connection.execute(
+                            """update chat_turns set status='core_failed',updated_at=$1,
+                                      last_failed_stage='recovery',
+                                      safe_error_category='recovered_before_provider'
+                               where turn_id=$2 and status='pending' and core_completed_at is null""",
+                            timestamp, execution["turn_id"],
+                        )
                 else:
                     await connection.execute(
                         """update autonomy_executions set status='INDETERMINATE',
                                   safe_error_category='recovery_ambiguous',updated_at=$1
-                           where execution_id=$2 and status in ('PROVIDER_STARTED','MESSAGE_PERSISTED')""",
+                           where execution_id=$2 and status in ('RESERVED','PROVIDER_STARTED','MESSAGE_PERSISTED')""",
                         timestamp, execution_id,
                     )
         counts[outcome] += 1

@@ -31,7 +31,6 @@ from app.services.mindcore.autonomy_execution_store import (
     mark_complete as mark_autonomy_execution_complete,
     mark_failed_safe,
     mark_provider_started,
-    reserve_autonomy_execution,
 )
 
 
@@ -245,9 +244,9 @@ async def execute_proactive_intention(
     if autonomy_context is not None:
         if pre_provider_guard is not None and not await pre_provider_guard():
             raise ProactiveExecutionError("execution_gate_changed")
-        reservation = await reserve_autonomy_execution(
-            pool,
+        reservation = await durability.begin_autonomous_proactive_turn(
             conversation_id=conversation_id,
+            turn_context=turn_context,
             persona_id=active_persona_id,
             intention=intention,
             user_activity_anchor_message_id=autonomy_context["user_activity_anchor_message_id"],
@@ -255,9 +254,7 @@ async def execute_proactive_intention(
         )
         if reservation is None:
             raise ProactiveExecutionError("autonomy_execution_duplicate")
-        turn_id = await durability.begin_proactive_turn(
-            conversation_id, turn_context, turn_id=reservation.turn_id
-        )
+        turn_id = reservation.turn_id
     else:
         turn_id = await durability.begin_proactive_turn(conversation_id, turn_context)
     logger.info(
@@ -303,11 +300,11 @@ async def execute_proactive_intention(
                 provider_error_confirmed = True
                 raise
             if not isinstance(generated, str) or not generated.strip():
-                raise ProactiveExecutionError("empty_provider_response")
+                raise ProactiveExecutionError("provider_invalid_response")
             try:
                 generated.encode("utf-8", errors="strict")
             except UnicodeEncodeError:
-                raise ProactiveExecutionError("invalid_provider_response") from None
+                raise ProactiveExecutionError("provider_invalid_response") from None
             return generated
 
         response = await durability.run_stage(
@@ -358,6 +355,11 @@ async def execute_proactive_intention(
                 await mark_failed_safe(
                     pool, reservation.execution_id, error, now=current,
                     safe_category="provider_failure",
+                )
+            elif failed_stage == "provider_generate" and getattr(error, "category", None) == "provider_invalid_response":
+                await mark_failed_safe(
+                    pool, reservation.execution_id, error, now=current,
+                    safe_category="provider_invalid_response",
                 )
             # Assistant persistence is one transaction across message, turn,
             # and MESSAGE_PERSISTED. Leave the last durable execution status

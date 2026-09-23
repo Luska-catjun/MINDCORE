@@ -448,6 +448,130 @@ class AutonomyRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.provider_calls, 2)
 
     @stable_policy_test
+    async def test_empty_whitespace_and_invalid_provider_results_are_retryable_failures(self) -> None:
+        outputs = ("", "   \n\t", "invalid-\ud800")
+        for index, output in enumerate(outputs):
+            with self.subTest(output_kind="empty" if not output else "invalid"):
+                if index:
+                    self.now += timedelta(seconds=(60, 120)[index - 1] + 1)
+                    self.runtime = AutonomyRuntimeState(started_at=self.now - timedelta(minutes=3))
+                async def invalid_provider(*_args, **_kwargs):
+                    self.provider_calls += 1
+                    return output
+
+                async def invalid_executor(**kwargs):
+                    return await execute_proactive_intention(**kwargs, provider=invalid_provider)
+
+                result = await run_autonomy_cycle(
+                    pool=self.pool, settings=self.settings, identity_prompt="Test Persona identity",
+                    now=self.now, runtime=self.runtime, executor=invalid_executor,
+                )
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(await self.pool_scalar(
+                    "select count(*) from autonomy_executions where status='FAILED_SAFE' "
+                    "and safe_error_category='provider_invalid_response'"
+                ), index + 1)
+                self.assertEqual(await self.pool_scalar(
+                    "select count(*) from messages where source_device='mindcore_proactive'"
+                ), 0)
+                gate = await __import__(
+                    "app.services.mindcore.autonomy_execution_store",
+                    fromlist=["get_execution_gate"],
+                ).get_execution_gate(
+                    self.pool, persona_id="persona-a", intention_key="CHECK_IN:curiosity",
+                    user_activity_anchor_message_id=self.user_message_id, now=self.now,
+                )
+                self.assertEqual(gate[0], False)
+                delay = (60, 120, 300)[index]
+                self.assertEqual(gate[1], self.now + timedelta(seconds=delay))
+                immediate_retry = await run_autonomy_cycle(
+                    pool=self.pool, settings=self.settings, identity_prompt="Test Persona identity",
+                    now=self.now, runtime=AutonomyRuntimeState(
+                        started_at=self.now - timedelta(minutes=3)
+                    ), executor=invalid_executor,
+                )
+                self.assertEqual(immediate_retry.reason, "failure_backoff_durable")
+                restarted = await recover_incomplete_autonomy_executions(
+                    self.pool, persona_id="persona-a", now=self.now + timedelta(seconds=1),
+                )
+                self.assertEqual(sum(restarted.values()), 0)
+                self.assertEqual(self.provider_calls, index + 1)
+
+    async def test_failure_backoff_uses_failure_time_not_creation_time(self) -> None:
+        from types import SimpleNamespace
+        from app.services.mindcore.autonomy_execution_store import (
+            get_execution_gate, mark_failed_safe, reserve_autonomy_execution,
+        )
+
+        created_at = self.now - timedelta(minutes=20)
+        reservation = await reserve_autonomy_execution(
+            self.pool, conversation_id=self.conversation_id, persona_id="persona-a",
+            intention=SimpleNamespace(
+                intention_key="CHECK_IN:curiosity", intention_type="CHECK_IN",
+                target_kind="NEED", target_key="curiosity",
+            ), user_activity_anchor_message_id=self.user_message_id, now=created_at,
+        )
+        failed_at = created_at + timedelta(minutes=5)
+        await mark_failed_safe(
+            self.pool, reservation.execution_id, RuntimeError("synthetic"),
+            now=failed_at, safe_category="provider_failure",
+        )
+        blocked, retry_after = await get_execution_gate(
+            self.pool, persona_id="persona-a", intention_key="CHECK_IN:curiosity",
+            user_activity_anchor_message_id=self.user_message_id,
+            now=failed_at + timedelta(seconds=10),
+        )
+        self.assertFalse(blocked)
+        self.assertEqual(retry_after, failed_at + timedelta(seconds=60))
+
+    @stable_policy_test
+    async def test_atomic_reservation_turn_stage_creation_rolls_back_on_turn_failure(self) -> None:
+        async def fail_turn(*_args, **_kwargs):
+            raise RuntimeError("injected turn creation failure")
+
+        with patch(
+            "app.services.turn_durability.TurnDurability._insert_proactive_turn_with_connection",
+            new=fail_turn,
+        ):
+            result = await run_autonomy_cycle(
+                pool=self.pool, settings=self.settings, identity_prompt="Test Persona identity",
+                now=self.now, runtime=self.runtime, executor=self._fake_executor,
+            )
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(self.provider_calls, 0)
+        self.assertEqual(await self.pool_scalar("select count(*) from autonomy_executions"), 0)
+        self.assertEqual(await self.pool_scalar(
+            "select count(*) from chat_turns where trigger_type='autonomy_decision'"
+        ), 0)
+
+    @stable_policy_test
+    async def test_atomic_reservation_stage_creation_rolls_back_all_rows(self) -> None:
+        async def fail_stages(*_args, **_kwargs):
+            raise RuntimeError("injected stage creation failure")
+
+        with patch(
+            "app.services.turn_durability.TurnDurability._insert_proactive_stages_with_connection",
+            new=fail_stages,
+        ):
+            result = await run_autonomy_cycle(
+                pool=self.pool, settings=self.settings, identity_prompt="Test Persona identity",
+                now=self.now, runtime=self.runtime, executor=self._fake_executor,
+            )
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(self.provider_calls, 0)
+        self.assertEqual(await self.pool_scalar("select count(*) from autonomy_executions"), 0)
+        self.assertEqual(await self.pool_scalar(
+            "select count(*) from chat_turns where trigger_type='autonomy_decision'"
+        ), 0)
+        self.assertEqual(await self.pool_scalar("select count(*) from chat_turn_stages"), 0)
+        retry = await run_autonomy_cycle(
+            pool=self.pool, settings=self.settings, identity_prompt="Test Persona identity",
+            now=self.now + timedelta(seconds=61), runtime=self.runtime, executor=self._fake_executor,
+        )
+        self.assertEqual(retry.status, "executed")
+        self.assertEqual(self.provider_calls, 1)
+
+    @stable_policy_test
     async def test_provider_crash_recovers_indeterminate_and_never_recalls(self) -> None:
         entered = asyncio.Event()
         release = asyncio.Event()
@@ -590,14 +714,18 @@ class AutonomyRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ),
             user_activity_anchor_message_id=self.user_message_id, now=self.now,
         )
-        async with self.pool.acquire() as connection:
-            await connection.execute(
-                """insert into chat_turns(
-                     turn_id,conversation_id,user_message_id,assistant_message_id,status,created_at,updated_at,
-                     initiator_actor,trigger_type,input_source)
-                   values($1,$2,null,null,'pending',$3,$3,'persona','autonomy_decision','internal')""",
-                reservation.turn_id, self.conversation_id, self.now.isoformat(),
-            )
+        from app.models.turn_context import ActorContext, ActorKind, TurnContext, TurnInputSource, TurnTrigger
+        await __import__("app.services.turn_durability", fromlist=["TurnDurability"]).TurnDurability(
+            self.pool
+        ).begin_proactive_turn(
+            self.conversation_id,
+            TurnContext(
+                initiator=ActorContext(ActorKind.PERSONA),
+                trigger=TurnTrigger.AUTONOMY_DECISION,
+                input_source=TurnInputSource.INTERNAL,
+            ),
+            turn_id=reservation.turn_id,
+        )
         recovered = await recover_incomplete_autonomy_executions(
             self.pool, persona_id="persona-a", now=self.now + timedelta(seconds=1),
         )
@@ -605,9 +733,59 @@ class AutonomyRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.provider_calls, 0)
         async with self.pool.acquire() as connection:
             turn = await connection.fetchrow(
-                "select status from chat_turns where turn_id=$1", reservation.turn_id
+                "select status,last_failed_stage,safe_error_category from chat_turns where turn_id=$1",
+                reservation.turn_id,
             )
-        self.assertEqual(turn["status"], "pending")
+            stages = await connection.fetch(
+                "select status from chat_turn_stages where turn_id=$1", reservation.turn_id
+            )
+        self.assertEqual(turn["status"], "core_failed")
+        self.assertEqual(turn["last_failed_stage"], "recovery")
+        self.assertEqual(turn["safe_error_category"], "recovered_before_provider")
+        self.assertEqual({row["status"] for row in stages}, {"failed"})
+        for offset in range(100):
+            repeated = await recover_incomplete_autonomy_executions(
+                self.pool, persona_id="persona-a", now=self.now + timedelta(seconds=2 + offset),
+            )
+            self.assertEqual(sum(repeated.values()), 0)
+        self.assertEqual(await self.pool_scalar(
+            "select count(*) from autonomy_executions where status='FAILED_SAFE' "
+            "and safe_error_category='recovered_before_provider'"
+        ), 1)
+        self.assertEqual(await self.pool_scalar(
+            "select count(*) from messages where source_device='mindcore_proactive'"
+        ), 0)
+        self.assertEqual(self.provider_calls, 0)
+
+    async def test_reserved_execution_with_malformed_linked_turn_becomes_indeterminate(self) -> None:
+        from types import SimpleNamespace
+        from app.services.mindcore.autonomy_execution_store import reserve_autonomy_execution
+
+        reservation = await reserve_autonomy_execution(
+            self.pool, conversation_id=self.conversation_id, persona_id="persona-a",
+            intention=SimpleNamespace(
+                intention_key="CHECK_IN:curiosity", intention_type="CHECK_IN",
+                target_kind="NEED", target_key="curiosity",
+            ), user_activity_anchor_message_id=self.user_message_id, now=self.now,
+        )
+        async with self.pool.acquire() as connection:
+            await connection.execute(
+                """insert into chat_turns(
+                     turn_id,conversation_id,user_message_id,assistant_message_id,status,created_at,updated_at,
+                     initiator_actor,trigger_type,input_source)
+                   values($1,$2,null,null,'pending',$3,$3,'system','system_event','internal')""",
+                reservation.turn_id, self.conversation_id, self.now.isoformat(),
+            )
+        recovered = await recover_incomplete_autonomy_executions(
+            self.pool, persona_id="persona-a", now=self.now + timedelta(seconds=1),
+        )
+        self.assertEqual(recovered["INDETERMINATE"], 1)
+        async with self.pool.acquire() as connection:
+            status = await connection.fetchval(
+                "select status from autonomy_executions where execution_id=$1", reservation.execution_id
+            )
+        self.assertEqual(status, "INDETERMINATE")
+        self.assertEqual(self.provider_calls, 0)
 
     async def test_recovery_is_persona_scoped(self) -> None:
         from types import SimpleNamespace

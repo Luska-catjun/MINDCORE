@@ -253,18 +253,13 @@ class AutonomyScenarioHarnessTests(unittest.TestCase):
 
     def test_schema_marker_is_24_for_durable_autonomy_execution_authority(self) -> None:
         self.assertEqual(CURRENT_TURSO_BASELINE_VERSION, "24")
-        status = __import__("subprocess").run(
-            ["git", "status", "--short", "--untracked-files=all"],
-            cwd=ROOT, capture_output=True, text=True, check=True,
-        ).stdout.splitlines()
-        changed = {line[3:] for line in status if len(line) > 3}
-        schema_paths = {
-            "app/database/migrations.py",
-            "app/database/schema_contract.py",
-            "db/turso/baseline_v1.sql",
-        }
-        self.assertTrue(schema_paths.issubset(changed))
-        self.assertIn("024_autonomy_execution_persistence", (ROOT / "app/database/migrations.py").read_text())
+        migration = (ROOT / "app/database/migrations.py").read_text(encoding="utf-8")
+        contract = (ROOT / "app/database/schema_contract.py").read_text(encoding="utf-8")
+        baseline = (ROOT / "db/turso/baseline_v1.sql").read_text(encoding="utf-8")
+        self.assertIn("024_autonomy_execution_persistence", migration)
+        self.assertIn('CURRENT_TURSO_BASELINE_VERSION = "24"', contract)
+        self.assertIn("CREATE TABLE autonomy_executions", baseline)
+        self.assertIn("uq_autonomy_execution_active_dedupe", baseline)
 
     def test_catalog_expectations_use_test_contract_vocabulary(self) -> None:
         self.assertEqual(
