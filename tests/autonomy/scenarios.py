@@ -120,7 +120,7 @@ def _scenario_catalog() -> tuple[ScenarioEntry, ...]:
     entries.append(_entry("k_goal_overdue", "Overdue Goal produces pressure facts only; no execution.", age=18000, goals=(_goal(FIXED_NOW, deadline=-3600),), allowed=(ActionClass.DO_NOT_ACT, ActionClass.DEFER), required=(ReasonCode.DEADLINE_PRESSURE,)))
     entries.append(_entry("l_system_event_recent_user", "Fresh system event with recent user activity.", temporal_inputs=_inputs(FIXED_NOW, activity=(("system", 30, "system-l"), ("user", 20, "user-l")), ever_user=True), required=(ReasonCode.RECENT_USER_ACTIVITY, ReasonCode.SYSTEM_EVENT), suppression=(ReasonCode.RECENT_USER_ACTIVITY,)))
     entries.append(_entry("m_system_event_long_idle", "Long-idle conversation plus an independent fresh global system event.", age=18000, overlays=(_system_overlay(FIXED_NOW),), allowed=(ActionClass.ACT, ActionClass.DEFER), required=(ReasonCode.LONG_IDLE, ReasonCode.SYSTEM_EVENT), tags=("global", "conversation-scoped"), notes="Global system activity is composed separately from this conversation's idle context; composition is test-only."))
-    entries.append(_entry("n_conflicting_scoped_signals", "Recent user activity, long idle from separate scope, Need, deadline, and system event.", age=18000, needs=(_need(FIXED_NOW),), goals=(_goal(FIXED_NOW, deadline=3600),), overlays=(_system_overlay(FIXED_NOW),), allowed=(ActionClass.DO_NOT_ACT, ActionClass.DEFER, ActionClass.ACT), required=(ReasonCode.CONFLICTING_SIGNALS,), tags=("conflict",)))
+    entries.append(_entry("n_conflicting_scoped_signals", "Recent user activity, long idle from separate scope, Need, deadline, and system event.", age=18000, needs=(_need(FIXED_NOW),), goals=(_goal(FIXED_NOW, deadline=3600),), overlays=(_system_overlay(FIXED_NOW),), allowed=(ActionClass.DO_NOT_ACT, ActionClass.DEFER, ActionClass.ACT), required=(ReasonCode.CONFLICTING_SIGNALS,), suppression=(ReasonCode.RECENT_USER_ACTIVITY,), tags=("conflict",), notes="The separate-scope user event is 5 seconds old and global recent-user policy suppresses an otherwise eligible proactive decision."))
     # The independent recent-user fact is added as a second deterministic scope.
     recent_scope = _inputs(FIXED_NOW, activity=(("user", 5, "other-scope-recent-user"),), ever_user=True)
     recent_temporal = compute_temporal_context(recent_scope, timezone_name=DEFAULT_TIMEZONE, now=FIXED_NOW)
@@ -144,7 +144,8 @@ def _scenario_catalog() -> tuple[ScenarioEntry, ...]:
     for suffix, seconds in (("below", 899.999), ("at", 900.0), ("above", 900.001)):
         entries.append(_entry(f"s_idle_15m_{suffix}", f"Idle boundary at fifteen minutes: {seconds} seconds.", age=seconds, required=(ReasonCode.INSUFFICIENT_IDLE,)))
     for suffix, seconds in (("below", 7199.999), ("at", 7200.0), ("above", 7200.001)):
-        entries.append(_entry(f"t_idle_2h_{suffix}", f"Idle boundary at two hours: {seconds} seconds.", age=seconds, required=(ReasonCode.LONG_IDLE,)))
+        required = (ReasonCode.INSUFFICIENT_IDLE,) if suffix == "below" else (ReasonCode.LONG_IDLE,)
+        entries.append(_entry(f"t_idle_2h_{suffix}", f"Idle boundary at two hours: {seconds} seconds.", age=seconds, required=required, notes="The just-below sample remains in M3's `idle` band; LONG_IDLE begins at the exact 7200-second boundary."))
     entries.append(_entry("u_idle_24h_saturation", "Idle pressure reaches exact saturation at twenty-four hours.", age=86400, required=(ReasonCode.LONG_IDLE,)))
     for hour, minute, second, daypart in ((4,59,59,"late_night"),(5,0,0,"morning"),(11,59,59,"morning"),(12,0,0,"afternoon"),(16,59,59,"afternoon"),(17,0,0,"evening"),(20,59,59,"evening"),(21,0,0,"night")):
         local_now = datetime(2026, 9, 23, hour, minute, second, tzinfo=timezone(timedelta(hours=9)))
