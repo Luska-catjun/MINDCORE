@@ -133,6 +133,7 @@ def derive_autonomy_intention(
     motivation: MotivationalSnapshot,
     temporal: TemporalContext,
     triggers: TriggerSnapshot,
+    persona_id: str | None = None,
 ) -> AutonomyIntention | None:
     """Select exactly one intention only when M5 has already authorized ACT.
 
@@ -232,4 +233,5 @@ def derive_autonomy_intention(
         confidence=decision.confidence,
         evaluated_at=_utc(decision.evaluated_at),
         intention_key=f"{selected.intention_type}:{selected.target_key}",
+        persona_id=persona_id,
     )

@@ -51,6 +51,7 @@ class AutonomyIntention:
     confidence: float
     evaluated_at: datetime
     intention_key: str
+    persona_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "intention_type", IntentionType(self.intention_type))
@@ -94,6 +95,8 @@ class AutonomyIntention:
         expected_key = f"{self.intention_type}:{self.target_key or ''}"
         if self.intention_key != expected_key:
             raise ValueError("autonomy_intention_key_mismatch")
+        if self.persona_id is not None and not self.persona_id.strip():
+            raise ValueError("autonomy_intention_persona_id_invalid")
         if not self.reason_codes:
             raise ValueError("autonomy_intention_reason_required")
         for field in ("urgency", "confidence"):

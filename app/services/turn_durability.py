@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any, Awaitable, Callable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from app.services import repository
 from app.services.error_safety import safe_error_type
@@ -57,6 +57,16 @@ POST_COGNITION_STAGES: tuple[StageDefinition, ...] = (
     StageDefinition("self_model", "automatic"),
 )
 STAGE_BY_NAME = {stage.name: stage for stage in POST_COGNITION_STAGES}
+
+# These stages belong only to explicitly invoked proactive turns. They are
+# intentionally not appended to POST_COGNITION_STAGES, which is the foreground
+# chat ledger template.
+PROACTIVE_TURN_STAGES: tuple[StageDefinition, ...] = (
+    StageDefinition("context_prepare", "manual"),
+    StageDefinition("provider_generate", "manual"),
+    StageDefinition("assistant_persist", "manual"),
+)
+STAGE_BY_NAME.update({stage.name: stage for stage in PROACTIVE_TURN_STAGES})
 
 
 class StageNotClaimed(RuntimeError):
@@ -160,6 +170,102 @@ class TurnDurability:
         )
         return message
 
+    async def begin_proactive_turn(
+        self, conversation_id: UUID | str, turn_context: TurnContext
+    ) -> UUID:
+        """Create a persona-initiated durable turn without fabricating user input."""
+        if not self.enabled:
+            raise RuntimeError("proactive_turn_durability_unavailable")
+        if turn_context.durable_values() != ("persona", "autonomy_decision", "internal"):
+            raise ValueError("proactive_turn_context_invalid")
+        turn_id = uuid4()
+        now = _utc_now()
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """insert into chat_turns(
+                         turn_id,conversation_id,user_message_id,assistant_message_id,status,
+                         created_at,updated_at,core_completed_at,completed_at,last_failed_stage,safe_error_category,
+                         initiator_actor,trigger_type,input_source
+                       ) values($1,$2,null,null,'pending',$3,$3,null,null,null,null,$4,$5,$6)""",
+                    turn_id, conversation_id, now, *turn_context.durable_values(),
+                )
+                for stage in PROACTIVE_TURN_STAGES:
+                    await connection.execute(
+                        """insert into chat_turn_stages(
+                             turn_id,stage_name,status,retry_policy,attempt_count,
+                             started_at,completed_at,last_error_category
+                           ) values($1,$2,'pending',$3,0,null,null,null)""",
+                        turn_id, stage.name, stage.retry_policy,
+                    )
+        logger.info(
+            "TURN_LIFECYCLE turn=%s status=pending initiator=persona trigger=autonomy_decision input_source=internal",
+            turn_id,
+        )
+        return turn_id
+
+    async def complete_proactive_core(self, turn_id: UUID | str, assistant_payload: Any) -> dict[str, Any]:
+        """Atomically persist one Persona message and complete its proactive turn."""
+        if not self.enabled:
+            raise RuntimeError("proactive_turn_durability_unavailable")
+        try:
+            async with self.pool.acquire() as connection:
+                async with connection.transaction():
+                    turn = await connection.fetchrow(
+                        """select user_message_id,core_completed_at,initiator_actor,trigger_type,input_source
+                           from chat_turns where turn_id=$1""",
+                        turn_id,
+                    )
+                    prerequisites = await connection.fetchrow(
+                        """select
+                             sum(case when stage_name='context_prepare' and status='completed' then 1 else 0 end) as context_done,
+                             sum(case when stage_name='provider_generate' and status='completed' then 1 else 0 end) as provider_done
+                           from chat_turn_stages where turn_id=$1""",
+                        turn_id,
+                    )
+                    if (
+                        turn is None
+                        or turn["user_message_id"] is not None
+                        or turn["core_completed_at"] is not None
+                        or (turn["initiator_actor"], turn["trigger_type"], turn["input_source"])
+                        != ("persona", "autonomy_decision", "internal")
+                        or int((prerequisites or {}).get("context_done") or 0) != 1
+                        or int((prerequisites or {}).get("provider_done") or 0) != 1
+                    ):
+                        raise RuntimeError("proactive_turn_persist_prerequisite_failed")
+                    if not await self._claim_stage_with_connection(
+                        connection, turn_id, "assistant_persist"
+                    ):
+                        raise StageNotClaimed("assistant_persist")
+                    message = await repository.create_message(
+                        _ConnectionBoundPool(connection), assistant_payload
+                    )
+                    now = _utc_now()
+                    updated = await connection.fetchrow(
+                        """update chat_turns set assistant_message_id=$1,status='core_completed',
+                                  core_completed_at=$2,updated_at=$2,last_failed_stage=null,
+                                  safe_error_category=null
+                           where turn_id=$3 and user_message_id is null
+                             and initiator_actor='persona' and trigger_type='autonomy_decision'
+                             and input_source='internal' and core_completed_at is null
+                           returning turn_id""",
+                        message["id"], now, turn_id,
+                    )
+                    if updated is None:
+                        raise RuntimeError("proactive_turn_completion_conflict")
+                    await connection.execute(
+                        """update chat_turn_stages set status='completed',completed_at=$1,
+                                  last_error_category=null
+                           where turn_id=$2 and stage_name='assistant_persist' and status='running'""",
+                        now, turn_id,
+                    )
+                    await _refresh_turn_status(connection, turn_id)
+        except BaseException as error:
+            await self._mark_stage_failed(turn_id, "assistant_persist", error)
+            raise
+        logger.info("TURN_LIFECYCLE turn=%s status=complete initiator=persona", turn_id)
+        return message
+
     async def load_turn_context(self, turn_id: UUID | str) -> TurnContext | None:
         """Load durable turn provenance without reconstructing it from messages."""
         if not self.enabled:
@@ -172,17 +278,26 @@ class TurnDurability:
             )
         return TurnContext.from_durable(row) if row is not None else None
 
-    async def mark_core_failed(self, turn_id: UUID | str, error: BaseException) -> None:
+    async def mark_core_failed(
+        self,
+        turn_id: UUID | str,
+        error: BaseException,
+        *,
+        stage_name: str = "core",
+    ) -> None:
         if not self.enabled:
             return
+        if stage_name not in {"core", *(stage.name for stage in PROACTIVE_TURN_STAGES)}:
+            raise ValueError("unknown_turn_failure_stage")
         category = safe_error_type(error)
         now = _utc_now()
         async with self.pool.acquire() as connection:
             await connection.execute(
                 """update chat_turns set status='core_failed',updated_at=$1,
-                         last_failed_stage='core',safe_error_category=$2
-                   where turn_id=$3 and core_completed_at is null""",
+                         last_failed_stage=$2,safe_error_category=$3
+                   where turn_id=$4 and core_completed_at is null""",
                 now,
+                stage_name,
                 category,
                 turn_id,
             )

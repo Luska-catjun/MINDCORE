@@ -251,12 +251,20 @@ class AutonomyScenarioHarnessTests(unittest.TestCase):
         self.assertNotIn("should_act", source)
         self.assertNotIn("score_total", source)
 
-    def test_schema_marker_stays_23_and_m4_adds_no_migration_or_runtime_files(self) -> None:
+    def test_schema_marker_stays_23_and_m7_adds_no_schema_or_migration_files(self) -> None:
         self.assertEqual(CURRENT_TURSO_BASELINE_VERSION, "23")
-        changed = __import__("subprocess").run(
-            ["git", "diff", "--name-only"], cwd=ROOT, capture_output=True, text=True, check=True,
+        status = __import__("subprocess").run(
+            ["git", "status", "--short", "--untracked-files=all"],
+            cwd=ROOT, capture_output=True, text=True, check=True,
         ).stdout.splitlines()
-        self.assertTrue(all(path.startswith("tests/autonomy/") for path in changed))
+        changed = {line[3:] for line in status if len(line) > 3}
+        schema_paths = {
+            "app/database/migrations.py",
+            "app/database/schema_contract.py",
+            "db/turso/baseline_v1.sql",
+        }
+        self.assertTrue(changed.isdisjoint(schema_paths))
+        self.assertFalse(any(path.startswith("db/migrations/") for path in changed))
 
     def test_catalog_expectations_use_test_contract_vocabulary(self) -> None:
         self.assertEqual(
