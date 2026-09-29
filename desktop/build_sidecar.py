@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARIES = ROOT / "frontend" / "src-tauri" / "binaries"
-COLLECT_ALL = ("libsql", "asyncpg", "tzdata")
+COLLECT_ALL = ("libsql", "asyncpg", "tzdata", "cryptography", "keyring")
 
 
 def target_suffix(system: str | None = None, machine: str | None = None) -> str:

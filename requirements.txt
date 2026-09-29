@@ -9,3 +9,5 @@ tzdata==2026.3
 # not expose WebSocket routes, so avoid Uvicorn's optional `standard` extras
 # (including the native websockets speedups extension) in public bundles.
 uvicorn==0.34.0
+cryptography==48.0.0
+keyring==25.7.0

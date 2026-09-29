@@ -28,6 +28,10 @@ class SidecarNamingTests(unittest.TestCase):
     def test_sidecar_collects_iana_timezone_data(self) -> None:
         self.assertIn("tzdata", COLLECT_ALL)
 
+    def test_sidecar_collects_secure_sync_crypto_and_keyring_backends(self) -> None:
+        self.assertIn("cryptography", COLLECT_ALL)
+        self.assertIn("keyring", COLLECT_ALL)
+
     def test_sidecar_archive_rejects_optional_websocket_speedups(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "WebSocket speedups"):
             validate_archive_members((
