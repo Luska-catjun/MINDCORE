@@ -370,6 +370,20 @@ class PersonaSyncSecurity:
         finally:
             db.close()
 
+    def trusted_devices(self) -> list[dict[str, Any]]:
+        """Return public trust metadata for the product device list."""
+        db = self._connect()
+        try:
+            return [{"device_id": str(row["device_id"]),
+                     "fingerprint": str(row["fingerprint"]),
+                     "state": str(row["state"]),
+                     "paired_at": int(row["paired_at"])}
+                    for row in db.execute(
+                        "SELECT device_id,fingerprint,state,paired_at FROM trusted_peer "
+                        "ORDER BY paired_at DESC")]
+        finally:
+            db.close()
+
     def _trusted_peer(self, peer_device_id: str) -> tuple[Any, str]:
         state = self.peer_state(peer_device_id)
         if state == "CORRUPT":

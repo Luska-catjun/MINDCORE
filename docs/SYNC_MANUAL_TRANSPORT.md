@@ -1,5 +1,12 @@
 # Manual Secure Sync Transport — Candidate Contract
 
+M7.3.2 adds a production React/Tauri **Sync / Devices** panel and an optional
+resolution field in the authenticated protocol-v1 delta. The panel invokes
+the packaged backend through `manual_sync_action` and native file dialogs.
+Its selected Persona must currently have a local `file:` schema-24 database;
+live `libsql:`/Turso domain sync is not implemented. Automatic and background
+sync remain disabled. The earlier M7.3.1.1 acceptance below is historical.
+
 This document describes the M7.3.1 Desktop CLI and its M7.3.1.1 accepted
 Android/Desktop protocol-v1 interoperability. It remains a manual file
 transport, not a production sync UI or live Turso workflow. The protocol

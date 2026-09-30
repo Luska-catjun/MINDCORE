@@ -1,5 +1,16 @@
 # Persona Sync Convergence Model — Candidate Contract
 
+## M7.3.2 resolution candidate
+
+The optional protocol-v1 `resolutions` delta field carries encrypted,
+authenticated first-class operations. A result supersedes two content-hash
+heads; different simultaneous results become a new explicit conflict, which
+can itself be resolved with `supersedes` references. Replay is logically
+idempotent. Local domain commits precede sidecar checkpoints so a retry after
+process death does not repeat the domain mutation. Semantic tombstones retain
+physical cognition rows and sidecar schema 5 records the retained row hash.
+Persona schema stays 24. See [SYNC_CONFLICT_RESOLUTION.md](SYNC_CONFLICT_RESOLUTION.md).
+
 This describes protocol-v1 behavior accepted through the M7.3.1.1 synthetic
 Android/Desktop convergence run. It establishes a local-file foundation only;
 production Persona Sync remains disabled until conflict resolution and

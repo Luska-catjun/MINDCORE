@@ -212,12 +212,31 @@ class SyncConflict:
 
 
 @dataclass(frozen=True)
+class SyncResolution:
+    """A signed-envelope operation that explicitly supersedes both conflict heads."""
+    resolution_id: str
+    persona_id: str
+    entity_kind: str
+    entity_id: str
+    head_hashes: tuple[str, str]
+    result: SyncRecord
+    supersedes: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"resolution_id": self.resolution_id, "persona_id": self.persona_id,
+                "entity_kind": self.entity_kind, "entity_id": self.entity_id,
+                "head_hashes": list(self.head_hashes), "result": self.result.as_dict(),
+                "supersedes": list(self.supersedes)}
+
+
+@dataclass(frozen=True)
 class SyncDelta:
     persona_id: str
     source_device_id: str
     entries: tuple[DeltaEntry, ...]
     conflicts: tuple[SyncConflict, ...] = ()
     protocol_version: int = PROTOCOL_VERSION
+    resolutions: tuple[SyncResolution, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -229,6 +248,10 @@ class SyncDelta:
             "protocol_version": self.protocol_version,
             "source_device_id": self.source_device_id,
         }
+        if self.resolutions:
+            value["resolutions"] = [item.as_dict() for item in sorted(
+                self.resolutions, key=lambda item: (item.entity_kind, item.entity_id,
+                                                    item.resolution_id))]
         value["delta_hash"] = canonical_hash(value)
         return value
 
@@ -436,8 +459,9 @@ def validate_manifest(manifest: SyncManifest | Mapping[str, Any],
 
 def validate_delta(delta: SyncDelta | Mapping[str, Any], expected_persona_id: str) -> dict[str, Any]:
     value = delta.as_dict() if isinstance(delta, SyncDelta) else dict(delta)
-    if set(value) != {"conflicts", "delta_hash", "entries", "persona_id",
-                      "protocol_version", "source_device_id"}:
+    required = {"conflicts", "delta_hash", "entries", "persona_id",
+                "protocol_version", "source_device_id"}
+    if set(value) not in (required, required | {"resolutions"}):
         raise SyncError("DELTA_FIELDS_UNSUPPORTED")
     persona_id = _canonical_uuid(value.get("persona_id"), "PERSONA_ID_INVALID")
     if persona_id != _canonical_uuid(expected_persona_id, "PERSONA_ID_INVALID"):
@@ -447,8 +471,10 @@ def validate_delta(delta: SyncDelta | Mapping[str, Any], expected_persona_id: st
     _canonical_uuid(value.get("source_device_id"), "DEVICE_ID_INVALID")
     entries = value.get("entries")
     conflicts = value.get("conflicts")
+    resolutions = value.get("resolutions", [])
     if not isinstance(entries, list) or not isinstance(conflicts, list) \
-            or len(entries) > MAX_RECORDS or len(conflicts) > MAX_RECORDS:
+            or not isinstance(resolutions, list) or len(entries) > MAX_RECORDS \
+            or len(conflicts) > MAX_RECORDS or len(resolutions) > MAX_RECORDS:
         raise SyncError("DELTA_SIZE_LIMIT")
     total_bytes = 0
     seen: set[tuple[str, str]] = set()
@@ -522,12 +548,80 @@ def validate_delta(delta: SyncDelta | Mapping[str, Any], expected_persona_id: st
     conflict_order = [(item["entity_kind"], item["entity_id"], item["code"]) for item in conflicts]
     if entry_order != sorted(entry_order) or conflict_order != sorted(conflict_order):
         raise SyncError("DELTA_ORDER_INVALID")
+    resolution_order: list[tuple[str, str, str]] = []
+    for operation in resolutions:
+        if not isinstance(operation, Mapping) or set(operation) != {
+                "resolution_id", "persona_id", "entity_kind", "entity_id",
+                "head_hashes", "result", "supersedes"}:
+            raise SyncError("RESOLUTION_FIELDS_INVALID")
+        kind, entity_id = operation["entity_kind"], operation["entity_id"]
+        heads = operation["head_hashes"]
+        supersedes = operation["supersedes"]
+        if operation["persona_id"] != persona_id or kind not in SYNC_ENTITY_POLICIES \
+                or SYNC_ENTITY_POLICIES[kind].policy != "SYNC_MUTABLE" \
+                or kind == "persona.identity" \
+                or not isinstance(entity_id, str) or not entity_id \
+                or len(entity_id.encode("utf-8")) > MAX_ID_BYTES \
+                or not isinstance(heads, list) or len(heads) != 2 \
+                or any(not isinstance(head, str) or len(head) != 64 or
+                       any(char not in "0123456789abcdef" for char in head) for head in heads) \
+                or heads != sorted(set(heads)):
+            raise SyncError("RESOLUTION_HEADS_INVALID")
+        if not isinstance(supersedes, list) or len(supersedes) not in (0, 2) \
+                or any(not isinstance(item, str) or len(item) != 64 or
+                       any(char not in "0123456789abcdef" for char in item)
+                       for item in supersedes) or supersedes != sorted(set(supersedes)):
+            raise SyncError("RESOLUTION_ANCESTRY_INVALID")
+        raw_result = operation["result"]
+        if not isinstance(raw_result, Mapping):
+            raise SyncError("RESOLUTION_RESULT_INVALID")
+        try:
+            result = _from_dict(raw_result)
+        except (KeyError, TypeError, ValueError) as error:
+            raise SyncError("RESOLUTION_RESULT_INVALID") from error
+        if (result.persona_id, result.entity_kind, result.entity_id) != (
+                persona_id, kind, entity_id) or result.origin_device_id != value["source_device_id"] \
+                or result.revision.parent_hash != heads[0] \
+                or result.revision.ancestor_hash != heads[1]:
+            raise SyncError("RESOLUTION_RESULT_INVALID")
+        # Reuse ordinary record checks, including payload hash and tombstone rules.
+        validate_delta(SyncDelta(persona_id, value["source_device_id"], (
+            DeltaEntry("deleted" if result.tombstone else "updated", result),)), persona_id)
+        expected_id = canonical_hash({"persona_id": persona_id, "entity_kind": kind,
+                                      "entity_id": entity_id, "head_hashes": heads,
+                                      "result_hash": result.content_hash,
+                                      "tombstone": result.tombstone,
+                                      "supersedes": supersedes})
+        if operation["resolution_id"] != expected_id:
+            raise SyncError("RESOLUTION_ID_INVALID")
+        resolution_order.append((kind, entity_id, expected_id))
+    if resolution_order != sorted(set(resolution_order)):
+        raise SyncError("RESOLUTION_ORDER_INVALID")
     if total_bytes > MAX_MANIFEST_BYTES:
         raise SyncError("DELTA_SIZE_LIMIT")
     computed = canonical_hash({key: value[key] for key in sorted(value) if key != "delta_hash"})
     if value.get("delta_hash") != computed:
         raise SyncError("DELTA_HASH_INVALID")
     return value
+
+
+def make_resolution(persona_id: str, entity_kind: str, entity_id: str,
+                    head_hashes: tuple[str, str], result: SyncRecord,
+                    supersedes: tuple[str, ...] = ()) -> SyncResolution:
+    heads = tuple(sorted(set(head_hashes)))
+    supersedes = tuple(sorted(set(supersedes)))
+    if len(heads) != 2:
+        raise SyncError("RESOLUTION_HEADS_INVALID")
+    resolution_id = canonical_hash({"persona_id": persona_id, "entity_kind": entity_kind,
+                                    "entity_id": entity_id, "head_hashes": list(heads),
+                                    "result_hash": result.content_hash,
+                                    "tombstone": result.tombstone,
+                                    "supersedes": list(supersedes)})
+    operation = SyncResolution(resolution_id, persona_id, entity_kind, entity_id,
+                               heads, result, supersedes)
+    validate_delta(SyncDelta(persona_id, result.origin_device_id, (), (),
+                             PROTOCOL_VERSION, (operation,)), persona_id)
+    return operation
 
 
 def _conflict_code(left: SyncRecord, right: SyncRecord) -> str | None:
@@ -650,7 +744,7 @@ class SyncMetadataStore:
                 # retain ancestry hashes. Rebuild only this derived metadata;
                 # the source Persona database is always opened read-only.
                 raise sqlite3.DatabaseError("legacy metadata schema")
-            if version not in (0, 2, 3):
+            if version not in (0, 2, 3, 4, 5):
                 raise SyncError("SYNC_METADATA_VERSION_UNSUPPORTED")
             tables = {row[0] for row in self.connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
@@ -659,6 +753,9 @@ class SyncMetadataStore:
             if version == 2 and tables != expected:
                 raise sqlite3.DatabaseError("metadata schema mismatch")
             if version == 3 and tables != expected | {"sync_conflicts"}:
+                raise sqlite3.DatabaseError("metadata schema mismatch")
+            if version in (4, 5) and tables != expected | {"sync_conflicts", "sync_resolutions",
+                                                         "sync_pending_artifact"}:
                 raise sqlite3.DatabaseError("metadata schema mismatch")
             if version == 0 and tables:
                 raise sqlite3.DatabaseError("unversioned metadata tables")
@@ -677,6 +774,10 @@ class SyncMetadataStore:
                 self._create_schema()
             elif version == 2:
                 self._upgrade_conflict_schema()
+            if version in (2, 3):
+                self._upgrade_resolution_schema()
+            elif version == 4:
+                self._upgrade_retained_schema()
             stored_id = self.connection.execute(
                 "SELECT value FROM sync_store_meta WHERE key='device_id'").fetchone()[0]
             if stored_id != self.device_id:
@@ -746,8 +847,27 @@ class SyncMetadataStore:
             );
             CREATE INDEX sync_conflicts_persona_state
                 ON sync_conflicts(persona_id,resolution_state,last_seen_ms);
+            CREATE TABLE sync_resolutions(
+                resolution_id TEXT PRIMARY KEY,
+                persona_id TEXT NOT NULL,
+                entity_kind TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                head_a TEXT NOT NULL,
+                head_b TEXT NOT NULL,
+                result_hash TEXT NOT NULL,
+                tombstone INTEGER NOT NULL CHECK(tombstone IN (0,1)),
+                origin_device_id TEXT NOT NULL,
+                supersedes_json TEXT NOT NULL,
+                retained_hash TEXT
+            );
+            CREATE INDEX sync_resolutions_persona
+                ON sync_resolutions(persona_id,entity_kind,entity_id);
+            CREATE TABLE sync_pending_artifact(
+                conflict_id TEXT PRIMARY KEY REFERENCES sync_conflicts(conflict_id),
+                envelope_json TEXT NOT NULL
+            );
             INSERT INTO sync_store_meta(key,value) VALUES('device_id', '""');
-            PRAGMA user_version=3;
+            PRAGMA user_version=5;
             COMMIT;
         """)
         self.connection.execute("UPDATE sync_store_meta SET value=? WHERE key='device_id'", (self.device_id,))
@@ -774,6 +894,42 @@ class SyncMetadataStore:
             CREATE INDEX sync_conflicts_persona_state
                 ON sync_conflicts(persona_id,resolution_state,last_seen_ms);
             PRAGMA user_version=3;
+            COMMIT;
+        """)
+
+    def _upgrade_resolution_schema(self) -> None:
+        assert self.connection is not None
+        self.connection.executescript("""
+            BEGIN IMMEDIATE;
+            CREATE TABLE sync_resolutions(
+                resolution_id TEXT PRIMARY KEY,
+                persona_id TEXT NOT NULL,
+                entity_kind TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                head_a TEXT NOT NULL,
+                head_b TEXT NOT NULL,
+                result_hash TEXT NOT NULL,
+                tombstone INTEGER NOT NULL CHECK(tombstone IN (0,1)),
+                origin_device_id TEXT NOT NULL,
+                supersedes_json TEXT NOT NULL,
+                retained_hash TEXT
+            );
+            CREATE INDEX sync_resolutions_persona
+                ON sync_resolutions(persona_id,entity_kind,entity_id);
+            CREATE TABLE sync_pending_artifact(
+                conflict_id TEXT PRIMARY KEY REFERENCES sync_conflicts(conflict_id),
+                envelope_json TEXT NOT NULL
+            );
+            PRAGMA user_version=5;
+            COMMIT;
+        """)
+
+    def _upgrade_retained_schema(self) -> None:
+        assert self.connection is not None
+        self.connection.executescript("""
+            BEGIN IMMEDIATE;
+            ALTER TABLE sync_resolutions ADD COLUMN retained_hash TEXT;
+            PRAGMA user_version=5;
             COMMIT;
         """)
 
@@ -843,6 +999,98 @@ class SyncMetadataStore:
         query += " ORDER BY first_seen_ms,conflict_id"
         return [dict(row) for row in self.connection.execute(query, parameters)]
 
+    def save_pending_artifact(self, conflict_id: str, envelope_json: str) -> None:
+        """Retain only the authenticated ciphertext for a restart-safe user choice."""
+        if len(envelope_json.encode("utf-8")) > MAX_MANIFEST_BYTES * 2:
+            raise SyncError("ENVELOPE_SIZE_LIMIT")
+        try:
+            envelope = json.loads(envelope_json)
+        except (TypeError, ValueError) as error:
+            raise SyncError("ENVELOPE_MALFORMED") from error
+        if not isinstance(envelope, dict) or set(envelope) != {
+                "ciphertext", "message_id", "nonce", "persona_id", "protocol_version",
+                "recipient_device_id", "sender_device_id", "sequence", "type"} \
+                or not isinstance(envelope.get("ciphertext"), str):
+            raise SyncError("ENVELOPE_MALFORMED")
+        assert self.connection is not None
+        self.connection.execute("INSERT INTO sync_pending_artifact(conflict_id,envelope_json) "
+                                "VALUES(?,?) ON CONFLICT(conflict_id) DO UPDATE SET "
+                                "envelope_json=excluded.envelope_json",
+                                (conflict_id, envelope_json))
+
+    def pending_artifact(self, persona_id: str, conflict_id: str) -> str | None:
+        persona_id = _canonical_uuid(persona_id, "PERSONA_ID_INVALID")
+        assert self.connection is not None
+        row = self.connection.execute(
+            "SELECT a.envelope_json FROM sync_pending_artifact a JOIN sync_conflicts c "
+            "ON c.conflict_id=a.conflict_id WHERE c.persona_id=? AND c.conflict_id=? "
+            "AND c.resolution_state='UNRESOLVED'", (persona_id, conflict_id)).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def resolution_rows(self, persona_id: str) -> list[dict[str, Any]]:
+        persona_id = _canonical_uuid(persona_id, "PERSONA_ID_INVALID")
+        assert self.connection is not None
+        return [dict(row) for row in self.connection.execute(
+            "SELECT resolution_id,persona_id,entity_kind,entity_id,head_a,head_b,"
+            "result_hash,tombstone,origin_device_id,supersedes_json,retained_hash "
+            "FROM sync_resolutions "
+            "WHERE persona_id=? ORDER BY entity_kind,entity_id,resolution_id", (persona_id,))]
+
+    def conflict_row(self, persona_id: str, conflict_id: str) -> dict[str, Any] | None:
+        persona_id = _canonical_uuid(persona_id, "PERSONA_ID_INVALID")
+        assert self.connection is not None
+        row = self.connection.execute(
+            "SELECT * FROM sync_conflicts WHERE persona_id=? AND conflict_id=?",
+            (persona_id, conflict_id)).fetchone()
+        return dict(row) if row is not None else None
+
+    def record_resolution(self, operation: SyncResolution, *, peer_device_id: str,
+                          resolve_conflict_id: str,
+                          retained_hash: str | None = None) -> None:
+        """Checkpoint an already committed domain result without copying content."""
+        assert self.connection is not None
+        connection = self.connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = connection.execute(
+                "SELECT result_hash FROM sync_resolutions WHERE resolution_id=?",
+                (operation.resolution_id,)).fetchone()
+            if existing is not None and existing[0] != operation.result.content_hash:
+                raise SyncError("RESOLUTION_ID_COLLISION")
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO sync_resolutions VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (operation.resolution_id, operation.persona_id, operation.entity_kind,
+                     operation.entity_id, *operation.head_hashes,
+                     operation.result.content_hash, int(operation.result.tombstone),
+                     operation.result.origin_device_id,
+                     canonical_json(list(operation.supersedes)), retained_hash))
+            result = operation.result
+            connection.execute(
+                "INSERT INTO sync_record_state(persona_id,entity_kind,entity_id,content_hash,"
+                "tombstone,origin_device_id,logical_counter,parent_hash,ancestor_hash) "
+                "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(persona_id,entity_kind,entity_id) "
+                "DO UPDATE SET content_hash=excluded.content_hash,tombstone=excluded.tombstone,"
+                "origin_device_id=excluded.origin_device_id,logical_counter=excluded.logical_counter,"
+                "parent_hash=excluded.parent_hash,ancestor_hash=excluded.ancestor_hash",
+                (result.persona_id, result.entity_kind, result.entity_id, result.content_hash,
+                 int(result.tombstone), result.origin_device_id, result.revision.counter,
+                 result.revision.parent_hash, result.revision.ancestor_hash))
+            connection.execute(
+                "INSERT INTO persona_revision_counters(persona_id,counter) VALUES(?,?) "
+                "ON CONFLICT(persona_id) DO UPDATE SET counter=max(counter,excluded.counter)",
+                (result.persona_id, result.revision.counter))
+            connection.execute("UPDATE sync_conflicts SET resolution_state='RESOLVED' "
+                               "WHERE conflict_id=? AND persona_id=?",
+                               (resolve_conflict_id, operation.persona_id))
+            connection.execute("DELETE FROM sync_pending_artifact WHERE conflict_id=?",
+                               (resolve_conflict_id,))
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
     def close(self) -> None:
         if self.connection is not None:
             self.connection.close()
@@ -875,6 +1123,13 @@ class SyncMetadataStore:
                     "logical_counter,parent_hash,ancestor_hash FROM sync_record_state WHERE persona_id=?",
                     (persona_id,))
             }
+            retained = {}
+            for resolution in connection.execute(
+                    "SELECT entity_kind,entity_id,result_hash,retained_hash "
+                    "FROM sync_resolutions WHERE persona_id=? AND tombstone=1 "
+                    "ORDER BY rowid DESC", (persona_id,)):
+                retained.setdefault((resolution["entity_kind"], resolution["entity_id"]),
+                                    (resolution["result_hash"], resolution["retained_hash"]))
 
             def next_revision(parent_hash: str | None, ancestor_hash: str | None) -> SyncRevision:
                 row = connection.execute(
@@ -908,7 +1163,8 @@ class SyncMetadataStore:
                 if old and old["tombstone"]:
                     # An explicit tombstone is metadata-only until a future
                     # apply phase. The source row can still exist unchanged.
-                    if old["parent_hash"] == content_hash:
+                    if content_hash in (old["parent_hash"], old["ancestor_hash"]) \
+                            or retained.get(key) == (old["content_hash"], content_hash):
                         continue
                     conflicts.append(SyncConflict("TOMBSTONE_ID_REUSE", kind, entity_id,
                                                   content_hash, old["content_hash"]))
@@ -1205,11 +1461,31 @@ class PersonaSyncEngine:
         candidates = self._read_candidates(persona_id)
         with SyncMetadataStore(self.metadata_path, self.device_id) as store:
             records, entries, conflicts = store.reconcile(persona_id, candidates)
+            resolution_rows = store.resolution_rows(persona_id)
             recovered = store.metadata_recovered
         manifest = SyncManifest(_canonical_uuid(persona_id, "PERSONA_ID_INVALID"),
                                 self.device_id, records)
         validate_manifest(manifest, persona_id)
-        delta = SyncDelta(manifest.persona_id, self.device_id, entries, conflicts)
+        record_map = {(record.entity_kind, record.entity_id): record for record in records}
+        operations: list[SyncResolution] = []
+        superseded_ids = {resolution_id for row in resolution_rows
+                          for resolution_id in json.loads(row["supersedes_json"])}
+        for row in resolution_rows:
+            if row["resolution_id"] in superseded_ids:
+                continue
+            record = record_map.get((row["entity_kind"], row["entity_id"]))
+            if record is None or record.content_hash != row["result_hash"] \
+                    or record.tombstone != bool(row["tombstone"]):
+                continue
+            # A peer's own operation need not be echoed back to that same peer.
+            if row["origin_device_id"] != self.device_id:
+                continue
+            operations.append(make_resolution(persona_id, row["entity_kind"],
+                                              row["entity_id"],
+                                              (row["head_a"], row["head_b"]), record,
+                                              tuple(json.loads(row["supersedes_json"]))))
+        delta = SyncDelta(manifest.persona_id, self.device_id, entries, conflicts,
+                          PROTOCOL_VERSION, tuple(operations))
         validate_delta(delta, persona_id)
         return SyncScan(manifest, delta, recovered)
 
@@ -1259,7 +1535,8 @@ def _decode_canonical_sql_value(value: Any) -> Any:
 def apply_remote_delta(database_path: str | Path, private_root: str | Path,
                        device_id: str, expected_persona_id: str,
                        trusted_peer_device_id: str,
-                       delta: SyncDelta | Mapping[str, Any]) -> str:
+                       delta: SyncDelta | Mapping[str, Any],
+                       encrypted_envelope: str | None = None) -> str:
     """Validate and transactionally apply a trusted peer delta to one schema-24 DB.
 
     Domain rows commit atomically first. The sidecar checkpoint follows. If a
@@ -1276,24 +1553,79 @@ def apply_remote_delta(database_path: str | Path, private_root: str | Path,
         with SyncMetadataStore(sync_metadata_path(private_root), local_device_id) as store:
             local_hash, local_revision = store.local_revision(
                 persona_id, error.entity_kind, error.entity_id)
-            store.record_conflict(
+            conflict_id = store.record_conflict(
                 persona_id=persona_id, entity_kind=error.entity_kind, entity_id=error.entity_id,
                 conflict_type=error.code, peer_device_id=peer_id,
                 local_hash=error.local_hash or local_hash,
                 remote_hash=error.remote_hash,
                 local_revision=error.local_revision or local_revision,
                 remote_revision=error.remote_revision)
+            if encrypted_envelope is not None:
+                store.save_pending_artifact(conflict_id, encrypted_envelope)
 
     validated = validate_delta(delta, persona_id)
     if validated["source_device_id"] != peer_id:
         raise SyncError("SENDER_MISMATCH")
-    if validated["conflicts"]:
-        item = validated["conflicts"][0]
-        error = SyncApplyConflict(item["code"], item["entity_kind"], item["entity_id"],
-                                  local_hash=item["local_hash"], remote_hash=item["remote_hash"])
-        persist_conflict(error)
-        raise error
-    records = [_from_dict(entry["record"]) for entry in validated["entries"]]
+    resolution_ops = [SyncResolution(
+        item["resolution_id"], persona_id, item["entity_kind"], item["entity_id"],
+        tuple(item["head_hashes"]), _from_dict(item["result"]),
+        tuple(item["supersedes"]))
+        for item in validated.get("resolutions", [])]
+    resolution_keys = {(item.entity_kind, item.entity_id) for item in resolution_ops}
+    if len(resolution_keys) != len(resolution_ops):
+        raise SyncError("RESOLUTION_ORDER_INVALID")
+    resolution_conflict_ids: dict[str, str] = {}
+    with SyncMetadataStore(sync_metadata_path(private_root), local_device_id) as store:
+        known = store.resolution_rows(persona_id)
+        pending = store.list_conflicts(persona_id)
+        for operation in resolution_ops:
+            existing = next((row for row in known
+                             if row["resolution_id"] == operation.resolution_id), None)
+            if existing is not None:
+                continue
+            sibling = next((row for row in known
+                            if row["entity_kind"] == operation.entity_kind
+                            and row["entity_id"] == operation.entity_id
+                            and (row["head_a"], row["head_b"]) == operation.head_hashes
+                            and row["resolution_id"] != operation.resolution_id), None)
+            matching = next((row for row in pending
+                             if row["entity_kind"] == operation.entity_kind
+                             and row["entity_id"] == operation.entity_id
+                             and row["peer_device_id"] == peer_id
+                             and tuple(sorted((row["local_hash"], row["remote_hash"])))
+                             == operation.head_hashes), None)
+            if sibling is not None and not (
+                    matching is not None and matching["conflict_type"] == "RESOLUTION_CONFLICT"
+                    and tuple(sorted((matching["local_revision"], matching["remote_revision"])))
+                    == operation.supersedes
+                    and sibling["resolution_id"] in operation.supersedes):
+                error = SyncApplyConflict("RESOLUTION_CONFLICT", operation.entity_kind,
+                                          operation.entity_id,
+                                          local_hash=sibling["result_hash"],
+                                          remote_hash=operation.result.content_hash,
+                                          local_revision=sibling["resolution_id"],
+                                          remote_revision=operation.resolution_id)
+                persist_conflict(error)
+                raise error
+            if matching is None:
+                raise SyncError("STALE_RESOLUTION")
+            if matching["conflict_type"] == "RESOLUTION_CONFLICT":
+                if tuple(sorted((matching["local_revision"], matching["remote_revision"]))) \
+                        != operation.supersedes:
+                    raise SyncError("STALE_RESOLUTION")
+            elif operation.supersedes:
+                raise SyncError("STALE_RESOLUTION")
+            resolution_conflict_ids[operation.resolution_id] = matching["conflict_id"]
+    for item in validated["conflicts"]:
+        if (item["entity_kind"], item["entity_id"]) not in resolution_keys:
+            error = SyncApplyConflict(item["code"], item["entity_kind"], item["entity_id"],
+                                      local_hash=item["local_hash"], remote_hash=item["remote_hash"])
+            persist_conflict(error)
+            raise error
+    ordinary_entries = [entry for entry in validated["entries"]
+                        if (entry["record"]["entity_kind"], entry["record"]["entity_id"])
+                        not in resolution_keys]
+    records = [_from_dict(entry["record"]) for entry in ordinary_entries]
     if any(record.entity_kind == "persona.identity" for record in records):
         item = next(record for record in records if record.entity_kind == "persona.identity")
         error = SyncApplyConflict("ENTITY_STORAGE_NOT_TRANSACTIONAL", item.entity_kind, item.entity_id,
@@ -1319,7 +1651,8 @@ def apply_remote_delta(database_path: str | Path, private_root: str | Path,
         _validate_persona_database(connection, persona_id)
 
         plans: list[tuple[SyncRecord, str, tuple[str, ...], Any]] = []
-        for entry, record in zip(validated["entries"], records):
+        retained_hashes: dict[str, str | None] = {}
+        for entry, record in zip(ordinary_entries, records):
             policy = SYNC_ENTITY_POLICIES[record.entity_kind]
             columns = _BASELINE_COLUMNS.get(record.entity_kind)
             if not columns:
@@ -1337,6 +1670,19 @@ def apply_remote_delta(database_path: str | Path, private_root: str | Path,
                 (record.entity_id,)).fetchone()
             current_payload = dict(current_row) if current_row is not None else None
             current_hash = canonical_hash(current_payload) if current_payload is not None else None
+
+            if not record.tombstone:
+                with SyncMetadataStore(sync_metadata_path(private_root), local_device_id) as store:
+                    local_tombstone = store.local_tombstone(
+                        persona_id, record.entity_kind, record.entity_id)
+                    tombstone_hash, tombstone_revision = store.local_revision(
+                        persona_id, record.entity_kind, record.entity_id)
+                if local_tombstone and record.content_hash != tombstone_hash:
+                    raise SyncApplyConflict(
+                        "CONCURRENT_DELETE_MUTATION", record.entity_kind, record.entity_id,
+                        local_hash=tombstone_hash, remote_hash=record.content_hash,
+                        local_revision=tombstone_revision,
+                        remote_revision=canonical_json(record.revision.as_dict()))
 
             if record.tombstone:
                 if current_hash is None:
@@ -1396,6 +1742,43 @@ def apply_remote_delta(database_path: str | Path, private_root: str | Path,
                                         remote_revision=canonical_json(record.revision.as_dict()))
             plans.append((record, "update", columns, payload))
 
+        for operation in resolution_ops:
+            if operation.resolution_id not in resolution_conflict_ids:
+                idempotent += 1
+                continue
+            record = operation.result
+            kind = record.entity_kind
+            columns = _BASELINE_COLUMNS.get(kind)
+            if not columns:
+                raise SyncError("SYNC_SCHEMA_UNSUPPORTED")
+            policy = SYNC_ENTITY_POLICIES[kind]
+            row = connection.execute(
+                f'SELECT {",".join(chr(34)+column+chr(34) for column in columns)} '
+                f'FROM "{kind}" WHERE "{policy.identity_column}"=?',
+                (record.entity_id,)).fetchone()
+            current_payload = dict(row) if row is not None else None
+            current_hash = canonical_hash(current_payload) if current_payload is not None else None
+            with SyncMetadataStore(sync_metadata_path(private_root), local_device_id) as store:
+                metadata_hash, _ = store.local_revision(persona_id, kind, record.entity_id)
+                tombstoned = store.local_tombstone(persona_id, kind, record.entity_id)
+            effective_hash = metadata_hash if tombstoned else current_hash
+            if effective_hash not in (*operation.head_hashes, record.content_hash):
+                raise SyncError("STALE_RESOLUTION")
+            if record.tombstone:
+                retained_hashes[operation.resolution_id] = current_hash
+                plans.append((record, "deleted", columns, None))
+                idempotent += 1
+            else:
+                payload = record.canonical_payload
+                if not isinstance(payload, dict) or set(payload) != set(columns) \
+                        or str(payload.get(policy.identity_column)) != record.entity_id:
+                    raise SyncError("RESOLUTION_RESULT_INVALID")
+                if current_hash == record.content_hash:
+                    plans.append((record, "noop", columns, payload))
+                    idempotent += 1
+                else:
+                    plans.append((record, "insert" if row is None else "update", columns, payload))
+
         # Classification completes before the first mutation. The entire delta
         # is then applied in one SQLite transaction; no partial-success mode.
         for record, action, columns, payload in plans:
@@ -1433,6 +1816,12 @@ def apply_remote_delta(database_path: str | Path, private_root: str | Path,
     _debug_crash_barrier("C_BEFORE_CHECKPOINT")
     with SyncMetadataStore(sync_metadata_path(private_root), local_device_id) as store:
         store.checkpoint_remote_records(records, peer_id)
+        for operation in resolution_ops:
+            conflict_id = resolution_conflict_ids.get(operation.resolution_id)
+            if conflict_id is not None:
+                store.record_resolution(operation, peer_device_id=peer_id,
+                                        resolve_conflict_id=conflict_id,
+                                        retained_hash=retained_hashes.get(operation.resolution_id))
     return canonical_json({
         "applied": applied,
         "idempotent": idempotent,
@@ -1444,7 +1833,8 @@ def apply_remote_delta(database_path: str | Path, private_root: str | Path,
 
 def apply_remote_delta_json(database_path: str | Path, private_root: str | Path,
                             device_id: str, expected_persona_id: str,
-                            trusted_peer_device_id: str, delta_json: str) -> str:
+                            trusted_peer_device_id: str, delta_json: str,
+                            encrypted_envelope: str | None = None) -> str:
     """Fixed Android bridge; parse bounded authenticated plaintext then validate fully."""
     if not isinstance(delta_json, str) or len(delta_json.encode("utf-8")) > MAX_MANIFEST_BYTES:
         raise SyncError("DELTA_SIZE_LIMIT")
@@ -1455,7 +1845,8 @@ def apply_remote_delta_json(database_path: str | Path, private_root: str | Path,
     if not isinstance(delta, dict):
         raise SyncError("DELTA_MALFORMED")
     return apply_remote_delta(database_path, private_root, device_id,
-                              expected_persona_id, trusted_peer_device_id, delta)
+                              expected_persona_id, trusted_peer_device_id, delta,
+                              encrypted_envelope)
 
 
 def list_remote_conflicts_json(private_root: str | Path, device_id: str,
@@ -1464,3 +1855,204 @@ def list_remote_conflicts_json(private_root: str | Path, device_id: str,
     with SyncMetadataStore(sync_metadata_path(private_root), device_id) as store:
         return canonical_json({"conflicts": store.list_conflicts(
             persona_id, unresolved_only=bool(unresolved_only))})
+
+def pending_conflict_artifact_json(private_root: str | Path, device_id: str,
+                                   persona_id: str, conflict_id: str) -> str:
+    """Return stored ciphertext to the native bridge, never to a product view."""
+    with SyncMetadataStore(sync_metadata_path(private_root), device_id) as store:
+        artifact = store.pending_artifact(persona_id, conflict_id)
+    if artifact is None:
+        raise SyncError("CONFLICT_ARTIFACT_UNAVAILABLE")
+    return artifact
+
+
+def preview_conflict_json(database_path: str | Path, private_root: str | Path,
+                          device_id: str, persona_id: str, conflict_id: str,
+                          peer_delta_json: str) -> str:
+    """Build a short in-memory user preview; no raw payload enters the sidecar."""
+    persona_id = _canonical_uuid(persona_id, "PERSONA_ID_INVALID")
+    with SyncMetadataStore(sync_metadata_path(private_root), device_id) as store:
+        conflict = store.conflict_row(persona_id, conflict_id)
+        if conflict is None:
+            raise SyncError("CONFLICT_NOT_PENDING")
+        local_tombstone = store.local_tombstone(
+            persona_id, conflict["entity_kind"], conflict["entity_id"])
+    kind, entity_id = conflict["entity_kind"], conflict["entity_id"]
+    if conflict["conflict_type"] == "IDENTITY_PAYLOAD_CONFLICT":
+        return canonical_json({"category": kind.replace("_", " ").title(),
+                               "conflict_type": conflict["conflict_type"],
+                               "resolution_available": False,
+                               "repair_required": True,
+                               "local_fingerprint": str(conflict["local_hash"] or "")[:12],
+                               "peer_fingerprint": str(conflict["remote_hash"] or "")[:12]})
+    delta = validate_delta(json.loads(peer_delta_json), persona_id)
+    if delta["source_device_id"] != conflict["peer_device_id"]:
+        raise SyncError("CONFLICT_PEER_MISMATCH")
+    peers = [item["record"] for item in delta["entries"]
+             if item["record"]["entity_kind"] == kind
+             and item["record"]["entity_id"] == entity_id]
+    peers += [item["result"] for item in delta.get("resolutions", [])
+              if item["entity_kind"] == kind and item["entity_id"] == entity_id]
+    peer = next((item for item in peers
+                 if item["content_hash"] == conflict["remote_hash"]), None)
+    if peer is None:
+        raise SyncError("CONFLICT_ARTIFACT_INVALID")
+    columns = _BASELINE_COLUMNS.get(kind)
+    if columns is None:
+        raise SyncError("SYNC_SCHEMA_UNSUPPORTED")
+    connection = sqlite3.connect(Path(database_path).resolve().as_uri() + "?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            f'SELECT {",".join(chr(34)+column+chr(34) for column in columns)} '
+            f'FROM "{kind}" WHERE "{SYNC_ENTITY_POLICIES[kind].identity_column}"=?',
+            (entity_id,)).fetchone()
+        local_payload = dict(row) if row is not None else None
+    finally:
+        connection.close()
+
+    def readable(payload: dict[str, Any] | None, deleted: bool) -> str:
+        if deleted:
+            return "Deleted version"
+        if payload is None:
+            return "Unavailable"
+        fields = ("title", "content", "summary", "description", "status", "trust",
+                  "confidence", "value", "importance", "updated_at")
+        parts = []
+        for field in fields:
+            value = payload.get(field)
+            if value is None or isinstance(value, (dict, list, bytes)):
+                continue
+            parts.append(f"{field.replace('_', ' ').title()}: {str(value)[:120]}")
+            if len(parts) == 3:
+                break
+        return " · ".join(parts) if parts else "Updated version"
+
+    return canonical_json({"category": kind.replace("_", " ").title(),
+                           "conflict_type": conflict["conflict_type"],
+                           "resolution_available": True,
+                           "repair_required": False,
+                           "this_device": readable(local_payload, local_tombstone),
+                           "peer_device": readable(peer.get("canonical_payload"),
+                                                   bool(peer["tombstone"]))})
+
+
+def resolve_conflict_json(database_path: str | Path, private_root: str | Path,
+                          device_id: str, persona_id: str, conflict_id: str,
+                          choice: str, peer_delta_json: str) -> str:
+    """Resolve one authenticated conflict without entering provider or cognition paths.
+
+    The caller must supply plaintext from the peer's stored authenticated
+    ciphertext. The sidecar retains only hashes, revisions and ciphertext.
+    """
+    persona_id = _canonical_uuid(persona_id, "PERSONA_ID_INVALID")
+    device_id = _canonical_uuid(device_id, "DEVICE_ID_INVALID")
+    try:
+        peer_delta = validate_delta(json.loads(peer_delta_json), persona_id)
+    except (TypeError, ValueError) as error:
+        raise SyncError("CONFLICT_ARTIFACT_INVALID") from error
+    with SyncMetadataStore(sync_metadata_path(private_root), device_id) as store:
+        conflict = store.conflict_row(persona_id, conflict_id)
+        if conflict is None or conflict["resolution_state"] != "UNRESOLVED":
+            raise SyncError("CONFLICT_NOT_PENDING")
+        if conflict["conflict_type"] not in {
+                "CONCURRENT_MUTATION", "TOMBSTONE_CONFLICT", "RESOLUTION_CONFLICT"}:
+            raise SyncError("INTEGRITY_REPAIR_REQUIRED")
+        if peer_delta["source_device_id"] != conflict["peer_device_id"]:
+            raise SyncError("CONFLICT_PEER_MISMATCH")
+        kind, entity_id = conflict["entity_kind"], conflict["entity_id"]
+        candidates = [_from_dict(item["record"]) for item in peer_delta["entries"]
+                      if item["record"]["entity_kind"] == kind
+                      and item["record"]["entity_id"] == entity_id]
+        candidates += [_from_dict(item["result"]) for item in peer_delta.get("resolutions", [])
+                       if item["entity_kind"] == kind and item["entity_id"] == entity_id]
+        peer_record = next((item for item in candidates
+                            if item.content_hash == conflict["remote_hash"]), None)
+        if peer_record is None:
+            raise SyncError("CONFLICT_ARTIFACT_INVALID")
+        heads = tuple(sorted((conflict["local_hash"], conflict["remote_hash"])))
+        if len(set(heads)) != 2:
+            raise SyncError("CONFLICT_HEADS_INVALID")
+        local_tombstone = store.local_tombstone(persona_id, kind, entity_id)
+        counter_row = store.connection.execute(
+            "SELECT counter FROM persona_revision_counters WHERE persona_id=?",
+            (persona_id,)).fetchone()
+        counter = (int(counter_row[0]) if counter_row is not None else 0) + 1
+
+    database = Path(database_path)
+    if not database.is_file():
+        raise SyncError("PERSONA_DATABASE_UNAVAILABLE")
+    connection = sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True,
+                                 timeout=5.0, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("BEGIN IMMEDIATE")
+        _validate_persona_database(connection, persona_id)
+        columns = _BASELINE_COLUMNS.get(kind)
+        if not columns:
+            raise SyncError("SYNC_SCHEMA_UNSUPPORTED")
+        identity_column = SYNC_ENTITY_POLICIES[kind].identity_column
+        row = connection.execute(
+            f'SELECT {",".join(chr(34)+column+chr(34) for column in columns)} '
+            f'FROM "{kind}" WHERE "{identity_column}"=?', (entity_id,)).fetchone()
+        local_payload = _canonical_value(dict(row)) if row is not None else None
+        domain_hash = canonical_hash(local_payload) if local_payload is not None else None
+        if local_tombstone and conflict["local_hash"] != _tombstone_hash(persona_id, kind, entity_id):
+            raise SyncError("STALE_RESOLUTION")
+        if choice in {"KEEP_THIS_DEVICE_VERSION", "USE_PEER_VERSION"} \
+                and conflict["conflict_type"] in {"CONCURRENT_MUTATION", "RESOLUTION_CONFLICT"}:
+            selected = local_payload if choice == "KEEP_THIS_DEVICE_VERSION" else peer_record.canonical_payload
+            deleted = local_tombstone if choice == "KEEP_THIS_DEVICE_VERSION" else peer_record.tombstone
+        elif choice == "KEEP_UPDATED_ITEM" and conflict["conflict_type"] == "TOMBSTONE_CONFLICT":
+            selected = peer_record.canonical_payload if local_tombstone else local_payload
+            deleted = False
+        elif choice == "DELETE_ON_BOTH_DEVICES" and conflict["conflict_type"] == "TOMBSTONE_CONFLICT":
+            selected = None
+            deleted = True
+        else:
+            raise SyncError("RESOLUTION_CHOICE_INVALID")
+        if not deleted and (not isinstance(selected, dict) or set(selected) != set(columns)
+                            or str(selected.get(identity_column)) != entity_id):
+            raise SyncError("RESOLUTION_RESULT_INVALID")
+        result_hash = (_tombstone_hash(persona_id, kind, entity_id) if deleted
+                       else canonical_hash(selected))
+        # A process may have stopped after committing the selected domain row,
+        # before checkpointing the sidecar. The same choice must then retry.
+        if not local_tombstone and domain_hash not in (conflict["local_hash"], result_hash):
+            raise SyncError("STALE_RESOLUTION")
+        result = SyncRecord(persona_id, kind, entity_id, device_id, selected, result_hash,
+                            SyncRevision(device_id, counter, heads[0], heads[1]), deleted)
+        supersedes = ()
+        if conflict["conflict_type"] == "RESOLUTION_CONFLICT":
+            supersedes = tuple(sorted((conflict["local_revision"],
+                                       conflict["remote_revision"])))
+        operation = make_resolution(persona_id, kind, entity_id, heads, result, supersedes)
+        if not deleted and domain_hash != result_hash:
+            if row is None:
+                names = ",".join('"' + column + '"' for column in columns)
+                placeholders = ",".join("?" for _ in columns)
+                connection.execute(f'INSERT INTO "{kind}"({names}) VALUES({placeholders})',
+                                   [_decode_canonical_sql_value(selected[column]) for column in columns])
+            else:
+                mutable = [column for column in columns if column != identity_column]
+                assignments = ",".join('"' + column + '"=?' for column in mutable)
+                connection.execute(f'UPDATE "{kind}" SET {assignments} WHERE "{identity_column}"=?',
+                                   [_decode_canonical_sql_value(selected[column]) for column in mutable]
+                                   + [entity_id])
+        # Tombstones preserve independent cognition rows and their FK descendants.
+        connection.execute("COMMIT")
+        _debug_crash_barrier("RESOLUTION_DOMAIN_COMMITTED")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    with SyncMetadataStore(sync_metadata_path(private_root), device_id) as store:
+        store.record_resolution(operation, peer_device_id=conflict["peer_device_id"],
+                                resolve_conflict_id=conflict_id,
+                                retained_hash=domain_hash if deleted else None)
+    return canonical_json({"status": "RESOLVED", "resolution_id": operation.resolution_id,
+                           "persona_id": persona_id, "entity_kind": kind,
+                           "entity_id": entity_id, "tombstone": deleted})

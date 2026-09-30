@@ -105,6 +105,9 @@ async def create_pool(settings: Settings) -> asyncpg.Pool | TursoPool | None:
     if settings.database_backend.lower() == "turso":
         if not settings.database_url or not settings.database_auth_token:
             return None
+        scheme = settings.database_url.strip().split(":", 1)[0].lower()
+        if scheme not in {"https", "libsql"}:
+            raise ValueError("shared_database_https_required")
         return TursoPool(settings.database_url, settings.database_auth_token)
     if not settings.supabase_db_url:
         return None

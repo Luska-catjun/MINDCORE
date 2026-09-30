@@ -9,7 +9,11 @@ import sys
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+# The build entry is invoked from the repository root. Avoid resolving a
+# parent-relative path so the invocation obeys the two-root workflow.
+ROOT = Path.cwd().resolve()
+if not (ROOT / "app" / "desktop_backend.py").is_file():
+    raise RuntimeError("Run the sidecar build from the Desktop repository root")
 BINARIES = ROOT / "frontend" / "src-tauri" / "binaries"
 COLLECT_ALL = ("libsql", "asyncpg", "tzdata", "cryptography", "keyring")
 

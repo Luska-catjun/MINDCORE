@@ -410,14 +410,66 @@ def main() -> None:
     parser.add_argument("--setup-action", choices=("database", "llm", "classify", "initialize"))
     parser.add_argument("--config")
     parser.add_argument("--setup-print-generic-identity", action="store_true")
+    parser.add_argument("--database-credential-action", choices=("store", "get", "delete"))
+    parser.add_argument("--database-credential-id")
     parser.add_argument("--desktop-ensure-auth", action="store_true")
     parser.add_argument("--desktop-print-session", action="store_true")
+    parser.add_argument("--sync-command", choices=("identity", "peers", "pair-export", "pair-inspect",
+                        "pair-import", "revoke", "export", "apply", "conflicts",
+                        "conflict-preview", "resolve"))
+    parser.add_argument("--sync-state-dir")
+    parser.add_argument("--sync-database")
+    parser.add_argument("--sync-persona-id")
+    parser.add_argument("--sync-peer")
+    parser.add_argument("--sync-artifact")
+    parser.add_argument("--sync-out")
+    parser.add_argument("--sync-confirm-fingerprint")
+    parser.add_argument("--sync-conflict-id")
+    parser.add_argument("--sync-choice")
     parser.add_argument(
         "--startup-readonly-benchmark",
         action="store_true",
         help="Explicitly benchmark read-only Turso schema startup operations using --config.",
     )
     args = parser.parse_args()
+    if args.database_credential_action:
+        from app.services.persona_database_credentials import PersonaDatabaseCredentials
+        from app.services.persona_sync_crypto import SyncSecurityError
+
+        if not args.database_credential_id:
+            raise SystemExit("DATABASE_CREDENTIAL_ID_INVALID")
+        credentials = PersonaDatabaseCredentials()
+        try:
+            if args.database_credential_action == "store":
+                value = os.environ.pop("MINDCORE_DATABASE_CREDENTIAL_VALUE", "")
+                credentials.store(args.database_credential_id, value)
+                print("OK")
+            elif args.database_credential_action == "get":
+                # stdout is captured by the native host and is never logged.
+                sys.stdout.write(credentials.get(args.database_credential_id))
+            else:
+                credentials.delete(args.database_credential_id)
+                print("OK")
+        except SyncSecurityError as error:
+            print(error.code, file=sys.stderr)
+            raise SystemExit(1) from None
+        return
+    if args.sync_command:
+        from scripts.mindcore_sync import main as sync_main
+        if not args.sync_state_dir:
+            raise SystemExit("sync state directory required")
+        values = [args.sync_command, "--state-dir", args.sync_state_dir]
+        for flag, item in (("--database", args.sync_database),
+                           ("--persona-id", args.sync_persona_id),
+                           ("--peer", args.sync_peer),
+                           ("--artifact", args.sync_artifact),
+                           ("--out", args.sync_out),
+                           ("--confirm-fingerprint", args.sync_confirm_fingerprint),
+                           ("--conflict-id", args.sync_conflict_id),
+                           ("--choice", args.sync_choice)):
+            if item is not None:
+                values.extend((flag, item))
+        raise SystemExit(sync_main(values))
     if args.startup_readonly_benchmark:
         if not args.config:
             raise SystemExit("--startup-readonly-benchmark requires an explicit --config path")

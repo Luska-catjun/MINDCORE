@@ -209,7 +209,7 @@ fn env_value(value: &str) -> String {
 
 const PERSONA_DATABASE_KEYS: [&str; 5] = [
     "DATABASE_URL",
-    "DATABASE_AUTH_TOKEN",
+    "DATABASE_CREDENTIAL_ID",
     "OLD_DATABASE_URL",
     "TURSO_DB_URL",
     "SUPABASE_DB_URL",
@@ -226,6 +226,7 @@ const PERSONA_COMPATIBILITY_KEYS: [&str; 3] = [
 pub fn global_config_values(source: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut values = source.clone();
     values.remove("DATABASE_BACKEND");
+    values.remove("DATABASE_AUTH_TOKEN");
     for key in PERSONA_DATABASE_KEYS
         .iter()
         .chain(PERSONA_COMPATIBILITY_KEYS.iter())
@@ -249,8 +250,15 @@ pub fn profile_config_text(
             "PERSONA_IDENTITY_PATH={}",
             env_value(&identity_path.to_string_lossy())
         ),
+        format!(
+            "DATABASE_CREDENTIAL_ID={}",
+            env_value(source.get("DATABASE_CREDENTIAL_ID").map(String::as_str).unwrap_or(persona_id))
+        ),
     ];
     for key in PERSONA_DATABASE_KEYS {
+        if key == "DATABASE_CREDENTIAL_ID" {
+            continue;
+        }
         if let Some(value) = source.get(key) {
             lines.push(format!("{key}={}", env_value(value)));
         }
@@ -387,9 +395,8 @@ fn validate_database_source(source: &BTreeMap<String, String>) -> Result<(), Str
     if source
         .get("DATABASE_URL")
         .is_none_or(|value| value.trim().is_empty())
-        || source
-            .get("DATABASE_AUTH_TOKEN")
-            .is_none_or(|value| value.trim().is_empty())
+        || (source.get("DATABASE_AUTH_TOKEN").is_none_or(|value| value.trim().is_empty())
+            && source.get("DATABASE_CREDENTIAL_ID").is_none_or(|value| value.trim().is_empty()))
     {
         return Err("The Persona database configuration is incomplete.".to_string());
     }
@@ -504,7 +511,7 @@ where
     {
         return Err("Identity must be UTF-8 plain text under 64 KB.".to_string());
     }
-    let source = BTreeMap::from([
+    let mut source = BTreeMap::from([
         ("DATABASE_URL".to_string(), input.database_url.trim().to_string()),
         (
             "DATABASE_AUTH_TOKEN".to_string(),
@@ -532,6 +539,7 @@ where
         .map(|index| registry.personas[index].persona_id.clone())
         .map(Ok)
         .unwrap_or_else(new_persona_id)?;
+    source.insert("DATABASE_CREDENTIAL_ID".into(), persona_id.clone());
     let directory = persona_directory(global_config, &persona_id)?;
     let identity_path = directory.join("identity.txt");
     let config_path = directory.join("persona.env");
@@ -876,7 +884,7 @@ pub fn profile_overrides(profile: &PersonaProfile) -> Result<BTreeMap<String, St
         &fs::read_to_string(&profile.config_path)
             .map_err(|_| "Could not read the active Persona configuration.".to_string())?,
     );
-    for required in ["DATABASE_URL", "DATABASE_AUTH_TOKEN"] {
+    for required in ["DATABASE_URL", "DATABASE_CREDENTIAL_ID"] {
         if values.get(required).is_none_or(String::is_empty) {
             return Err("The active Persona configuration is incomplete.".to_string());
         }
@@ -920,6 +928,8 @@ mod tests {
 
         assert!(text.contains("PERSONA_DISPLAY_NAME=\"Jarvis\""));
         assert!(text.contains("DATABASE_URL=\"libsql://persona-a\""));
+        assert!(text.contains("DATABASE_CREDENTIAL_ID=\"persona-a\""));
+        assert!(!text.contains("DATABASE_AUTH_TOKEN"));
         assert!(!text.contains("USER_DISPLAY_NAME"));
     }
 

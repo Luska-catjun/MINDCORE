@@ -13,7 +13,9 @@ from typing import Any
 from app.services.manual_sync_transport import (read_pairing_artifact, read_sync_artifact,
                                                 write_pairing_artifact, write_sync_artifact)
 from app.services.persona_sync import (PersonaSyncEngine, SyncError, apply_remote_delta_json,
-                                       canonical_json, sync_metadata_path)
+                                       canonical_json, sync_metadata_path, SyncMetadataStore,
+                                       pending_conflict_artifact_json, preview_conflict_json,
+                                       resolve_conflict_json)
 from app.services.persona_sync_crypto import PersonaSyncSecurity, SyncSecurityError
 
 
@@ -56,6 +58,9 @@ def _handle(args: argparse.Namespace) -> dict[str, Any]:
                 "public_key": identity.public_key}
     if args.command == "pair-export":
         return {"artifact": str(write_pairing_artifact(args.out, security.pairing_artifact()))}
+    if args.command == "pair-inspect":
+        artifact = read_pairing_artifact(args.artifact)
+        return {"device_id": artifact["device_id"], "fingerprint": artifact["fingerprint"]}
     if args.command == "pair-import":
         artifact = read_pairing_artifact(args.artifact)
         identity = security.pair(artifact, args.confirm_fingerprint)
@@ -63,6 +68,10 @@ def _handle(args: argparse.Namespace) -> dict[str, Any]:
                 "peer_fingerprint": artifact["fingerprint"], "peer_state": "TRUSTED"}
     if args.command == "peer-state":
         return {"peer_device_id": args.peer, "state": security.peer_state(args.peer)}
+    if args.command == "peers":
+        identity = security.identity()
+        return {"device_id": identity.device_id, "fingerprint": identity.fingerprint,
+                "peers": security.trusted_devices()}
     if args.command == "revoke":
         security.revoke(args.peer)
         return {"peer_device_id": args.peer, "state": security.peer_state(args.peer)}
@@ -74,7 +83,7 @@ def _handle(args: argparse.Namespace) -> dict[str, Any]:
         engine = PersonaSyncEngine(database, sync_metadata_path(state_dir), identity.device_id,
                                    identity_path)
         scan = engine.scan(persona)
-        if not scan.delta.entries and not scan.delta.conflicts:
+        if not scan.delta.entries and not scan.delta.conflicts and not scan.delta.resolutions:
             raise SyncError("NO_CHANGES")
         envelope = security.encrypt(args.peer, persona, canonical_json(scan.delta.as_dict()))
         path = write_sync_artifact(args.out, envelope)
@@ -89,14 +98,37 @@ def _handle(args: argparse.Namespace) -> dict[str, Any]:
         inbound = security.decrypt_and_reserve(persona, envelope)
         result = json.loads(apply_remote_delta_json(
             database, state_dir, security.identity().device_id, persona,
-            inbound.sender_device_id, inbound.payload_json))
+            inbound.sender_device_id, inbound.payload_json, canonical_json(envelope)))
         security.complete_inbound(inbound.sender_device_id, inbound.message_id, inbound.sequence)
         # Keep Desktop's local identity projection in sync only when using the
         # protocol's SQLite identity entity is ever allowed by the core. Current
         # v1 reject behavior remains fail-closed and file identity is not mutated.
         del identity_path
         return {"applied": result["applied"], "idempotent": result["idempotent"],
-                "persona_id": result["persona_id"], "status": result["status"]}
+                "persona_id": result["persona_id"],
+                "source_device_id": inbound.sender_device_id, "status": result["status"]}
+    if args.command == "conflicts":
+        identity = security.identity()
+        database = _regular_file(args.database)
+        PersonaSyncEngine(database, sync_metadata_path(state_dir), identity.device_id).scan(
+            args.persona_id)
+        with SyncMetadataStore(sync_metadata_path(state_dir), identity.device_id) as store:
+            return {"conflicts": store.list_conflicts(args.persona_id)}
+    if args.command in {"conflict-preview", "resolve"}:
+        database = _regular_file(args.database)
+        identity = security.identity()
+        ciphertext = pending_conflict_artifact_json(
+            state_dir, identity.device_id, args.persona_id, args.conflict_id)
+        inbound = security.decrypt_and_reserve(args.persona_id, json.loads(ciphertext))
+        if args.command == "conflict-preview":
+            return json.loads(preview_conflict_json(
+                database, state_dir, identity.device_id, args.persona_id,
+                args.conflict_id, inbound.payload_json))
+        result = json.loads(resolve_conflict_json(
+            database, state_dir, identity.device_id, args.persona_id,
+            args.conflict_id, args.choice, inbound.payload_json))
+        security.complete_inbound(inbound.sender_device_id, inbound.message_id, inbound.sequence)
+        return result
     raise SyncSecurityError("COMMAND_UNSUPPORTED")
 
 
@@ -111,11 +143,14 @@ def parser() -> argparse.ArgumentParser:
     state_command("identity", "show the public identity and fingerprint")
     export_pair = state_command("pair-export", "write a public .mindcorepair artifact")
     export_pair.add_argument("--out", required=True)
+    inspect_pair = state_command("pair-inspect", "inspect a public pairing fingerprint")
+    inspect_pair.add_argument("--artifact", required=True)
     import_pair = state_command("pair-import", "trust a peer after out-of-band fingerprint confirmation")
     import_pair.add_argument("--artifact", required=True)
     import_pair.add_argument("--confirm-fingerprint", required=True)
     peer_state = state_command("peer-state", "inspect a peer trust state")
     peer_state.add_argument("--peer", required=True)
+    state_command("peers", "list public trusted device metadata")
     revoke = state_command("revoke", "revoke a trusted peer")
     revoke.add_argument("--peer", required=True)
     export = state_command("export", "encrypt changed records into a .mindcoresync file")
@@ -129,6 +164,16 @@ def parser() -> argparse.ArgumentParser:
     apply.add_argument("--persona-id", required=True)
     apply.add_argument("--identity-path", help="reserved, read-only local identity path")
     apply.add_argument("--artifact", required=True)
+    conflicts = state_command("conflicts", "list one Persona's durable conflicts")
+    conflicts.add_argument("--persona-id", required=True)
+    conflicts.add_argument("--database", required=True)
+    for name in ("conflict-preview", "resolve"):
+        command = state_command(name, "review or resolve a pending authenticated conflict")
+        command.add_argument("--database", required=True)
+        command.add_argument("--persona-id", required=True)
+        command.add_argument("--conflict-id", required=True)
+        if name == "resolve":
+            command.add_argument("--choice", required=True)
     return root
 
 

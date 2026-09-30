@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -29,7 +31,9 @@ from app.services.persona_sync import (  # noqa: E402
     detect_conflicts,
     generate_delta,
     manifest_semantically_equal,
+    make_resolution,
     sync_metadata_path,
+    resolve_conflict_json,
     validate_delta,
     validate_manifest,
 )
@@ -582,6 +586,205 @@ class PersonaSyncTests(unittest.TestCase):
         after = self.engine_a.scan(PERSONA_A)
         self.assertEqual((), after.delta.entries)
         self.assertTrue(manifest_semantically_equal(local, after.manifest))
+
+    def test_mutable_resolution_is_syncable_and_replay_safe(self):
+        self.engine_a.scan(PERSONA_A)
+        self.engine_b.scan(PERSONA_A)
+        mutate(self.db_a, "UPDATE relationship SET trust=0.8 WHERE id=1")
+        mutate(self.db_b, "UPDATE relationship SET trust=0.9 WHERE id=1")
+        delta_a = self.engine_a.scan(PERSONA_A).delta.as_dict()
+        delta_b = self.engine_b.scan(PERSONA_A).delta.as_dict()
+        with self.assertRaises(SyncApplyConflict):
+            apply_remote_delta(self.db_a, self.root / "device-a", DEVICE_A,
+                               PERSONA_A, DEVICE_B, delta_b)
+        with self.assertRaises(SyncApplyConflict):
+            apply_remote_delta(self.db_b, self.root / "device-b", DEVICE_B,
+                               PERSONA_A, DEVICE_A, delta_a)
+        with SyncMetadataStore(self.meta_b, DEVICE_B) as store:
+            conflict = store.list_conflicts(PERSONA_A)[0]
+        resolved = json.loads(resolve_conflict_json(
+            self.db_b, self.root / "device-b", DEVICE_B, PERSONA_A,
+            conflict["conflict_id"], "KEEP_THIS_DEVICE_VERSION", canonical_json(delta_a)))
+        self.assertEqual("RESOLVED", resolved["status"])
+        outbound = self.engine_b.scan(PERSONA_A).delta.as_dict()
+        self.assertEqual(1, len(outbound["resolutions"]))
+        first = json.loads(apply_remote_delta(self.db_a, self.root / "device-a",
+            DEVICE_A, PERSONA_A, DEVICE_B, outbound))
+        second = json.loads(apply_remote_delta(self.db_a, self.root / "device-a",
+            DEVICE_A, PERSONA_A, DEVICE_B, outbound))
+        self.assertEqual(1, first["applied"])
+        self.assertEqual(0, second["applied"])
+        self.assertEqual(0, len(self.engine_a.scan(PERSONA_A).delta.entries))
+        with SyncMetadataStore(self.meta_a, DEVICE_A) as store:
+            self.assertEqual([], store.list_conflicts(PERSONA_A))
+            self.assertEqual(1, len(store.resolution_rows(PERSONA_A)))
+
+    def test_tombstone_resolution_preserves_independent_cognition(self):
+        self.engine_a.scan(PERSONA_A)
+        self.engine_b.scan(PERSONA_A)
+        deleted = self.engine_a.create_tombstone(PERSONA_A, "relationship", "1")
+        delta_a = SyncDelta(PERSONA_A, DEVICE_A, (DeltaEntry("deleted", deleted),)).as_dict()
+        mutate(self.db_b, "UPDATE relationship SET trust=0.9 WHERE id=1")
+        delta_b = self.engine_b.scan(PERSONA_A).delta.as_dict()
+        with self.assertRaises(SyncApplyConflict):
+            apply_remote_delta(self.db_a, self.root / "device-a", DEVICE_A,
+                               PERSONA_A, DEVICE_B, delta_b)
+        with self.assertRaises(SyncApplyConflict):
+            apply_remote_delta(self.db_b, self.root / "device-b", DEVICE_B,
+                               PERSONA_A, DEVICE_A, delta_a)
+        with SyncMetadataStore(self.meta_b, DEVICE_B) as store:
+            conflict = store.list_conflicts(PERSONA_A)[0]
+        resolve_conflict_json(self.db_b, self.root / "device-b", DEVICE_B, PERSONA_A,
+                              conflict["conflict_id"], "DELETE_ON_BOTH_DEVICES",
+                              canonical_json(delta_a))
+        outbound = self.engine_b.scan(PERSONA_A).delta.as_dict()
+        apply_remote_delta(self.db_a, self.root / "device-a", DEVICE_A,
+                           PERSONA_A, DEVICE_B, outbound)
+        with SyncMetadataStore(self.meta_a, DEVICE_A) as store:
+            self.assertTrue(store.local_tombstone(PERSONA_A, "relationship", "1"))
+        self.assertEqual((), self.engine_a.scan(PERSONA_A).delta.conflicts)
+        self.assertEqual((), self.engine_b.scan(PERSONA_A).delta.conflicts)
+        db = sqlite3.connect(self.db_a)
+        self.assertEqual(1, db.execute("SELECT count(*) FROM memories").fetchone()[0])
+        db.close()
+
+    def test_competing_resolutions_need_second_explicit_choice(self):
+        self.engine_a.scan(PERSONA_A)
+        self.engine_b.scan(PERSONA_A)
+        mutate(self.db_a, "UPDATE relationship SET trust=0.8 WHERE id=1")
+        mutate(self.db_b, "UPDATE relationship SET trust=0.9 WHERE id=1")
+        delta_a = self.engine_a.scan(PERSONA_A).delta.as_dict()
+        delta_b = self.engine_b.scan(PERSONA_A).delta.as_dict()
+        for db, root, device, peer, delta in (
+            (self.db_a, self.root / "device-a", DEVICE_A, DEVICE_B, delta_b),
+            (self.db_b, self.root / "device-b", DEVICE_B, DEVICE_A, delta_a),
+        ):
+            with self.assertRaises(SyncApplyConflict):
+                apply_remote_delta(db, root, device, PERSONA_A, peer, delta)
+        with SyncMetadataStore(self.meta_a, DEVICE_A) as store:
+            conflict_a = store.list_conflicts(PERSONA_A)[0]["conflict_id"]
+        with SyncMetadataStore(self.meta_b, DEVICE_B) as store:
+            conflict_b = store.list_conflicts(PERSONA_A)[0]["conflict_id"]
+        resolve_conflict_json(self.db_a, self.root / "device-a", DEVICE_A, PERSONA_A,
+                              conflict_a, "KEEP_THIS_DEVICE_VERSION", canonical_json(delta_b))
+        resolve_conflict_json(self.db_b, self.root / "device-b", DEVICE_B, PERSONA_A,
+                              conflict_b, "KEEP_THIS_DEVICE_VERSION", canonical_json(delta_a))
+        resolution_a = self.engine_a.scan(PERSONA_A).delta.as_dict()
+        resolution_b = self.engine_b.scan(PERSONA_A).delta.as_dict()
+        with self.assertRaisesRegex(SyncApplyConflict, "RESOLUTION_CONFLICT"):
+            apply_remote_delta(self.db_a, self.root / "device-a", DEVICE_A,
+                               PERSONA_A, DEVICE_B, resolution_b)
+        with self.assertRaisesRegex(SyncApplyConflict, "RESOLUTION_CONFLICT"):
+            apply_remote_delta(self.db_b, self.root / "device-b", DEVICE_B,
+                               PERSONA_A, DEVICE_A, resolution_a)
+        with SyncMetadataStore(self.meta_a, DEVICE_A) as store:
+            conflict = next(item for item in store.list_conflicts(PERSONA_A)
+                            if item["conflict_type"] == "RESOLUTION_CONFLICT")
+        resolve_conflict_json(self.db_a, self.root / "device-a", DEVICE_A, PERSONA_A,
+                              conflict["conflict_id"], "USE_PEER_VERSION",
+                              canonical_json(resolution_b))
+        final = self.engine_a.scan(PERSONA_A).delta.as_dict()
+        apply_remote_delta(self.db_b, self.root / "device-b", DEVICE_B,
+                           PERSONA_A, DEVICE_A, final)
+        with SyncMetadataStore(self.meta_b, DEVICE_B) as store:
+            self.assertEqual([], store.list_conflicts(PERSONA_A))
+
+    def test_resolution_checkpoint_retry_and_stale_reject(self):
+        self.engine_a.scan(PERSONA_A)
+        self.engine_b.scan(PERSONA_A)
+        mutate(self.db_a, "UPDATE relationship SET trust=0.8 WHERE id=1")
+        mutate(self.db_b, "UPDATE relationship SET trust=0.9 WHERE id=1")
+        delta_a = self.engine_a.scan(PERSONA_A).delta.as_dict()
+        delta_b = self.engine_b.scan(PERSONA_A).delta.as_dict()
+        with self.assertRaises(SyncApplyConflict):
+            apply_remote_delta(self.db_a, self.root / "device-a", DEVICE_A,
+                               PERSONA_A, DEVICE_B, delta_b)
+        with self.assertRaises(SyncApplyConflict):
+            apply_remote_delta(self.db_b, self.root / "device-b", DEVICE_B,
+                               PERSONA_A, DEVICE_A, delta_a)
+        with SyncMetadataStore(self.meta_b, DEVICE_B) as store:
+            conflict = store.list_conflicts(PERSONA_A)[0]
+        resolve_conflict_json(self.db_b, self.root / "device-b", DEVICE_B, PERSONA_A,
+                              conflict["conflict_id"], "KEEP_THIS_DEVICE_VERSION",
+                              canonical_json(delta_a))
+        resolution = self.engine_b.scan(PERSONA_A).delta.as_dict()
+        with mock.patch("app.services.persona_sync.SyncMetadataStore.record_resolution",
+                        side_effect=RuntimeError("synthetic checkpoint crash")):
+            with self.assertRaises(RuntimeError):
+                apply_remote_delta(self.db_a, self.root / "device-a", DEVICE_A,
+                                   PERSONA_A, DEVICE_B, resolution)
+        recovered = json.loads(apply_remote_delta(self.db_a, self.root / "device-a",
+            DEVICE_A, PERSONA_A, DEVICE_B, resolution))
+        self.assertEqual(0, recovered["applied"])
+        with SyncMetadataStore(self.meta_a, DEVICE_A) as store:
+            self.assertEqual(1, len(store.resolution_rows(PERSONA_A)))
+        source = resolution["resolutions"][0]["result"]
+        unrelated = ("0" * 64, "1" * 64)
+        record = SyncRecord(PERSONA_A, "relationship", "1", DEVICE_B,
+                            source["canonical_payload"], source["content_hash"],
+                            SyncRevision(DEVICE_B, 99, *unrelated))
+        stale = make_resolution(PERSONA_A, "relationship", "1", unrelated, record)
+        with self.assertRaisesRegex(SyncError, "STALE_RESOLUTION"):
+            apply_remote_delta(self.db_a, self.root / "device-a", DEVICE_A,
+                               PERSONA_A, DEVICE_B,
+                               SyncDelta(PERSONA_A, DEVICE_B, (), (), 1,
+                                         (stale,)).as_dict())
+
+    def test_local_resolution_domain_commit_retries_checkpoint(self):
+        self.engine_a.scan(PERSONA_A)
+        self.engine_b.scan(PERSONA_A)
+        mutate(self.db_a, "UPDATE relationship SET trust=0.8 WHERE id=1")
+        mutate(self.db_b, "UPDATE relationship SET trust=0.9 WHERE id=1")
+        delta_b = self.engine_b.scan(PERSONA_A).delta.as_dict()
+        with self.assertRaises(SyncApplyConflict):
+            apply_remote_delta(self.db_a, self.root / "device-a", DEVICE_A,
+                               PERSONA_A, DEVICE_B, delta_b)
+        with SyncMetadataStore(self.meta_a, DEVICE_A) as store:
+            conflict_id = store.list_conflicts(PERSONA_A)[0]["conflict_id"]
+        arguments = (self.db_a, self.root / "device-a", DEVICE_A, PERSONA_A,
+                     conflict_id, "USE_PEER_VERSION", canonical_json(delta_b))
+        with mock.patch("app.services.persona_sync.SyncMetadataStore.record_resolution",
+                        side_effect=RuntimeError("synthetic checkpoint crash")):
+            with self.assertRaises(RuntimeError):
+                resolve_conflict_json(*arguments)
+        db = sqlite3.connect(self.db_a)
+        self.assertEqual(0.9, db.execute("SELECT trust FROM relationship WHERE id=1").fetchone()[0])
+        db.close()
+        self.assertEqual("RESOLVED", json.loads(resolve_conflict_json(*arguments))["status"])
+        with SyncMetadataStore(self.meta_a, DEVICE_A) as store:
+            self.assertEqual(1, len(store.resolution_rows(PERSONA_A)))
+            self.assertEqual([], store.list_conflicts(PERSONA_A))
+
+    def test_resolution_recovers_after_real_child_process_death(self):
+        self.engine_a.scan(PERSONA_A)
+        self.engine_b.scan(PERSONA_A)
+        mutate(self.db_a, "UPDATE relationship SET trust=0.8 WHERE id=1")
+        mutate(self.db_b, "UPDATE relationship SET trust=0.9 WHERE id=1")
+        delta_b = self.engine_b.scan(PERSONA_A).delta.as_dict()
+        with self.assertRaises(SyncApplyConflict):
+            apply_remote_delta(self.db_a, self.root / "device-a", DEVICE_A,
+                               PERSONA_A, DEVICE_B, delta_b)
+        with SyncMetadataStore(self.meta_a, DEVICE_A) as store:
+            conflict_id = store.list_conflicts(PERSONA_A)[0]["conflict_id"]
+        arguments = (str(self.db_a), str(self.root / "device-a"), DEVICE_A,
+                     PERSONA_A, conflict_id, "USE_PEER_VERSION", canonical_json(delta_b))
+        child = ("import os,sys; from app.services import persona_sync as sync; "
+                 "sync._debug_crash_barrier=lambda stage: os._exit(23) if "
+                 "stage=='RESOLUTION_DOMAIN_COMMITTED' else None; "
+                 "sync.resolve_conflict_json(*sys.argv[1:])")
+        crashed = subprocess.run([sys.executable, "-c", child, *arguments],
+                                 cwd=ROOT, capture_output=True, timeout=30, check=False)
+        self.assertEqual(23, crashed.returncode)
+        with sqlite3.connect(self.db_a) as db:
+            self.assertEqual(0.9, db.execute(
+                "SELECT trust FROM relationship WHERE id=1").fetchone()[0])
+        with SyncMetadataStore(self.meta_a, DEVICE_A) as store:
+            self.assertEqual(1, len(store.list_conflicts(PERSONA_A)))
+            self.assertEqual([], store.resolution_rows(PERSONA_A))
+        self.assertEqual("RESOLVED", json.loads(resolve_conflict_json(*arguments))["status"])
+        with SyncMetadataStore(self.meta_a, DEVICE_A) as store:
+            self.assertEqual([], store.list_conflicts(PERSONA_A))
+            self.assertEqual(1, len(store.resolution_rows(PERSONA_A)))
 
 
 if __name__ == "__main__":

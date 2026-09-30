@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import Settings, get_settings
 from app.database.connection import close_pool, create_pool
 from app.database.migrations import ensure_turso_schema_current
+from app.database.persona_storage import bind_persona_identity, storage_mode
 from app.routers import autonomy, auth, chat, conversations, episodes, health, identity, messages, observe, relationship, state
 from app.routers.auth import require_auth_settings, request_is_authenticated
 from app.services.prompt_loader import load_persona_identity_prompt
@@ -101,6 +102,14 @@ def build_lifespan(
                 "database_connect", "pool_acquire", round((perf_counter() - acquire_started) * 1000)
             )
             await ensure_turso_schema_current(connection)
+            mode = storage_mode(settings.database_url)
+            if settings.persona_id:
+                await bind_persona_identity(connection, settings.persona_id)
+            app.state.persona_storage_mode = mode
+    else:
+        # The Supabase backend is a service database, not a Persona registry
+        # mode. Keep it distinct from a device-local authoritative Persona DB.
+        app.state.persona_storage_mode = "SERVICE_DATABASE"
     app.state.cognitive_snapshot_scope = CognitiveSnapshotScope()
     # One startup hydration keeps Narrative activation off the foreground chat
     # path.  Isolated ASGI fixtures without a database acquire seam simply use

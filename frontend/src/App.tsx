@@ -25,6 +25,7 @@ import { proactiveDeliveryMode, proactiveUnreadKey, rememberProactiveEvent, shou
 import { DEFAULT_PERSONA_DISPLAY_NAME, DEFAULT_USER_DISPLAY_NAME } from "./assets";
 import { PersonaManager, type PersonaSummary } from "./components/PersonaManager";
 import { PersonaAvatar } from "./components/PersonaAvatar";
+import { SyncPanel } from "./components/SyncPanel";
 import "./styles.css";
 
 const SOURCE_DEVICE = "web";
@@ -587,6 +588,9 @@ function App() {
             onSendSucceeded={handleSendSucceeded}
             onSendFailed={handleSendFailed}
           />
+        ) : activeView === "sync" ? (
+          isDesktopRuntime() ? <SyncPanel key={activePersonaId ?? "none"} personaId={activePersonaId}
+            personaName={activePersona?.display_name ?? personaDisplayName} /> : null
         ) : (
           <WorkspacePanel
             key={activePersonaId ?? "web"}
