@@ -341,6 +341,18 @@ class TursoPool:
     def __init__(self, url: str, auth_token: str) -> None:
         self._url = url
         self._auth_token = auth_token
+        # Hrana represents a remote transaction as a mutable stream/baton.
+        # A concurrent append burst leaves many transactions open across
+        # separate HTTP requests; earlier streams can idle until sqld expires
+        # them before COMMIT. Serialize message appends for this pool; each
+        # operation still owns and closes its own connection.
+        self._message_write_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def message_write_scope(self) -> AsyncIterator[None]:
+        """Serialize message appends using this pool's short-lived Hrana streams."""
+        async with self._message_write_lock:
+            yield
 
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[TursoConnection]:

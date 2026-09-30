@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 from uuid import uuid4
@@ -18,6 +19,17 @@ from app.database.normalization import normalize_json_object, normalize_json_val
 
 logger = logging.getLogger("diana.repository")
 MESSAGE_SEQUENCE_MAX_ATTEMPTS = 3
+
+
+@asynccontextmanager
+async def _message_write_scope(pool: Any):
+    """Use the Turso pool's local write gate while leaving asyncpg unchanged."""
+    scope_factory = getattr(pool, "message_write_scope", None)
+    if scope_factory is None:
+        yield
+        return
+    async with scope_factory():
+        yield
 
 
 async def update_observed_memory(connection: Any, *, memory_id: UUID, content: str, normalized_content: str, updated_at: str) -> bool:
@@ -219,56 +231,91 @@ async def list_conversations(pool: asyncpg.Pool, limit: int = 50, offset: int = 
 
 async def create_message(pool: asyncpg.Pool, payload: MessageCreate) -> dict[str, Any]:
     total_started = perf_counter()
-    for attempt in range(MESSAGE_SEQUENCE_MAX_ATTEMPTS):
-        acquire_started = perf_counter()
-        try:
-            async with pool.acquire() as connection:
-                acquire_ms = (perf_counter() - acquire_started) * 1000
-                async with connection.transaction():
-                    message_id = uuid4()
-                    created_at = datetime.now(timezone.utc)
-                    insert_started = perf_counter()
-                    if payload.sequence is None:
-                        # SQLite serializes the write statement itself, so MAX()+1 is
-                        # evaluated atomically with this insert instead of on a stale
-                        # prior SELECT result.  The durable unique constraint remains
-                        # the final invariant for (conversation_id, sequence).
-                        record = await connection.fetchrow(
-                            """
-                            insert into messages (id, conversation_id, role, source_device, sequence, content, created_at)
-                            select $1, $2, $3, $4, coalesce(max(sequence), 0) + 1, $5, $6
-                            from messages where conversation_id = $2
-                            returning id, conversation_id, role, source_device, sequence, content, created_at
-                            """,
-                            message_id, payload.conversation_id, payload.role,
-                            payload.source_device or "unknown", payload.content, created_at,
-                        )
-                    else:
-                        record = await connection.fetchrow(
-                            """
-                            insert into messages (id, conversation_id, role, source_device, sequence, content, created_at)
-                            values ($1, $2, $3, $4, $5, $6, $7)
-                            returning id, conversation_id, role, source_device, sequence, content, created_at
-                            """,
-                            message_id, payload.conversation_id, payload.role,
-                            payload.source_device or "unknown", payload.sequence,
-                            payload.content, created_at,
-                        )
-                    insert_with_sequence_ms = (perf_counter() - insert_started) * 1000
-                    commit_started = perf_counter()
+    message_id = uuid4()
+    created_at = datetime.now(timezone.utc)
+    retries = 0
+    acquire_ms = insert_with_sequence_ms = commit_ms = 0.0
+    async with _message_write_scope(pool):
+        for attempt in range(MESSAGE_SEQUENCE_MAX_ATTEMPTS):
+            acquire_started = perf_counter()
+            try:
+                async with pool.acquire() as connection:
+                    acquire_ms = (perf_counter() - acquire_started) * 1000
+                    async with connection.transaction():
+                        insert_started = perf_counter()
+                        if payload.sequence is None:
+                            # SQLite serializes the write statement itself, so MAX()+1 is
+                            # evaluated atomically with this insert instead of on a stale
+                            # prior SELECT result. The durable unique constraint remains
+                            # the final invariant for (conversation_id, sequence).
+                            record = await connection.fetchrow(
+                                """
+                                insert into messages (id, conversation_id, role, source_device, sequence, content, created_at)
+                                select $1, $2, $3, $4, coalesce(max(sequence), 0) + 1, $5, $6
+                                from messages where conversation_id = $2
+                                returning id, conversation_id, role, source_device, sequence, content, created_at
+                                """,
+                                message_id, payload.conversation_id, payload.role,
+                                payload.source_device or "unknown", payload.content, created_at,
+                            )
+                        else:
+                            record = await connection.fetchrow(
+                                """
+                                insert into messages (id, conversation_id, role, source_device, sequence, content, created_at)
+                                values ($1, $2, $3, $4, $5, $6, $7)
+                                returning id, conversation_id, role, source_device, sequence, content, created_at
+                                """,
+                                message_id, payload.conversation_id, payload.role,
+                                payload.source_device or "unknown", payload.sequence,
+                                payload.content, created_at,
+                            )
+                        insert_with_sequence_ms = (perf_counter() - insert_started) * 1000
+                        commit_started = perf_counter()
                 commit_ms = (perf_counter() - commit_started) * 1000
-            break
-        except ValueError as exc:
-            retryable = payload.sequence is None and "database is locked" in str(exc).casefold()
-            if not retryable or attempt + 1 == MESSAGE_SEQUENCE_MAX_ATTEMPTS:
-                raise
-            logger.warning("Message sequence insert retry attempt=%s error_type=%s", attempt + 1, type(exc).__name__)
-            await asyncio.sleep(0.01 * (attempt + 1))
+                break
+            except Exception as exc:
+                error_text = str(exc).casefold()
+                ambiguous_stream = "stream_expired" in error_text
+                retryable_lock = payload.sequence is None and "database is locked" in error_text
+                if not (ambiguous_stream or retryable_lock):
+                    raise
+
+                # The stream may have expired after COMMIT reached the server.
+                # Discard that lease and resolve the stable primary key on a fresh
+                # connection before deciding whether another insert is necessary.
+                try:
+                    async with pool.acquire() as read_connection:
+                        existing = await read_connection.fetchrow(
+                            """select id, conversation_id, role, source_device, sequence, content, created_at
+                               from messages where id=$1""",
+                            message_id,
+                        )
+                except Exception as read_error:
+                    exc.add_note(
+                        f"Message outcome reconciliation failed with {type(read_error).__name__}; write was not retried."
+                    )
+                    raise
+                if existing is not None:
+                    record = existing
+                    logger.warning(
+                        "MESSAGE_WRITE_AMBIGUOUS_COMMIT_RECONCILED attempts=%s error_type=%s",
+                        attempt + 1, type(exc).__name__,
+                    )
+                    break
+                if attempt + 1 == MESSAGE_SEQUENCE_MAX_ATTEMPTS:
+                    raise
+                retries += 1
+                logger.warning(
+                    "MESSAGE_WRITE_RETRY attempt=%s reason=%s stream_reopen_count=%s",
+                    retries, "stream_expired" if ambiguous_stream else "database_locked",
+                    retries if ambiguous_stream else 0,
+                )
+                await asyncio.sleep(0.01 * retries)
     logger.info(
         "DB_LATENCY operation=message_insert acquire_ms=%.2f insert_with_sequence_ms=%.2f "
         "commit_ms=%.2f attempts=%s total_ms=%.2f",
         acquire_ms, insert_with_sequence_ms, max(0.0, commit_ms),
-        attempt + 1,
+        retries + 1,
         (perf_counter() - total_started) * 1000,
     )
     return {
