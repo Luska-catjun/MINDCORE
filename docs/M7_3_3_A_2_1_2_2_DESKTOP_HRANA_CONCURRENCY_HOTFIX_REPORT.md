@@ -54,6 +54,13 @@ The Desktop-specific write lock is process-local to one `TursoPool`; this accept
 
 All required focus cases passed with zero focused failures, errors, or core skips:
 
+```text
+FOCUSED_TESTS = 21/21
+FOCUSED_FAILURES = 0
+FOCUSED_ERRORS = 0
+FOCUSED_CORE_SKIPS = 0
+```
+
 | Gate | Result |
 | --- | --- |
 | Original expiry reproduction and exact failure stage | PASS — `COMMIT`; reproduced before fix. |
