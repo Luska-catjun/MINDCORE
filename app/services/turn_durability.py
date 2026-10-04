@@ -68,6 +68,10 @@ PROACTIVE_TURN_STAGES: tuple[StageDefinition, ...] = (
 )
 STAGE_BY_NAME.update({stage.name: stage for stage in PROACTIVE_TURN_STAGES})
 
+# Foreground turns use the same schema-24 provider boundary as proactive
+# turns, but enter it from the user initiated chat path.
+FOREGROUND_TURN_STAGES = PROACTIVE_TURN_STAGES
+
 
 class StageNotClaimed(RuntimeError):
     """The stage is already complete, currently owned, or terminal."""
@@ -164,11 +168,72 @@ class TurnDurability:
                     now,
                     *turn_context.durable_values(),
                 )
+                for stage in FOREGROUND_TURN_STAGES:
+                    await connection.execute(
+                        """insert into chat_turn_stages(
+                             turn_id,stage_name,status,retry_policy,attempt_count,
+                             started_at,completed_at,last_error_category
+                           ) values($1,$2,'pending',$3,0,null,null,null)""",
+                        message["id"], stage.name, stage.retry_policy,
+                    )
         logger.info(
             "TURN_LIFECYCLE turn=%s status=pending initiator=%s trigger=%s input_source=%s",
             message["id"], *turn_context.durable_values(),
         )
         return message
+
+    async def mark_foreground_context_prepared(self, turn_id: UUID | str) -> None:
+        """Commit the foreground context boundary before starting a provider."""
+        if not self.enabled:
+            return
+        now = _utc_now()
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                turn = await connection.fetchrow(
+                    "select status,core_completed_at from chat_turns where turn_id=$1",
+                    turn_id,
+                )
+                if turn is None or turn["status"] != "pending" or turn["core_completed_at"] is not None:
+                    raise RuntimeError("foreground_turn_not_pending")
+                changed = await connection.fetchrow(
+                    """update chat_turn_stages set status='completed',started_at=$1,
+                              completed_at=$1,attempt_count=1,last_error_category=null
+                       where turn_id=$2 and stage_name='context_prepare' and status='pending'
+                       returning turn_id""",
+                    now, turn_id,
+                )
+                if changed is None:
+                    raise RuntimeError("foreground_context_boundary_not_pending")
+
+    async def mark_provider_started(self, turn_id: UUID | str) -> None:
+        """Commit provider ownership in the shared ledger before any provider call."""
+        if not self.enabled:
+            return
+        now = _utc_now()
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                turn = await connection.fetchrow(
+                    "select status,core_completed_at from chat_turns where turn_id=$1",
+                    turn_id,
+                )
+                if turn is None or turn["status"] != "pending" or turn["core_completed_at"] is not None:
+                    raise RuntimeError("foreground_turn_not_pending")
+                context = await connection.fetchval(
+                    "select status from chat_turn_stages where turn_id=$1 and stage_name='context_prepare'",
+                    turn_id,
+                )
+                if context != "completed":
+                    raise RuntimeError("foreground_context_not_prepared")
+                changed = await connection.fetchrow(
+                    """update chat_turn_stages set status='running',started_at=$1,
+                              attempt_count=attempt_count+1,last_error_category=null
+                       where turn_id=$2 and stage_name='provider_generate' and status='pending'
+                       returning turn_id""",
+                    now, turn_id,
+                )
+                if changed is None:
+                    raise RuntimeError("foreground_provider_already_started")
+        logger.info("TURN_LIFECYCLE turn=%s provider_started=durable", turn_id)
 
     async def begin_proactive_turn(
         self, conversation_id: UUID | str, turn_context: TurnContext,
@@ -378,6 +443,15 @@ class TurnDurability:
         try:
             async with self.pool.acquire() as connection:
                 async with connection.transaction():
+                    boundary = await connection.fetchrow(
+                        """select
+                             (select status from chat_turn_stages where turn_id=$1 and stage_name='context_prepare') as context_status,
+                             (select status from chat_turn_stages where turn_id=$1 and stage_name='provider_generate') as provider_status""",
+                        turn_id,
+                    )
+                    if (boundary is None or boundary["context_status"] != "completed"
+                            or boundary["provider_status"] != "running"):
+                        raise RuntimeError("foreground_provider_boundary_missing")
                     message = await repository.create_message(
                         _ConnectionBoundPool(connection), assistant_payload
                     )
@@ -394,6 +468,18 @@ class TurnDurability:
                     )
                     if updated is None:
                         raise RuntimeError("turn_core_completion_conflict")
+                    await connection.execute(
+                        """update chat_turn_stages set status='completed',completed_at=$1,
+                                  last_error_category=null
+                           where turn_id=$2 and stage_name='provider_generate' and status='running'""",
+                        now, turn_id,
+                    )
+                    await connection.execute(
+                        """update chat_turn_stages set status='completed',started_at=$1,
+                                  completed_at=$1,attempt_count=1,last_error_category=null
+                           where turn_id=$2 and stage_name='assistant_persist' and status='pending'""",
+                        now, turn_id,
+                    )
                     for stage in POST_COGNITION_STAGES:
                         await connection.execute(
                             """insert into chat_turn_stages(

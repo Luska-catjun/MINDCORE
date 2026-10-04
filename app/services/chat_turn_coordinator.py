@@ -393,6 +393,10 @@ async def _execute_chat_turn(
     logger.info("Chat prompt context_mode=%s dynamic_chars=%s identity_chars=%s", "fast" if lightweight else "full", len(dynamic_context or ""), len(identity_prompt))
     latency.mark('pre_llm_done')
     record_context(dynamic_context_chars=len(dynamic_context or ""), context_mode="fast" if lightweight else "full")
+    # Each call returns only after its transaction commits, making the
+    # provider-start marker visible to an independent recovery reader.
+    await durability.mark_foreground_context_prepared(turn_id)
+    await durability.mark_provider_started(turn_id)
     llm_started_at = perf_counter()
     try:
         reply_text = await generate_reply(

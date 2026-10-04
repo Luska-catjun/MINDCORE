@@ -17,7 +17,7 @@ from app.services.mindcore.goals import GoalsNeedsTurnResult
 
 
 class ChatPartialWriteBaseline(IsolatedAsyncioTestCase):
-    async def _run(self, *, failing: str | None = None, content: str = "A, B, C 중 골라봐", goals_result=None, forbid_goal_fallback: bool = False, forbid_emotion_state_reread: bool = False, reply_text: str = "B가 궁금해!", decision_calls: list[dict] | None = None):
+    async def _run(self, *, failing: str | None = None, content: str = "A, B, C 중 골라봐", goals_result=None, forbid_goal_fallback: bool = False, forbid_emotion_state_reread: bool = False, reply_text: str = "B가 궁금해!", decision_calls: list[dict] | None = None, provider_order: list[str] | None = None, fail_provider_marker: bool = False):
         messages: list[dict] = []; calls: list[str] = []
         async def create_message(_pool, payload):
             row={"id":uuid4(),"sequence":len(messages)+1,"content":payload.content,"role":payload.role};messages.append(row);calls.append("message");return row
@@ -30,7 +30,10 @@ class ChatPartialWriteBaseline(IsolatedAsyncioTestCase):
         async def record_experience(*_a, **_k): calls.append("experience"); return {"experience_id":uuid4()}
         async def finalize(*_a, **_k): calls.append("episode"); return None
         async def update_emotion(*_a, **_k): calls.append("emotion"); return SimpleNamespace(state={})
-        async def generate(*_a, **_k): calls.append("llm"); return reply_text
+        async def generate(*_a, **_k):
+            calls.append("llm")
+            if provider_order is not None: provider_order.append("provider")
+            return reply_text
         async def epistemic(*_a, **_k): calls.append("epistemic"); return [], None
         async def recall(*_a, **_k): calls.append("recall"); return SimpleNamespace(episodes=[],raw_messages=[])
         failures={
@@ -69,6 +72,17 @@ class ChatPartialWriteBaseline(IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(coordinator,"update_goals",return_value=goals_result))
             if forbid_goal_fallback:
                 stack.enter_context(patch.object(coordinator,"get_relevant_goals",side_effect=AssertionError("same-turn goal reread")))
+            original_context_marker = coordinator.TurnDurability.mark_foreground_context_prepared
+            original_provider_marker = coordinator.TurnDurability.mark_provider_started
+            async def context_marker(durability, turn_id):
+                if provider_order is not None: provider_order.append("context_committed")
+                return await original_context_marker(durability, turn_id)
+            async def provider_marker(durability, turn_id):
+                if provider_order is not None: provider_order.append("provider_started_committed")
+                if fail_provider_marker: raise RuntimeError("injected provider marker persistence failure")
+                return await original_provider_marker(durability, turn_id)
+            stack.enter_context(patch.object(coordinator.TurnDurability,"mark_foreground_context_prepared",context_marker))
+            stack.enter_context(patch.object(coordinator.TurnDurability,"mark_provider_started",provider_marker))
             for target in targets: stack.enter_context(target)
             request=SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(settings=SimpleNamespace(llm_provider="test",diana_timezone="Asia/Seoul"),diana_identity_prompt="")))
             result=await chat.send_chat_message(ChatRequest(conversation_id=uuid4(),role=MessageRole.user,content=content),request,BackgroundTasks(),SimpleNamespace())
@@ -76,6 +90,17 @@ class ChatPartialWriteBaseline(IsolatedAsyncioTestCase):
 
     async def test_successful_chat_saves_two_messages(self):
         result,messages,calls=await self._run();self.assertEqual(len(messages),2);self.assertEqual(calls,["message","emotion","epistemic","context","llm","message","decision","memory","experience","episode"]);self.assertEqual(result["diana_message"],messages[1])
+
+    async def test_foreground_provider_call_follows_provider_started_commit(self):
+        order=[]
+        await self._run(provider_order=order)
+        self.assertEqual(order,["context_committed","provider_started_committed","provider"])
+
+    async def test_provider_marker_persistence_failure_prevents_provider_call(self):
+        order=[]
+        with self.assertRaisesRegex(RuntimeError,"injected provider marker persistence failure"):
+            await self._run(provider_order=order,fail_provider_marker=True)
+        self.assertEqual(order,["context_committed","provider_started_committed"])
 
     async def test_historical_recall_stays_in_context_before_llm(self):
         _result,_messages,calls=await self._run(content="어제 무슨 이야기 했지?");self.assertLess(calls.index("recall"),calls.index("context"));self.assertLess(calls.index("context"),calls.index("llm"))

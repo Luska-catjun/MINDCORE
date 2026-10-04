@@ -78,6 +78,8 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
                 content="hello",
             )
         )
+        await self.durability.mark_foreground_context_prepared(user["id"])
+        await self.durability.mark_provider_started(user["id"])
         assistant = await self.durability.complete_core(
             user["id"],
             MessageCreate(
@@ -120,6 +122,9 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn["user_message_id"], user["id"])
         self.assertEqual(turn["status"], "pending")
         self.assertIsNone(turn["assistant_message_id"])
+        stages = {row["stage_name"]: row for row in await self.durability.get_stages(user["id"])}
+        self.assertEqual(set(stages), {"context_prepare", "provider_generate", "assistant_persist"})
+        self.assertTrue(all(row["status"] == "pending" for row in stages.values()))
         await self._assert_user_context(user["id"])
 
     async def test_provider_failure_keeps_user_message_and_marks_core_failed(self) -> None:
@@ -130,6 +135,8 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
                 content="provider failure",
             )
         )
+        await self.durability.mark_foreground_context_prepared(user["id"])
+        await self.durability.mark_provider_started(user["id"])
         error = RuntimeError("secret provider body must not be stored")
 
         await self.durability.mark_core_failed(user["id"], error)
@@ -141,7 +148,8 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await self._value("select count(*) from messages where id=$1", user["id"]), 1
         )
-        self.assertEqual(len(await self.durability.get_stages(user["id"])), 0)
+        stages = {row["stage_name"]: row for row in await self.durability.get_stages(user["id"])}
+        self.assertEqual(stages["provider_generate"]["status"], "running")
         await self._assert_user_context(user["id"])
 
     async def test_assistant_failure_rolls_back_row_and_never_marks_core_complete(self) -> None:
@@ -152,6 +160,8 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
                 content="assistant persistence failure",
             )
         )
+        await self.durability.mark_foreground_context_prepared(user["id"])
+        await self.durability.mark_provider_started(user["id"])
         original = repository.create_message
 
         async def fail_assistant(pool, payload):
@@ -189,8 +199,77 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn["assistant_message_id"], assistant["id"])
         self.assertEqual(turn["status"], "core_completed")
         self.assertIsNotNone(turn["core_completed_at"])
-        self.assertEqual(len(stages), len(POST_COGNITION_STAGES))
-        self.assertTrue(all(row["status"] == "pending" for row in stages))
+        by_name = {row["stage_name"]: row for row in stages}
+        self.assertEqual(len(stages), len(POST_COGNITION_STAGES) + 3)
+        self.assertTrue(all(by_name[name]["status"] == "completed" for name in
+                            ("context_prepare", "provider_generate", "assistant_persist")))
+        self.assertTrue(all(by_name[definition.name]["status"] == "pending"
+                            for definition in POST_COGNITION_STAGES))
+
+    async def test_provider_started_is_visible_after_commit_to_fresh_reader(self) -> None:
+        user = await self.durability.begin_turn(ChatRequest(
+            conversation_id=self.conversation_id, role=MessageRole.user, content="fresh reader"
+        ))
+        await self.durability.mark_foreground_context_prepared(user["id"])
+        await self.durability.mark_provider_started(user["id"])
+
+        independent_pool = LocalFilePool(self.database)
+        async with independent_pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "select status,attempt_count,started_at from chat_turn_stages "
+                "where turn_id=$1 and stage_name='provider_generate'", user["id"]
+            )
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["attempt_count"], 1)
+        self.assertIsNotNone(row["started_at"])
+
+    async def test_provider_started_requires_context_and_rejects_duplicate_start(self) -> None:
+        user = await self.durability.begin_turn(ChatRequest(
+            conversation_id=self.conversation_id, role=MessageRole.user, content="ordered start"
+        ))
+        with self.assertRaisesRegex(RuntimeError, "foreground_context_not_prepared"):
+            await self.durability.mark_provider_started(user["id"])
+
+        await self.durability.mark_foreground_context_prepared(user["id"])
+        await self.durability.mark_provider_started(user["id"])
+        with self.assertRaisesRegex(RuntimeError, "foreground_provider_already_started"):
+            await self.durability.mark_provider_started(user["id"])
+        stage = await self._row(
+            "select status,attempt_count from chat_turn_stages where turn_id=$1 "
+            "and stage_name='provider_generate'", user["id"]
+        )
+        self.assertEqual((stage["status"], stage["attempt_count"]), ("running", 1))
+
+    async def test_core_completion_refuses_missing_provider_started_boundary(self) -> None:
+        user = await self.durability.begin_turn(ChatRequest(
+            conversation_id=self.conversation_id, role=MessageRole.user, content="missing boundary"
+        ))
+        await self.durability.mark_foreground_context_prepared(user["id"])
+        with self.assertRaisesRegex(RuntimeError, "foreground_provider_boundary_missing"):
+            await self.durability.complete_core(user["id"], MessageCreate(
+                conversation_id=self.conversation_id, role=MessageRole.diana,
+                content="must not persist", source_device="test",
+            ))
+        self.assertIsNone((await self.durability.get_turn(user["id"]))["assistant_message_id"])
+        self.assertEqual(await self._value(
+            "select count(*) from messages where role='diana' and conversation_id=$1",
+            self.conversation_id,
+        ), 0)
+
+    async def test_provider_failure_keeps_durable_running_marker_for_ambiguity(self) -> None:
+        user = await self.durability.begin_turn(ChatRequest(
+            conversation_id=self.conversation_id, role=MessageRole.user, content="ambiguous provider"
+        ))
+        await self.durability.mark_foreground_context_prepared(user["id"])
+        await self.durability.mark_provider_started(user["id"])
+        await self.durability.mark_core_failed(user["id"], RuntimeError("provider interrupted"))
+        turn = await self.durability.get_turn(user["id"])
+        stage = await self._row(
+            "select status from chat_turn_stages where turn_id=$1 and stage_name='provider_generate'",
+            user["id"],
+        )
+        self.assertEqual(turn["status"], "core_failed")
+        self.assertEqual(stage["status"], "running")
 
     async def test_stage_failure_rolls_back_side_effect_then_retry_completes_once(self) -> None:
         user, _assistant = await self._core_completed_turn()
