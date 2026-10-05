@@ -235,6 +235,50 @@ class TurnDurability:
                     raise RuntimeError("foreground_provider_already_started")
         logger.info("TURN_LIFECYCLE turn=%s provider_started=durable", turn_id)
 
+    async def settle_interrupted_provider_turn(
+        self, turn_id: UUID | str, *, origin_device_id: str, recovery_device_id: str
+    ) -> bool:
+        """Settle a harness-proven interrupted foreign provider turn without replay.
+
+        The explicit origin/recovery identities are supplied only when the caller
+        has deterministic interruption evidence. A fresh running provider turn
+        is never inferred stale from its age.
+        """
+        if not self.enabled or not origin_device_id or not recovery_device_id \
+                or origin_device_id == recovery_device_id:
+            return False
+        now = _utc_now()
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                turn = await connection.fetchrow(
+                    """select t.status,t.assistant_message_id,m.source_device
+                       from chat_turns t join messages m on m.id=t.user_message_id
+                       where t.turn_id=$1""",
+                    turn_id,
+                )
+                if (turn is None or turn["status"] != "pending"
+                        or turn["assistant_message_id"] is not None
+                        or str(turn["source_device"]) != str(origin_device_id)):
+                    return False
+                changed = await connection.fetchrow(
+                    """update chat_turn_stages set status='failed',completed_at=$1,
+                              last_error_category='PROVIDER_INDETERMINATE'
+                       where turn_id=$2 and stage_name='provider_generate' and status='running'
+                       returning turn_id""",
+                    now, turn_id,
+                )
+                if changed is None:
+                    return False
+                await connection.execute(
+                    """update chat_turns set status='core_failed',updated_at=$1,
+                              last_failed_stage='provider_generate',
+                              safe_error_category='PROVIDER_INDETERMINATE'
+                       where turn_id=$2 and status='pending' and assistant_message_id is null""",
+                    now, turn_id,
+                )
+        logger.warning("TURN_LIFECYCLE turn=%s status=core_failed category=PROVIDER_INDETERMINATE", turn_id)
+        return True
+
     async def begin_proactive_turn(
         self, conversation_id: UUID | str, turn_context: TurnContext,
         *, turn_id: UUID | str | None = None,

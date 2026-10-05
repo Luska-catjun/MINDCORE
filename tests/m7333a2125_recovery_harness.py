@@ -31,11 +31,13 @@ class RecoveryResult:
     schema_version: int
     recovered_turns: int
     cognition_observations: dict[str, int] | None = None
+    settled_provider_turns: int = 0
 
 
 async def run_desktop_recovery_once(database_url: str, auth_token: str,
                                     persona_id: str,
-                                    observer: "CognitionExecutionObserver | None" = None
+                                    observer: "CognitionExecutionObserver | None" = None,
+                                    interrupted_provider_turns: dict[str, str] | None = None
                                     ) -> RecoveryResult:
     """Validate the shared owner, then invoke the real Desktop startup recovery."""
     pool = TursoPool(database_url, auth_token)
@@ -52,8 +54,17 @@ async def run_desktop_recovery_once(database_url: str, auth_token: str,
             raise RuntimeError("HARNESS_SCHEMA_MUST_BE_24")
         if str(owner) != str(persona_id):
             raise RuntimeError("HARNESS_PERSONA_MISMATCH")
+        candidate_ids = list((interrupted_provider_turns or {}).keys())
+        async with pool.acquire() as connection:
+            before_rows = await connection.fetch(
+                "select turn_id,status from chat_turns where turn_id in (" +
+                ",".join(f"${index + 1}" for index in range(len(candidate_ids))) + ")",
+                *candidate_ids) if candidate_ids else []
+        before = {str(row["turn_id"]): str(row["status"]) for row in before_rows}
         if observer is None:
-            count = await recover_incomplete_turns(pool)
+            count = await recover_incomplete_turns(
+                pool, interrupted_provider_turns=interrupted_provider_turns,
+                recovery_device_id="98e27b8c-071a-4bf2-8f29-8417178b80a7")
         else:
             original = TurnDurability.run_stage
 
@@ -75,9 +86,19 @@ async def run_desktop_recovery_once(database_url: str, auth_token: str,
 
             from unittest.mock import patch
             with patch.object(TurnDurability, "run_stage", observed_run_stage):
-                count = await recover_incomplete_turns(pool)
+                count = await recover_incomplete_turns(
+                    pool, interrupted_provider_turns=interrupted_provider_turns,
+                    recovery_device_id="98e27b8c-071a-4bf2-8f29-8417178b80a7")
+        async with pool.acquire() as connection:
+            after_rows = await connection.fetch(
+                "select turn_id,status from chat_turns where turn_id in (" +
+                ",".join(f"${index + 1}" for index in range(len(candidate_ids))) + ")",
+                *candidate_ids) if candidate_ids else []
+        after = {str(row["turn_id"]): str(row["status"]) for row in after_rows}
+        settled = sum(before.get(turn_id) == "pending" and after.get(turn_id) == "core_failed"
+                      for turn_id in candidate_ids)
         return RecoveryResult(str(owner), int(schema), int(count),
-                              observer.snapshot() if observer is not None else None)
+                              observer.snapshot() if observer is not None else None, settled)
     finally:
         await pool.close()
 
@@ -279,7 +300,8 @@ class SqldLifecycle:
 
 class LocalHranaMetadataProxy:
     """Forward Hrana to real loopback sqld and strip its HTTP affinity URL only."""
-    def __init__(self, upstream_url: str, host: str = "127.0.0.1", port: int = 0) -> None:
+    def __init__(self, upstream_url: str, host: str = "127.0.0.1", port: int = 0,
+                 error_observer=None, request_observer=None) -> None:
         from urllib.parse import urlsplit
         parsed = urlsplit(upstream_url)
         if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
@@ -288,6 +310,7 @@ class LocalHranaMetadataProxy:
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802
+                received = time.monotonic()
                 length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(length)
                 request = Request(upstream + self.path, data=body, method="POST",
@@ -299,10 +322,16 @@ class LocalHranaMetadataProxy:
                         content_type = response.headers.get("Content-Type", "application/json")
                         payload = response.read()
                     decoded = json.loads(payload)
+                    if error_observer is not None and isinstance(decoded, dict):
+                        for item in decoded.get("results", []):
+                            if isinstance(item, dict) and item.get("type") == "error":
+                                error_observer({"upstream_error": item.get("error")})
                     if isinstance(decoded, dict):
                         decoded.pop("base_url", None)
                     payload = json.dumps(decoded, separators=(",", ":")).encode()
                 except Exception as error:
+                    if error_observer is not None:
+                        error_observer({"proxy_error_type": type(error).__name__})
                     status, content_type = 502, "application/json"
                     payload = json.dumps({"proxy_error_type": type(error).__name__}).encode()
                 self.send_response(status)
@@ -310,6 +339,15 @@ class LocalHranaMetadataProxy:
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
+                if request_observer is not None:
+                    statements = json.loads(body).get("requests", [])
+                    request_observer({
+                        "received": received, "completed": time.monotonic(),
+                        "elapsed_ms": round((time.monotonic() - received) * 1000, 3),
+                        "sql_head": [str(item.get("stmt", {}).get("sql", ""))[:90]
+                                     for item in statements],
+                        "http_status": status,
+                    })
 
             def log_message(self, _format: str, *_args: object) -> None:
                 return

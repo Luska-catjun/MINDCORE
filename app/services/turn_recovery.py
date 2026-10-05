@@ -288,9 +288,23 @@ async def recover_incomplete_turns(
     *,
     snapshot_scope: CognitiveSnapshotScope | None = None,
     limit: int = RECOVERY_BATCH_LIMIT,
+    interrupted_provider_turns: Mapping[str, str] | None = None,
+    recovery_device_id: str = "desktop",
 ) -> int:
-    """Process one bounded startup batch without retrying incomplete cores."""
+    """Process automatic stages and explicitly proven interrupted provider turns.
+
+    ``interrupted_provider_turns`` maps a turn to the durable origin device and
+    is populated by recovery callers holding process-interruption evidence.
+    It is never inferred from elapsed time.
+    """
     durability = TurnDurability(pool)
+    settled = 0
+    for turn_id, origin_device_id in (interrupted_provider_turns or {}).items():
+        if await durability.settle_interrupted_provider_turn(
+            turn_id, origin_device_id=origin_device_id,
+            recovery_device_id=recovery_device_id,
+        ):
+            settled += 1
     turn_ids = await durability.incomplete_turn_ids(limit=max(0, min(limit, RECOVERY_BATCH_LIMIT)))
     recovered = 0
     for turn_id in turn_ids:
@@ -304,4 +318,4 @@ async def recover_incomplete_turns(
                 "TURN_RECOVERY turn=%s status=failed category=%s",
                 turn_id, safe_error_type(error),
             )
-    return recovered
+    return recovered + settled

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import tempfile
 import threading
 import unittest
@@ -56,7 +57,11 @@ class RecoveryHarnessPrimitiveTests(unittest.TestCase):
             barrier.close()
 
     def test_sqld_controller_stops_and_restarts_same_storage(self) -> None:
-        executable = Path("/Users/luska/mindcore-android/.toolchain/libsql-server-aarch64-apple-darwin/sqld")
+        executable = Path(os.environ.get(
+            "MINDCORE_TEST_SQLD",
+            str(Path(__file__).resolve().parents[2] / "mindcore-android" /
+                ".toolchain/libsql-server-aarch64-apple-darwin/sqld"),
+        ))
         self.assertTrue(executable.is_file(), "bundled synthetic sqld executable is required")
         with tempfile.TemporaryDirectory(prefix="m7333a2125-sqld-") as directory:
             lifecycle = SqldLifecycle(str(executable), str(Path(directory) / "shared.sqld"), port=0)

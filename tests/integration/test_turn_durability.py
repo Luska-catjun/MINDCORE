@@ -432,6 +432,44 @@ class TurnDurabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(selected), 2)
         self.assertTrue(set(selected).issubset(set(identifiers)))
 
+    async def test_foreign_interrupted_provider_turn_settlement_is_atomic_and_idempotent(self) -> None:
+        identifiers = []
+        for index in range(5):
+            user = await self.durability.begin_turn(
+                ChatRequest(conversation_id=self.conversation_id, role=MessageRole.user,
+                            content=f"interrupted provider {index}", source_device="android-origin")
+            )
+            await self.durability.mark_foreground_context_prepared(user["id"])
+            await self.durability.mark_provider_started(user["id"])
+            identifiers.append(str(user["id"]))
+
+        async def settle(turn_id):
+            return await self.durability.settle_interrupted_provider_turn(
+                turn_id, origin_device_id="android-origin", recovery_device_id="desktop"
+            )
+
+        for turn_id in identifiers:
+            self.assertTrue(await settle(turn_id))
+            self.assertFalse(await settle(turn_id))
+            turn = await self.durability.get_turn(turn_id)
+            stages = {row["stage_name"]: row for row in await self.durability.get_stages(turn_id)}
+            self.assertEqual(turn["status"], "core_failed")
+            self.assertEqual(turn["safe_error_category"], "PROVIDER_INDETERMINATE")
+            self.assertIsNone(turn["assistant_message_id"])
+            self.assertEqual(stages["provider_generate"]["status"], "failed")
+            self.assertEqual(stages["provider_generate"]["attempt_count"], 1)
+
+        active = await self.durability.begin_turn(
+            ChatRequest(conversation_id=self.conversation_id, role=MessageRole.user,
+                        content="fresh active provider", source_device="android-origin")
+        )
+        await self.durability.mark_foreground_context_prepared(active["id"])
+        await self.durability.mark_provider_started(active["id"])
+        self.assertFalse(await self.durability.settle_interrupted_provider_turn(
+            active["id"], origin_device_id="android-origin", recovery_device_id="android-origin"
+        ))
+        self.assertEqual((await self.durability.get_turn(active["id"]))["status"], "pending")
+
     async def test_restart_and_duplicate_resume_skip_completed_stage(self) -> None:
         user, _assistant = await self._core_completed_turn()
         await self._complete_except(user["id"], {"relationship"})
