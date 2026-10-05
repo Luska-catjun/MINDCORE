@@ -8,7 +8,8 @@
 
 - Repository: `/Users/noseunghudong-alibujang/Developer/mindcore-desktop`
 - Branch: `backup/mindcore-desktop-current-2026-09-30`
-- Start/final HEAD: `8380564303c06f3cee6c51f894e10be4c42ee3a3`
+- Starting HEAD before A2 closure: `8380564303c06f3cee6c51f894e10be4c42ee3a3`.
+- Accepted UI implementation commit: `330008d427b23124d881f1148e4d1f10d6244f43`. The closure report follows it on the same local branch.
 - Existing `.toolchain/` remained untouched and unstaged.
 - No Desktop source changes were made in A2.1.
 - `git diff --check`: PASS.
