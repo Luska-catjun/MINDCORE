@@ -55,6 +55,7 @@ function App() {
   const [activeView, setActiveView] = useState<WorkspaceView>("chat");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [backendStatus, setBackendStatus] = useState<BackendStatus>("checking");
+  const [personaBindingState, setPersonaBindingState] = useState<string>("NOT_APPLICABLE");
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [authStatus, setAuthStatus] = useState<AuthStatus>("checking");
   const [loginError, setLoginError] = useState<string | null>(null);
@@ -289,6 +290,7 @@ function App() {
       setActivePersonaId(session.persona_id || null);
       setPersonaDisplayName(session.persona_display_name || DEFAULT_PERSONA_DISPLAY_NAME);
       setUserDisplayName(session.user_display_name || DEFAULT_USER_DISPLAY_NAME);
+      setPersonaBindingState(session.persona_binding_state ?? "NOT_APPLICABLE");
       if (isDesktopRuntime()) emitFrontendStartupTiming("authenticated_session");
       setAuthStatus("authenticated");
     }).catch((error) => {
@@ -474,6 +476,7 @@ function App() {
         ),
         "durable_user_assistant_merged",
       );
+      setPersonaBindingState((current) => current === "NOT_APPLICABLE" ? current : "BOUND_MATCH");
       settlePendingSend(send);
       return true;
     },
@@ -554,6 +557,7 @@ function App() {
         isOpen={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
         backendStatus={backendStatus}
+        personaBindingState={personaBindingState}
         unreadCount={Object.values(unreadByConversation).reduce((total, count) => total + count, 0)}
       />
 

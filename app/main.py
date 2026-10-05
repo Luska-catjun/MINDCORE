@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import Settings, get_settings
 from app.database.connection import close_pool, create_pool
 from app.database.migrations import ensure_turso_schema_current
-from app.database.persona_storage import bind_persona_identity, storage_mode
+from app.database.persona_storage import PersonaBindingError, storage_mode, validate_for_protected_action
 from app.routers import autonomy, auth, chat, conversations, episodes, health, identity, messages, observe, relationship, state
 from app.routers.auth import require_auth_settings, request_is_authenticated
 from app.services.prompt_loader import load_persona_identity_prompt
@@ -87,34 +87,48 @@ def build_lifespan(
     pool_started = perf_counter()
     pool = db_pool_factory(settings) if db_pool_factory else create_pool(settings)
     app.state.db_pool = await pool if hasattr(pool, "__await__") else pool
+    app.state.persona_binding_recovery_done = False
+    app.state.persona_binding_recovery_lock = asyncio.Lock()
     emit_startup_timing("database_connect", "pool_create", round((perf_counter() - pool_started) * 1000))
     # Setup connection preflight remains read-only. The actual backend startup
     # is the single production boundary that adopts a released legacy schema or
     # runs a future registered forward migration before runtime reads begin.
-    if (
-        db_pool_factory is None
-        and settings.database_backend.lower() == "turso"
-        and hasattr(app.state.db_pool, "acquire")
-    ):
-        acquire_started = perf_counter()
-        async with app.state.db_pool.acquire() as connection:
-            emit_startup_timing(
-                "database_connect", "pool_acquire", round((perf_counter() - acquire_started) * 1000)
-            )
-            await ensure_turso_schema_current(connection)
-            mode = storage_mode(settings.database_url)
-            if settings.persona_id:
-                await bind_persona_identity(connection, settings.persona_id)
-            app.state.persona_storage_mode = mode
+    startup_storage_ready = True
+    if db_pool_factory is None and settings.database_backend.lower() == "turso":
+        try:
+            app.state.persona_storage_mode = storage_mode(settings.database_url)
+        except ValueError:
+            # Invalid/missing shared configuration must not route writes into
+            # an alternate service/local database.
+            app.state.persona_storage_mode = "SHARED"
+        if app.state.db_pool is None or not hasattr(app.state.db_pool, "acquire"):
+            startup_storage_ready = False
+            app.state.persona_binding_state = "DB_UNAVAILABLE"
+        else:
+            acquire_started = perf_counter()
+            try:
+                async with app.state.db_pool.acquire() as connection:
+                    emit_startup_timing(
+                        "database_connect", "pool_acquire", round((perf_counter() - acquire_started) * 1000)
+                    )
+                    await ensure_turso_schema_current(connection)
+                    app.state.persona_binding_state = "UNBOUND"
+            except Exception as error:
+                startup_storage_ready = False
+                app.state.persona_binding_state = "DB_UNAVAILABLE"
+                logging.getLogger("diana.runtime").warning(
+                    "Persona storage preflight unavailable error_type=%s", safe_error_type(error)
+                )
     else:
         # The Supabase backend is a service database, not a Persona registry
         # mode. Keep it distinct from a device-local authoritative Persona DB.
         app.state.persona_storage_mode = "SERVICE_DATABASE"
+        app.state.persona_binding_state = "NOT_APPLICABLE"
     app.state.cognitive_snapshot_scope = CognitiveSnapshotScope()
     # One startup hydration keeps Narrative activation off the foreground chat
     # path.  Isolated ASGI fixtures without a database acquire seam simply use
     # the empty, safe snapshot.
-    if hasattr(app.state.db_pool, "acquire"):
+    if startup_storage_ready and hasattr(app.state.db_pool, "acquire"):
         narrative_started = perf_counter()
         emit_startup_timing("hydration", "narrative_start", 0)
         await hydrate_narrative_snapshot(app.state.db_pool, app.state.cognitive_snapshot_scope)
@@ -131,7 +145,9 @@ def build_lifespan(
     # after schema migration and snapshot hydration, without delaying startup.
     app.state.turn_recovery_task = None
     if (
-        settings.database_backend.lower() == "turso"
+        startup_storage_ready
+        and settings.database_backend.lower() == "turso"
+        and app.state.persona_storage_mode != "SHARED"
         and hasattr(app.state.db_pool, "acquire")
         and not getattr(app.state.db_pool, "isolated", False)
     ):
@@ -150,7 +166,9 @@ def build_lifespan(
     app.state.autonomy_runtime_state = None
     app.state.autonomy_recovery_task = None
     desktop_autonomy_runtime = (
-        bool(os.environ.get("MINDCORE_DESKTOP_SHUTDOWN_CAPABILITY"))
+        startup_storage_ready
+        and app.state.persona_storage_mode != "SHARED"
+        and bool(os.environ.get("MINDCORE_DESKTOP_SHUTDOWN_CAPABILITY"))
         and settings.database_backend.lower() == "turso"
         and hasattr(app.state.db_pool, "acquire")
         and not getattr(app.state.db_pool, "isolated", False)
@@ -263,6 +281,41 @@ def create_app(*, settings_override: Settings | None = None, db_pool_factory: Ca
         if not authenticated:
             logger.warning("[AUTH] authentication failed reason=missing_or_invalid_credential path=%s", request.url.path)
             return JSONResponse({"detail": "Authentication required."}, status_code=401)
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} \
+                and getattr(request.app.state, "persona_storage_mode", "") == "SHARED":
+            try:
+                await validate_for_protected_action(
+                    request.app.state.db_pool, settings.persona_id
+                )
+                request.app.state.persona_binding_state = "BOUND_MATCH"
+                if not request.app.state.persona_binding_recovery_done:
+                    async with request.app.state.persona_binding_recovery_lock:
+                        if not request.app.state.persona_binding_recovery_done:
+                            await recover_incomplete_turns(
+                                request.app.state.db_pool,
+                                snapshot_scope=request.app.state.cognitive_snapshot_scope,
+                            )
+                            request.app.state.persona_binding_recovery_done = True
+            except PersonaBindingError as error:
+                request.app.state.persona_binding_state = error.state
+                if error.state == "BOUND_MISMATCH":
+                    return JSONResponse({"detail": {
+                        "code": "PERSONA_MISMATCH",
+                        "message": "현재 연결된 MindCore가 이 Persona와 일치하지 않습니다.",
+                    }}, status_code=409)
+                return JSONResponse({"detail": {
+                    "code": "CONNECTION_UNAVAILABLE",
+                    "message": "Persona 연결을 확인할 수 없습니다. 연결 상태를 확인한 뒤 다시 시도해 주세요.",
+                }}, status_code=503)
+            except Exception as error:
+                request.app.state.persona_binding_state = "DB_UNAVAILABLE"
+                logging.getLogger("diana.runtime").warning(
+                    "Persona recovery unavailable error_type=%s", safe_error_type(error)
+                )
+                return JSONResponse({"detail": {
+                    "code": "CONNECTION_UNAVAILABLE",
+                    "message": "Persona 연결을 확인할 수 없습니다. 연결 상태를 확인한 뒤 다시 시도해 주세요.",
+                }}, status_code=503)
         logger.info("[AUTH] authentication success path=%s credential=%s", request.url.path, source)
         return await call_next(request)
 

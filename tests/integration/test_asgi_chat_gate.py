@@ -38,6 +38,35 @@ class PersistentIsolatedPool:
 
 
 class AsgiChatGate(TestCase):
+    def test_shared_persona_mismatch_blocks_chat_before_any_durable_or_provider_call(self):
+        persona_p, persona_q = str(uuid4()), str(uuid4())
+        pool = PersistentIsolatedPool()
+        asyncio.run(pool.connection.execute(
+            'create table schema_metadata(key text primary key,value text not null)'))
+        asyncio.run(pool.connection.execute(
+            'insert into schema_metadata(key,value) values($1,$2)',
+            'mindcore_persona_id', persona_p))
+        settings = Settings(
+            private_access_password='test-password', auth_signing_secret='test-secret',
+            database_backend='turso', database_url='libsql://synthetic.invalid',
+            database_auth_token='synthetic-token', persona_id=persona_q,
+            llm_provider='gemini', gemini_api_key='synthetic-key',
+        )
+        app = create_app(settings_override=settings, db_pool_factory=lambda _settings: pool)
+        provider = AsyncMock(return_value='must not run')
+        with patch.object(coordinator, 'generate_reply', provider), TestClient(app) as client:
+            app.state.persona_storage_mode = 'SHARED'
+            self._login(client)
+            before = asyncio.run(pool.connection.fetchval('select count(*) from messages'))
+            response = client.post('/chat', json={
+                'conversation_id': str(uuid4()), 'role': 'user', 'content': 'synthetic guarded turn'
+            })
+            after = asyncio.run(pool.connection.fetchval('select count(*) from messages'))
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()['detail']['code'], 'PERSONA_MISMATCH')
+        self.assertEqual(before, after)
+        provider.assert_not_awaited()
+
     def test_authenticated_chat_persists_pre_response_intention_with_exact_provenance(self):
         pool=PersistentIsolatedPool(); rows=[]; captured=[]; conversation_id=uuid4(); asyncio.run(pool.connection.execute('insert into conversations values($1)',conversation_id))
         settings=Settings(private_access_password='test-password',auth_signing_secret='test-secret',database_backend='turso',database_url='file::memory:',database_auth_token='test-token',llm_provider='gemini',gemini_api_key='test-key')

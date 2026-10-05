@@ -243,7 +243,7 @@ export const api = {
     return request(`/autonomy/events${query}`);
   },
 
-  me: (): Promise<{ authenticated: boolean; persona_id: string; persona_display_name: string; user_display_name: string }> =>
+  me: (): Promise<{ authenticated: boolean; persona_id: string; persona_display_name: string; user_display_name: string; persona_binding_state?: string }> =>
     request("/auth/me", { suppressAuthFailure: true }),
 
   login: async (password: string): Promise<{ authenticated: boolean; persona_id: string; persona_display_name: string; user_display_name: string }> => {

@@ -6,6 +6,7 @@ interface SidebarProps {
   isOpen: boolean;
   onClose: () => void;
   backendStatus: "checking" | "connected" | "error";
+  personaBindingState?: string;
   unreadCount?: number;
 }
 
@@ -35,6 +36,7 @@ export function Sidebar({
   isOpen,
   onClose,
   backendStatus,
+  personaBindingState = "NOT_APPLICABLE",
   unreadCount = 0,
 }: SidebarProps) {
   return (
@@ -70,6 +72,9 @@ export function Sidebar({
           <span className={`status-dot status-dot-${backendStatus}`} aria-hidden="true" />
           <span>{backendStatus === "connected" ? "Backend connected" : backendStatus === "error" ? "Backend unavailable" : "Checking backend"}</span>
         </div>
+        {backendStatus === "connected" && personaBindingState !== "NOT_APPLICABLE" && <div className="sidebar-status">
+          <span>{personaBindingState === "BOUND_MATCH" ? "Persona connected" : personaBindingState === "UNBOUND" ? "Persona not yet bound" : personaBindingState === "BOUND_MISMATCH" ? "Persona mismatch" : "Persona connection unavailable"}</span>
+        </div>}
       </aside>
     </>
   );

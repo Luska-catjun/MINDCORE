@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel
 
 from app.config import Settings
+from app.database.persona_storage import inspect_binding_state
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -169,9 +170,14 @@ async def me(request: Request) -> dict[str, bool | str]:
         logger.warning("[AUTH] authentication failed reason=missing_or_invalid_credential path=/auth/me")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required.")
     logger.info("[AUTH] authentication success path=/auth/me credential=%s", source)
-    return {
+    result: dict[str, bool | str] = {
         "authenticated": True,
         "persona_id": settings.persona_id or "",
         "persona_display_name": settings.persona_display_name,
         "user_display_name": settings.user_display_name,
     }
+    if getattr(request.app.state, "persona_storage_mode", "") == "SHARED":
+        result["persona_binding_state"] = await inspect_binding_state(
+            request.app.state.db_pool, settings.persona_id
+        )
+    return result

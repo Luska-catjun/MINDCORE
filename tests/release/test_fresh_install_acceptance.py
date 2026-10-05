@@ -52,12 +52,21 @@ class FreshInstallAcceptance(TestCase):
         self.assertEqual(asyncio.run(self._bootstrap()), "TURSO_BOOTSTRAP_OK version=24")
         self.assertEqual(asyncio.run(self._scalar("pragma integrity_check")), "ok")
         self.assertEqual(asyncio.run(self._rows("pragma foreign_key_check")), [])
+        self.persona_id = "13a7c634-f66d-490d-9e8f-04a2f9acd97c"
+        async def bind_fixture_persona():
+            async with self.pool.acquire() as connection:
+                await connection.execute(
+                    "insert into schema_metadata(key,value) values($1,$2)",
+                    "mindcore_persona_id", self.persona_id,
+                )
+        asyncio.run(bind_fixture_persona())
         self.settings = Settings(
             private_access_password="fresh-test-password",
             auth_signing_secret="fresh-test-secret",
             database_backend="turso",
             database_url=str(self.database_path),
             database_auth_token="not-used-by-local-test-pool",
+            persona_id=self.persona_id,
             llm_provider="gemini",
             gemini_api_key="not-used-by-mocked-provider",
         )
@@ -120,6 +129,11 @@ class FreshInstallAcceptance(TestCase):
         ), patch.object(coordinator, "build_context", side_effect=capture_context):
             app = self._app()
             with TestClient(app) as client:
+                # Exercise the shared-mode request guard against this isolated
+                # schema-24 file fixture; normal production configuration sets
+                # SHARED from its libSQL URL during lifespan startup.
+                app.state.persona_storage_mode = "SHARED"
+                app.state.persona_binding_recovery_done = True
                 self.assertEqual(get_narrative_snapshot(app.state.cognitive_snapshot_scope), ())
                 self.assertEqual(get_self_model_snapshot(app.state.cognitive_snapshot_scope), ())
                 self.assertEqual(client.get("/health").json(), {"status": "ok", "db": "connected"})
