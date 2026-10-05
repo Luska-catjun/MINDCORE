@@ -6,13 +6,13 @@ import type { WorkspaceView } from "./Sidebar";
 import { formatKstDateTime, formatKstDateTimeWithSeconds } from "../utils/datetime";
 
 interface WorkspacePanelProps {
-  view: Exclude<WorkspaceView, "chat" | "sync">;
+  view: Exclude<WorkspaceView, "chat" | "sync" | "persona-connection">;
   backendStatus: "checking" | "connected" | "error";
   onToggleSidebar: () => void;
   onMessageDeleted?: (conversationId: string, messageId: string) => void;
 }
 type ObservationData = ObservationList<ObservedMemory> | ObservationList<ObservedMessage> | ObserveEmotion | ObservePreferences | ObservationList<ObservedEpisode> | ObservationList<ObservedDecision> | ObservationList<ObservedIntention> | ObservationList<ObservedNarrative> | ObservationList<ObservedSelfModel> | ObservationList<ObservedKnowledge> | ObserveRelationship | ObserveStats | ObserveDebug | ObserveWorldModel | ObserveGoalsNeeds;
-type ObservationView = Exclude<WorkspaceView, "chat" | "sync">;
+type ObservationView = Exclude<WorkspaceView, "chat" | "sync" | "persona-connection">;
 type ObservationResource = { view: ObservationView; data: ObservationData };
 type ObservationError = { view: ObservationView; message: string };
 const EMOTIONS = ["joy", "excitement", "interest", "curiosity", "delight", "amusement", "comfort", "affection", "pride", "bashfulness", "embarrassment", "surprise", "confusion", "sadness", "disappointment", "frustration", "concern", "anger", "neutral"];

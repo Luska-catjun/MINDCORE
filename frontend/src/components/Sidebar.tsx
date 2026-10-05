@@ -1,4 +1,4 @@
-export type WorkspaceView = "chat" | "messages" | "memory" | "emotion" | "knowledge" | "preferences" | "episodes" | "decisions" | "intentions" | "narratives" | "self-model" | "world-model" | "relationship" | "goals-needs" | "stats" | "debug" | "sync";
+export type WorkspaceView = "chat" | "messages" | "memory" | "emotion" | "knowledge" | "preferences" | "episodes" | "decisions" | "intentions" | "narratives" | "self-model" | "world-model" | "relationship" | "goals-needs" | "stats" | "debug" | "persona-connection";
 
 interface SidebarProps {
   activeView: WorkspaceView;
@@ -27,7 +27,7 @@ const NAVIGATION: Array<{ id: WorkspaceView; label: string }> = [
   { id: "goals-needs", label: "Goals & Needs" },
   { id: "stats", label: "Stats" },
   { id: "debug", label: "Debug" },
-  { id: "sync", label: "Sync / Devices" },
+  { id: "persona-connection", label: "Persona Connection" },
 ];
 
 export function Sidebar({

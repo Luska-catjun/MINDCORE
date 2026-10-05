@@ -1,4 +1,4 @@
-import { afterEach } from "vitest";
+import { afterEach, vi } from "vitest";
 import { cleanup } from "@testing-library/react";
 
 afterEach(() => cleanup());
@@ -22,3 +22,5 @@ function storage(): Storage {
 
 Object.defineProperty(window, "localStorage", { configurable: true, value: storage() });
 Object.defineProperty(window, "sessionStorage", { configurable: true, value: storage() });
+
+vi.mock("@tauri-apps/api/event", () => ({ listen: async () => () => undefined }));

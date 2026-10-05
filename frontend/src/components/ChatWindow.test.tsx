@@ -3,10 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invoke = vi.hoisted(() => vi.fn());
 const listMessages = vi.hoisted(() => vi.fn());
+const sendChatMessage = vi.hoisted(() => vi.fn());
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("../api/client", () => ({
-  api: { listMessages, sendChatMessage: vi.fn() },
+  api: { listMessages, sendChatMessage },
   ApiError: class ApiError extends Error {},
   isDesktopRuntime: () => true,
 }));
@@ -52,5 +53,14 @@ describe("ChatWindow Persona avatar", () => {
     rerender(<ChatWindow {...props} personaAvatarRevision={2} />);
     await waitFor(() => expect(screen.getByAltText("Jarvis avatar").getAttribute("src")).toBe("blob:header-avatar-2"));
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:header-avatar-1");
+  });
+
+  it("blocks protected sends on Persona mismatch while keeping the chat visible", async () => {
+    render(<ChatWindow {...props} sendBlocked sendBlockedMessage="Persona mismatch" />);
+    expect(await screen.findByText("Persona mismatch")).toBeTruthy();
+    const input = await screen.findByPlaceholderText("메시지를 입력하세요...");
+    expect((input as HTMLTextAreaElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "전송" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(sendChatMessage).not.toHaveBeenCalled();
   });
 });

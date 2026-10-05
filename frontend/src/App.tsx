@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import { api, ApiError, isDesktopRuntime, setAuthFailureHandler, storeDesktopSession } from "./api/client";
 import {
   type ChatHistoryCache,
@@ -25,7 +26,7 @@ import { proactiveDeliveryMode, proactiveUnreadKey, rememberProactiveEvent, shou
 import { DEFAULT_PERSONA_DISPLAY_NAME, DEFAULT_USER_DISPLAY_NAME } from "./assets";
 import { PersonaManager, type PersonaSummary } from "./components/PersonaManager";
 import { PersonaAvatar } from "./components/PersonaAvatar";
-import { SyncPanel } from "./components/SyncPanel";
+import { PersonaConnection } from "./components/PersonaConnection";
 import "./styles.css";
 
 const SOURCE_DEVICE = "web";
@@ -36,6 +37,8 @@ type BackendStatus = "checking" | "connected" | "error";
 type AuthStatus = "checking" | "authenticated" | "unauthenticated";
 type SetupState = "checking" | "needed" | "configured";
 type RuntimeCapabilities = { updater_available: boolean };
+const healthIsConnected = (health: { status: string; db?: string }) =>
+  health.db ? health.db === "connected" : health.status === "ok";
 
 function App() {
   const [personaDisplayName, setPersonaDisplayName] = useState(DEFAULT_PERSONA_DISPLAY_NAME);
@@ -56,12 +59,13 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [backendStatus, setBackendStatus] = useState<BackendStatus>("checking");
   const [personaBindingState, setPersonaBindingState] = useState<string>("NOT_APPLICABLE");
+  const [databaseStatus, setDatabaseStatus] = useState<"checking" | "connected" | "error">("checking");
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [authStatus, setAuthStatus] = useState<AuthStatus>("checking");
   const [loginError, setLoginError] = useState<string | null>(null);
   const [desktopSessionError, setDesktopSessionError] = useState(false);
   const [startupAttempt, setStartupAttempt] = useState(0);
-  const [startupProgress, setStartupProgress] = useState(8);
+  const [bootStage, setBootStage] = useState("APP_INITIALIZING");
   const [setupState, setSetupState] = useState<SetupState>(isDesktopRuntime() ? "checking" : "configured");
   const [reconfiguring, setReconfiguring] = useState(false);
   const [updaterAvailable, setUpdaterAvailable] = useState(false);
@@ -74,6 +78,8 @@ function App() {
   const toastTimerRef = useRef<number | null>(null);
   const chatHistoryRef = useRef(chatHistory);
   chatHistoryRef.current = chatHistory;
+  const personasRef = useRef(personas);
+  personasRef.current = personas;
 
   const clearSessionState = useCallback(() => {
     sessionGenerationRef.current += 1;
@@ -151,35 +157,39 @@ function App() {
     let cancelled = false;
     const checkHealth = async () => {
       setBackendStatus("checking");
-      setStartupProgress(18);
+      setBootStage("LOCAL_CONFIG_LOADING");
       if (isDesktopRuntime()) {
+        let unlisten: (() => void) | undefined;
         try {
           // Native readiness is authoritative for the managed desktop child:
           // its 204 is served only after the backend lifespan (DB/schema and
           // runtime hydration) has completed. Do not gate it on an additional
           // /health request, which performs another remote DB round trip.
+          unlisten = await listen<string>("mindcore://boot-stage", (event) => setBootStage(event.payload));
           await invoke("start_mindcore_backend");
           emitFrontendStartupTiming("native_ready");
-          if (!cancelled) { setStartupProgress(100); setBackendStatus("connected"); }
+          if (!cancelled) { setBootStage("READY"); setBackendStatus("connected"); }
+          try { const health = await api.health(); if (!cancelled) setDatabaseStatus(healthIsConnected(health) ? "connected" : "error"); }
+          catch { if (!cancelled) setDatabaseStatus("error"); }
           return;
         } catch {
           if (!cancelled) setBackendStatus("error");
           return;
+        } finally {
+          unlisten?.();
         }
       }
       try {
-        await api.health();
-        if (!cancelled) { setStartupProgress(100); setBackendStatus("connected"); }
+        const health = await api.health();
+        if (!cancelled) { setBootStage("READY"); setDatabaseStatus(healthIsConnected(health) ? "connected" : "error"); setBackendStatus("connected"); }
       } catch {
-        if (!cancelled) setBackendStatus("error");
+        if (!cancelled) { setDatabaseStatus("error"); setBackendStatus("error"); }
       }
     };
     void checkHealth();
-    const progressTimer = window.setInterval(() => setStartupProgress((value) => value < 90 ? Math.min(90, value + 2) : value), 700);
     setAuthFailureHandler(clearSessionState);
     return () => {
       cancelled = true;
-      window.clearInterval(progressTimer);
       setAuthFailureHandler(undefined);
     };
   }, [clearSessionState, setupState, startupAttempt]);
@@ -296,6 +306,15 @@ function App() {
     }).catch((error) => {
       if (expectedGeneration !== sessionGenerationRef.current) return;
       if (isDesktopRuntime()) {
+        if (error instanceof ApiError && error.status >= 500) {
+          const active = personasRef.current.find((persona) => persona.active);
+          setDatabaseStatus("error");
+          setPersonaBindingState("DB_UNAVAILABLE");
+          setActivePersonaId(active?.persona_id ?? null);
+          setPersonaDisplayName(active?.display_name ?? DEFAULT_PERSONA_DISPLAY_NAME);
+          setAuthStatus("authenticated");
+          return;
+        }
         setDesktopSessionError(true);
         setAuthStatus("unauthenticated");
         return;
@@ -339,6 +358,19 @@ function App() {
     setAuthStatus("checking");
     setDesktopSessionError(false);
     setStartupAttempt((value) => value + 1);
+  }, []);
+
+  const reconnectPersona = useCallback(async () => {
+    setDatabaseStatus("checking");
+    try {
+      const health = await api.health();
+      setDatabaseStatus(healthIsConnected(health) ? "connected" : "error");
+      const session = await api.me();
+      setPersonaBindingState(session.persona_binding_state ?? "NOT_APPLICABLE");
+    } catch (error) {
+      setDatabaseStatus("error");
+      if (error instanceof ApiError && error.status !== 401 && error.status !== 403) throw error;
+    }
   }, []);
 
   const handleViewChange = (view: WorkspaceView) => {
@@ -534,7 +566,8 @@ function App() {
     return <SetupWizard reconfigure={reconfiguring} onComplete={() => { setReconfiguring(false); setSetupState("configured"); setStartupAttempt((value) => value + 1); }} />;
   }
   if (isDesktopRuntime() && backendStatus === "checking") {
-    return <main className="login-screen"><div className="login-form"><div className="login-title">MINDCORE</div><div className="startup-progress"><span style={{ width: `${startupProgress}%` }} /></div><p>{startupProgress < 25 ? "Preparing local runtime…" : startupProgress < 90 ? "Connecting…" : "Almost ready…"}</p></div></main>;
+    const labels: Record<string, string> = { APP_INITIALIZING: "Initializing MindCore", LOCAL_CONFIG_LOADING: "Loading local configuration", PERSONA_STORAGE_CONNECTING: "Connecting to Persona storage", PERSONA_BINDING_CHECK: "Checking Persona connection", COGNITION_INITIALIZING: "Starting Neural Core", COGNITION_HYDRATING: "Preparing cognition", READY: "Ready" };
+    return <main className="boot-screen"><div className="boot-card"><span className="boot-orbit" aria-hidden="true"><i /><b /></span><div className="login-title">MINDCORE</div><h1>Neural Core</h1><p>{labels[bootStage] ?? "Initializing MindCore"}</p><ol className="boot-stages" aria-label="MindCore initialization stages">{["LOCAL_CONFIG_LOADING", "COGNITION_INITIALIZING", "PERSONA_STORAGE_CONNECTING", "COGNITION_HYDRATING", "READY"].map((stage) => <li key={stage} className={bootStage === stage ? "boot-stage-current" : ""} aria-current={bootStage === stage ? "step" : undefined}>{labels[stage]}</li>)}</ol></div></main>;
   }
 
   if (isDesktopRuntime() && backendStatus === "error") {
@@ -587,14 +620,15 @@ function App() {
             messages={currentHistory?.messages ?? []}
             historyRevision={currentHistory?.revision ?? 0}
             sending={Boolean(mainConversationId && pendingSends[mainConversationId])}
+            sendBlocked={personaBindingState === "BOUND_MISMATCH" || personaBindingState === "DB_UNAVAILABLE" || databaseStatus === "error"}
+            sendBlockedMessage={personaBindingState === "BOUND_MISMATCH" ? "This MindCore is connected to a different Persona." : "MindCore cannot verify the Persona connection."}
             onDurableMessagesLoaded={handleDurableMessagesLoaded}
             onSendStarted={handleSendStarted}
             onSendSucceeded={handleSendSucceeded}
             onSendFailed={handleSendFailed}
           />
-        ) : activeView === "sync" ? (
-          isDesktopRuntime() ? <SyncPanel key={activePersonaId ?? "none"} personaId={activePersonaId}
-            personaName={activePersona?.display_name ?? personaDisplayName} /> : null
+        ) : activeView === "persona-connection" ? (
+          <PersonaConnection personaName={activePersona?.display_name ?? personaDisplayName} bindingState={personaBindingState} runtimeConnected={backendStatus === "connected"} databaseStatus={databaseStatus} onReconnect={reconnectPersona} />
         ) : (
           <WorkspacePanel
             key={activePersonaId ?? "web"}

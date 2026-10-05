@@ -105,6 +105,8 @@ def build_lifespan(
             startup_storage_ready = False
             app.state.persona_binding_state = "DB_UNAVAILABLE"
         else:
+            binding_started = perf_counter()
+            emit_startup_timing("persona_binding", "binding_check_start", 0)
             acquire_started = perf_counter()
             try:
                 async with app.state.db_pool.acquire() as connection:
@@ -119,6 +121,9 @@ def build_lifespan(
                 logging.getLogger("diana.runtime").warning(
                     "Persona storage preflight unavailable error_type=%s", safe_error_type(error)
                 )
+            emit_startup_timing(
+                "persona_binding", "binding_check_end", round((perf_counter() - binding_started) * 1000)
+            )
     else:
         # The Supabase backend is a service database, not a Persona registry
         # mode. Keep it distinct from a device-local authoritative Persona DB.

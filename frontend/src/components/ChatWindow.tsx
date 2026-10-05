@@ -24,6 +24,8 @@ interface ChatWindowProps {
   messages: LocalMessage[];
   historyRevision: number;
   sending: boolean;
+  sendBlocked?: boolean;
+  sendBlockedMessage?: string;
   onDurableMessagesLoaded: (conversationId: string, messages: LocalMessage[], expectedRevision: number) => void;
   onSendStarted: (conversationId: string, optimistic: LocalMessage) => PendingChatSend;
   onSendSucceeded: (send: PendingChatSend, reply: ChatResponse) => boolean;
@@ -44,6 +46,8 @@ export function ChatWindow({
   messages,
   historyRevision,
   sending,
+  sendBlocked = false,
+  sendBlockedMessage = "Protected actions are unavailable.",
   onDurableMessagesLoaded,
   onSendStarted,
   onSendSucceeded,
@@ -123,7 +127,7 @@ export function ChatWindow({
   }, [conversationId, historyRevision, messages]);
 
   const handleSend = async (content: string) => {
-    if (!conversationId || sendingRef.current) return;
+    if (!conversationId || sendingRef.current || sendBlocked) return;
     sendingRef.current = true;
     setSendError(null);
     chatDebug("before_send", { conversationId, messages, revision: historyRevision });
@@ -212,7 +216,8 @@ export function ChatWindow({
       </div>
 
       {sending && <div className="thinking-indicator">{personaDisplayName}가 생각 중...</div>}
-      <MessageInput onSend={handleSend} disabled={loading} sending={sending} />
+      {sendBlocked && <p className="send-blocked" role="status">{sendBlockedMessage}</p>}
+      <MessageInput onSend={handleSend} disabled={loading || sendBlocked} sending={sending} />
     </div>
   );
 }

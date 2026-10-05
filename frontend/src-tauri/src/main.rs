@@ -17,7 +17,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Manager, RunEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent};
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
@@ -928,6 +928,9 @@ fn startup_timing(operation: &str, started: Instant) {
         started.elapsed().as_millis()
     );
 }
+fn emit_boot_stage(app: &AppHandle, stage: &'static str) {
+    let _ = app.emit("mindcore://boot-stage", stage);
+}
 fn safe_python_startup_timing_line(line: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(line);
     let marker = "MINDCORE_STARTUP_TIMING ";
@@ -949,6 +952,7 @@ fn safe_python_startup_timing_line(line: &[u8]) -> Option<String> {
             | ("recovery", "recovery_task_schedule")
             | ("uvicorn", "lifespan_complete" | "ready_route_registered")
             | ("health", "database_check")
+            | ("persona_binding", "binding_check_start" | "binding_check_end")
     );
     allowed.then(|| {
         format!(
@@ -958,6 +962,7 @@ fn safe_python_startup_timing_line(line: &[u8]) -> Option<String> {
 }
 fn start_sidecar(app: &AppHandle) -> Result<(), String> {
     let startup_started = Instant::now();
+    emit_boot_stage(app, "LOCAL_CONFIG_LOADING");
     startup_timing("start_sidecar_enter", startup_started);
     let state = app.state::<Sidecar>();
     let generation = match state
@@ -1042,6 +1047,7 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
         .env("PERSONA_DISPLAY_NAME", &profile.display_name)
         .env("PERSONA_IDENTITY_PATH", &profile.identity_path);
     startup_timing("sidecar_command_prepared", startup_started);
+    emit_boot_stage(app, "COGNITION_INITIALIZING");
     let port = DESKTOP_PORT.to_string();
     let pid = std::process::id().to_string();
     startup_timing("sidecar_spawn_start", startup_started);
@@ -1074,11 +1080,19 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
         return Err("MindCore backend start was superseded by another lifecycle operation.".into());
     }
     let lifecycle = Arc::clone(&state.lifecycle);
+    let boot_app = app.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(event) = events.recv().await {
             match event {
                 CommandEvent::Stdout(line) | CommandEvent::Stderr(line) => {
                     if let Some(safe_line) = safe_python_startup_timing_line(&line) {
+                        if safe_line.contains("phase=database_connect operation=pool_create") {
+                            emit_boot_stage(&boot_app, "PERSONA_STORAGE_CONNECTING");
+                        } else if safe_line.contains("phase=persona_binding operation=binding_check_end") {
+                            emit_boot_stage(&boot_app, "PERSONA_BINDING_CHECK");
+                        } else if safe_line.contains("phase=hydration operation=narrative_start") {
+                            emit_boot_stage(&boot_app, "COGNITION_HYDRATING");
+                        }
                         eprintln!("{safe_line}");
                     }
                 }
@@ -1119,6 +1133,7 @@ fn start_sidecar(app: &AppHandle) -> Result<(), String> {
             tcp_accept_logged = true;
         }
         if readiness.ready {
+            emit_boot_stage(app, "READY");
             startup_timing("ready_success", startup_started);
             if state
                 .lifecycle

@@ -6,7 +6,7 @@ import logging
 
 
 _ALLOWED_PHASES = {
-    "settings", "identity", "database_connect", "schema", "hydration",
+    "settings", "identity", "database_connect", "persona_binding", "schema", "hydration",
     "recovery", "uvicorn", "health", "frontend",
 }
 _ALLOWED_OPERATIONS = {
@@ -17,6 +17,7 @@ _ALLOWED_OPERATIONS = {
     "self_model_start", "self_model_end", "recovery_task_schedule",
     "lifespan_complete", "ready_route_registered", "database_check",
     "native_ready", "authenticated_session", "chat_ready",
+    "binding_check_start", "binding_check_end",
 }
 
 

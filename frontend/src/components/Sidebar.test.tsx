@@ -16,4 +16,10 @@ describe("Sidebar proactive unread badge", () => {
     rerender(<Sidebar {...props} unreadCount={0} />);
     expect(screen.queryByLabelText(/unread proactive messages/)).toBeNull();
   });
+
+  it("exposes Persona Connection and removes deprecated sync navigation", () => {
+    render(<Sidebar activeView="chat" onViewChange={vi.fn()} isOpen={false} onClose={vi.fn()} backendStatus="connected" />);
+    expect(screen.getByRole("button", { name: "Persona Connection" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /sync|devices/i })).toBeNull();
+  });
 });
