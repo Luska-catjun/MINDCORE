@@ -52,7 +52,7 @@ describe("desktop update service", () => {
   });
 
   it("keeps verification failures hard and update errors non-fatal", () => {
-    expect(updateErrorMessage(new Error("signature verification failed"), "download")).toBe("The update could not be verified and was not installed.");
-    expect(updateErrorMessage(new Error("offline"), "check")).toBe("Could not check for updates.");
+    expect(updateErrorMessage(new Error("signature verification failed"), "download")).toBe("업데이트 파일을 확인할 수 없어 설치하지 않았습니다.");
+    expect(updateErrorMessage(new Error("offline"), "check")).toBe("업데이트를 확인할 수 없습니다.");
   });
 });

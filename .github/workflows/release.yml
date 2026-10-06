@@ -135,7 +135,7 @@ jobs:
             "$hash *$($installer.Name)" | Set-Content "$bundle/SHA256SUMS.txt" -NoNewline
             $manifest = @{
               version = $env:MINDCORE_VERSION
-              notes = "MindCore $env:MINDCORE_VERSION"
+              notes = (Get-Content "release-notes/$($env:MINDCORE_VERSION).md" -Raw -Encoding UTF8)
               pub_date = (Get-Date).ToUniversalTime().ToString("o")
               platforms = @{
                 "windows-x86_64" = @{
@@ -166,4 +166,4 @@ jobs:
             "$bundle/SHA256SUMS.txt",
             "$bundle/latest.json"
           )
-          gh release create $env:RELEASE_TAG $assets --title "MindCore $env:MINDCORE_VERSION" --generate-notes
+          gh release create $env:RELEASE_TAG $assets --title "MindCore $env:MINDCORE_VERSION" --notes-file "release-notes/$($env:MINDCORE_VERSION).md"

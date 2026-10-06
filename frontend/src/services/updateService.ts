@@ -6,6 +6,7 @@ export type UpdateInfo = {
   version: string;
   date?: string;
   body?: string;
+  announcementUrl?: string;
   download: (onProgress: (progress: UpdateProgress) => void) => Promise<void>;
   install: () => Promise<void>;
 };
@@ -88,8 +89,8 @@ export async function loadDesktopUpdateService(): Promise<UpdateService | null> 
 
 export function updateErrorMessage(error: unknown, action: "check" | "download" | "install"): string {
   const detail = error instanceof Error ? error.message.toLowerCase() : "";
-  if (/signature|verify|verification/.test(detail)) return "The update could not be verified and was not installed.";
-  if (action === "check") return "Could not check for updates.";
-  if (action === "download") return "Update download failed. Your current MindCore installation was not changed.";
-  return "Update installation failed. Your current MindCore installation is still available.";
+  if (/signature|verify|verification/.test(detail)) return "업데이트 파일을 확인할 수 없어 설치하지 않았습니다.";
+  if (action === "check") return "업데이트를 확인할 수 없습니다.";
+  if (action === "download") return "업데이트를 다운로드하지 못했습니다. 현재 앱은 그대로 사용할 수 있습니다.";
+  return "업데이트를 설치하지 못했습니다. 현재 앱은 그대로 사용할 수 있습니다.";
 }

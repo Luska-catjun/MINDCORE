@@ -17,7 +17,7 @@ import { ChatWindow } from "./components/ChatWindow";
 import { WorkspacePanel } from "./components/WorkspacePanel";
 import { LoginScreen } from "./components/LoginScreen";
 import { SetupWizard } from "./components/SetupWizard";
-import { DesktopUpdater } from "./components/DesktopUpdater";
+import { ProductSupport } from "./components/ProductSupport";
 import { invoke } from "@tauri-apps/api/core";
 import "./buildRevision";
 import { emitFrontendStartupTiming } from "./startupTiming";
@@ -36,11 +36,10 @@ const DEFAULT_CONVERSATION_TITLE = "MindCore conversation";
 type BackendStatus = "checking" | "connected" | "error";
 type AuthStatus = "checking" | "authenticated" | "unauthenticated";
 type SetupState = "checking" | "needed" | "configured";
-type RuntimeCapabilities = { updater_available: boolean };
 const healthIsConnected = (health: { status: string; db?: string }) =>
   health.db ? health.db === "connected" : health.status === "ok";
 
-function App() {
+function MindCoreWorkspace({ onProductState }: { onProductState: (ready: boolean, provider?: string, connection?: string) => void }) {
   const [personaDisplayName, setPersonaDisplayName] = useState(DEFAULT_PERSONA_DISPLAY_NAME);
   const [userDisplayName, setUserDisplayName] = useState(DEFAULT_USER_DISPLAY_NAME);
   const [activePersonaId, setActivePersonaId] = useState<string | null>(null);
@@ -68,7 +67,7 @@ function App() {
   const [bootStage, setBootStage] = useState("APP_INITIALIZING");
   const [setupState, setSetupState] = useState<SetupState>(isDesktopRuntime() ? "checking" : "configured");
   const [reconfiguring, setReconfiguring] = useState(false);
-  const [updaterAvailable, setUpdaterAvailable] = useState(false);
+
   const [unreadByConversation, setUnreadByConversation] = useState<Record<string, number>>({});
   const [proactiveToast, setProactiveToast] = useState<ProactiveEvent | null>(null);
   const eventCursorRef = useRef<{ createdAt: string; messageId: string } | null>(null);
@@ -143,9 +142,7 @@ function App() {
   useEffect(() => {
     if (!isDesktopRuntime()) return;
     void invoke<{ configured: boolean }>("get_setup_status").then((status) => setSetupState(status.configured ? "configured" : "needed")).catch(() => setSetupState("needed"));
-    void invoke<RuntimeCapabilities>("get_runtime_capabilities")
-      .then((capabilities) => setUpdaterAvailable(capabilities?.updater_available === true))
-      .catch(() => setUpdaterAvailable(false));
+
   }, []);
 
   useEffect(() => {
@@ -559,6 +556,10 @@ function App() {
     });
   }, [currentHistory, mainConversationId]);
 
+  useEffect(() => {
+    onProductState(setupState === "needed" || backendStatus === "connected" || backendStatus === "error", undefined, personaBindingState);
+  }, [setupState, backendStatus, personaBindingState, onProductState]);
+
   if (isDesktopRuntime() && setupState === "checking") {
     return <main className="login-screen"><div className="login-form"><div className="login-title">MINDCORE</div><p>Preparing local setup…</p></div></main>;
   }
@@ -603,7 +604,7 @@ function App() {
           <div className="error-banner error-banner-top">백엔드 서버에 연결할 수 없습니다. FastAPI 서버와 API 주소를 확인해주세요.</div>
         )}
         {globalError && <div className="error-banner error-banner-top">{globalError}</div>}
-        {isDesktopRuntime() && updaterAvailable && <DesktopUpdater />}
+
 
         {activeView === "chat" ? (
           <ChatWindow
@@ -645,4 +646,9 @@ function App() {
   );
 }
 
+function App() {
+  const [support, setSupport] = useState<{ ready: boolean; provider?: string; connection?: string }>({ ready: false });
+  const onProductState = useCallback((ready: boolean, provider?: string, connection?: string) => setSupport({ ready, provider, connection }), []);
+  return <><MindCoreWorkspace onProductState={onProductState} />{isDesktopRuntime() && <ProductSupport {...support} />}</>;
+}
 export default App;

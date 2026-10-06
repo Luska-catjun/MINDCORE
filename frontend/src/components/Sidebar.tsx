@@ -26,7 +26,6 @@ const NAVIGATION: Array<{ id: WorkspaceView; label: string }> = [
   { id: "relationship", label: "Relationship" },
   { id: "goals-needs", label: "Goals & Needs" },
   { id: "stats", label: "Stats" },
-  { id: "debug", label: "Debug" },
   { id: "persona-connection", label: "Persona Connection" },
 ];
 

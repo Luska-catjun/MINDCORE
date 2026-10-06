@@ -1,6 +1,6 @@
 [package]
 name = "mindcore"
-version = "0.3.0"
+version = "0.4.0"
 description = "MindCore native desktop shell"
 authors = ["MindCore"]
 edition = "2021"
@@ -10,6 +10,7 @@ default-run = "mindcore"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+url = "2"
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 tauri-plugin-updater = "2.11.0"

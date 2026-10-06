@@ -11,15 +11,15 @@ vi.mock("./components/SetupWizard", () => ({ SetupWizard: () => <div>Setup Wizar
 vi.mock("./components/Sidebar", () => ({ Sidebar: () => <div>Sidebar</div> }));
 vi.mock("./components/ChatWindow", () => ({ ChatWindow: () => <div>Main Chat</div> }));
 vi.mock("./components/DesktopUpdater", () => ({
-  DesktopUpdater: () => {
+  DesktopUpdater: ({ enabled }: {enabled?: boolean}) => {
     updaterRender();
-    return <button type="button">Check for Updates</button>;
+    return <div><span>버전 0.4.0</span><button>업데이트 내용</button>{enabled && <button type="button">업데이트 확인</button>}</div>;
   },
 }));
 
 import App from "./App";
 
-describe("desktop updater first-run suppression", () => {
+describe("desktop product support across setup and workspace", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     apiMock.health.mockResolvedValue({ status: "ok" });
@@ -28,7 +28,7 @@ describe("desktop updater first-run suppression", () => {
     apiMock.createConversation.mockResolvedValue({ id: "main" });
   });
 
-  it("does not render updater UI while Setup Wizard is active", async () => {
+  it("renders feedback and update controls in setup without a runtime", async () => {
     invoke.mockImplementation((command: string) => {
       if (command === "get_setup_status") return Promise.resolve({ configured: false });
       if (command === "get_runtime_capabilities") return Promise.resolve({ updater_available: true });
@@ -36,7 +36,8 @@ describe("desktop updater first-run suppression", () => {
     });
     render(<App />);
     expect(await screen.findByText("Setup Wizard")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Check for Updates" })).toBeNull();
+    expect(screen.getByRole("button", { name: "업데이트 확인" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Feedback" })).toBeTruthy();
   });
 
   it("renders updater UI when the native build reports updater availability", async () => {
@@ -48,11 +49,11 @@ describe("desktop updater first-run suppression", () => {
       return Promise.resolve();
     });
     render(<App />);
-    expect(await screen.findByRole("button", { name: "Check for Updates" })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "업데이트 확인" })).toBeTruthy();
     expect(updaterRender).toHaveBeenCalled();
   });
 
-  it("does not render or invoke updater UI in an updater-disabled build", async () => {
+  it("retains current notes and feedback without native update actions in a disabled build", async () => {
     invoke.mockImplementation((command: string) => {
       if (command === "get_setup_status") return Promise.resolve({ configured: true });
       if (command === "get_runtime_capabilities") return Promise.resolve({ updater_available: false });
@@ -62,7 +63,8 @@ describe("desktop updater first-run suppression", () => {
     });
     render(<App />);
     expect(await screen.findByText("Main Chat")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Check for Updates" })).toBeNull();
-    expect(updaterRender).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "업데이트 확인" })).toBeNull();
+    expect(screen.getByRole("button", {name:"업데이트 내용"})).toBeTruthy();
+    expect(screen.getByRole("button", {name:"Feedback"})).toBeTruthy();
   });
 });

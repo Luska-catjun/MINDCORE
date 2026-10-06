@@ -1810,6 +1810,39 @@ fn open_managed_path(path: &Path) -> Result<(), String> {
         .map(|_| ())
         .map_err(|_| "Could not open the managed MindCore file.".into())
 }
+fn public_url(value: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(value).map_err(|_| "링크를 열 수 없습니다.".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none()
+        || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("링크를 열 수 없습니다.".into());
+    }
+    Ok(parsed)
+}
+#[tauri::command]
+fn open_public_url(url: String) -> Result<(), String> {
+    let parsed = public_url(&url)?;
+    open_managed_path(Path::new(parsed.as_str()))
+}
+#[tauri::command]
+fn get_product_support_metadata(app: AppHandle) -> BTreeMap<String, String> {
+    let version = if cfg!(target_os = "macos") {
+        Command::new("sw_vers").arg("-productVersion").output().ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else { None };
+    let mut values = BTreeMap::from([("platform".into(), std::env::consts::OS.into())]);
+    if let Some(version) = version { values.insert("os_version".into(), version); }
+    if let Ok(path) = config_path(&app) {
+        if let Ok(text) = fs::read_to_string(path) {
+            if let Some(provider) = persona_registry::parse_env(&text).get("LLM_PROVIDER") {
+                if matches!(provider.as_str(), "gemini" | "groq" | "openai" | "anthropic" | "xai") {
+                    values.insert("provider".into(), provider.clone());
+                }
+            }
+        }
+    }
+    values
+}
 #[tauri::command]
 fn open_configuration_folder(app: AppHandle) -> Result<(), String> {
     let path = config_path(&app)?;
@@ -1895,6 +1928,15 @@ fn stop_sidecar(app: &AppHandle) {
 #[cfg(test)]
 mod setup_validation_tests {
     use super::*;
+
+    #[test]
+    fn public_links_reject_unsafe_schemes_and_credentials() {
+        for link in ["javascript:alert(1)", "file:///tmp/private", "data:text/html,x", "mindcore://x", "https://user:secret@example.com"] {
+            assert!(public_url(link).is_err());
+        }
+        assert!(public_url("https://example.com/post").is_ok());
+        assert!(public_url("http://example.com/post").is_ok());
+    }
 
     #[test]
     fn database_credential_output_removes_shell_line_framing() {
@@ -2410,6 +2452,8 @@ fn main() {
             report_frontend_startup_stage,
             stop_mindcore_backend,
             open_configuration_folder,
+            open_public_url,
+            get_product_support_metadata,
             open_identity_file,
             list_personas,
             get_active_persona,

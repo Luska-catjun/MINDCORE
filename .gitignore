@@ -27,3 +27,5 @@ logs/
 /frontend/src-tauri/tauri.updater.conf.json
 /frontend/src-tauri/gen/schemas/windows-schema.json
 .DS_Store
+
+/frontend/src/generated/

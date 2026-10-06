@@ -21,5 +21,6 @@ describe("Sidebar proactive unread badge", () => {
     render(<Sidebar activeView="chat" onViewChange={vi.fn()} isOpen={false} onClose={vi.fn()} backendStatus="connected" />);
     expect(screen.getByRole("button", { name: "Persona Connection" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /sync|devices/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Debug" })).toBeNull();
   });
 });
