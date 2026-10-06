@@ -7,12 +7,12 @@ type UpdateState = "idle" | "checking" | "up-to-date" | "available" | "downloadi
 // The support shell stays mounted across setup and workspace screens. Dismissal
 // is session-scoped; a manual check intentionally opens the offer again.
 const dismissedVersions = new Set<string>();
-export function DesktopUpdater({ service: override, enabled = true, autoCheck = true, onStateChange }: { service?: UpdateService; enabled?: boolean; autoCheck?: boolean; onStateChange?: (state: string) => void }) {
+export function DesktopUpdater({ service: override, enabled = true, autoCheck = true, onStateChange, request }: { service?: UpdateService; enabled?: boolean; autoCheck?: boolean; onStateChange?: (state: string) => void; request?: { id: number; action: "check" | "notes" } }) {
   const [service, setService] = useState<UpdateService | null>(override ?? null), [version, setVersion] = useState(CURRENT_VERSION);
   const [state, setState] = useState<UpdateState>("idle"), [update, setUpdate] = useState<UpdateInfo | null>(null), [error, setError] = useState<string | null>(null);
   const [offer, setOffer] = useState(false), [notes, setNotes] = useState<{ version: string; markdown: string } | null>(null);
   const [progress, setProgress] = useState<{ downloadedBytes: number; contentLength?: number }>({ downloadedBytes: 0 });
-  const checked = useRef(false), mounted = useRef(true);
+  const checked = useRef(false), mounted = useRef(true), handledRequest = useRef(0);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => { onStateChange?.(state); }, [state, onStateChange]);
   useEffect(() => { if (override || !enabled) return; void loadDesktopUpdateService().then(value => { if (mounted.current) setService(value); }).catch(() => { if (mounted.current) setError("업데이트를 확인할 수 없습니다."); }); }, [override, enabled]);
@@ -27,6 +27,12 @@ export function DesktopUpdater({ service: override, enabled = true, autoCheck = 
     } catch (reason) { if (mounted.current) { setError(updateErrorMessage(reason, "check")); setState("error"); } }
   }, [service]);
   useEffect(() => { if (!service || !autoCheck || checked.current) return; checked.current = true; const timer = window.setTimeout(() => void check(false), 1500); return () => { window.clearTimeout(timer); checked.current = false; }; }, [service, autoCheck, check]);
+  useEffect(() => {
+    if (!request || request.id === handledRequest.current || (request.action === "check" && !service)) return;
+    handledRequest.current = request.id;
+    if (request.action === "notes") setNotes({ version, markdown: CURRENT_RELEASE_NOTES });
+    else void check(true);
+  }, [request, service, version, check]);
   const later = () => { if (update) dismissedVersions.add(update.version); setOffer(false); };
   const download = async () => {
     if (!update) return; setOffer(false); setState("downloading"); setError(null); setProgress({ downloadedBytes: 0 });

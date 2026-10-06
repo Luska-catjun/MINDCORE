@@ -6,10 +6,14 @@ interface MessageInputProps {
   onSend: (content: string) => void;
   disabled: boolean;
   sending?: boolean;
+  draft?: string;
+  onDraftChange?: (value: string) => void;
 }
 
-export function MessageInput({ onSend, disabled, sending = false }: MessageInputProps) {
-  const [value, setValue] = useState("");
+export function MessageInput({ onSend, disabled, sending = false, draft, onDraftChange }: MessageInputProps) {
+  const [localValue, setLocalValue] = useState("");
+  const value = draft ?? localValue;
+  const setValue = (next: string) => { setLocalValue(next); onDraftChange?.(next); };
 
   const handleSend = () => {
     const trimmed = value.trim();

@@ -129,3 +129,20 @@ button { color: inherit; }
 .release-notes a { color: #80ddd0; text-decoration: underline; }
 .release-notes code { background: #080f1c; padding: 2px 5px; border-radius: 4px; }
 .feedback-preview { white-space: pre-wrap; overflow-wrap: anywhere; padding: 14px; background: #080f1c; border-radius: 12px; }
+
+/* Product navigation keeps domain lists in the content area. */
+.workspace-nav { flex: 0 0 auto; gap: 8px; }
+.workspace-nav-item { min-height: 46px; border-radius: 12px; transition: background .16s, color .16s, border-color .16s; }
+.session-toolbar { justify-content: space-between; min-height: 54px; }
+.main-area > .product-surface { display: flex; flex: 1; min-height: 0; flex-direction: column; }
+.main-area > .product-surface[hidden] { display: none; }
+.data-navigation, .app-settings { padding: 22px 28px; }
+.data-navigation { flex: 0 0 auto; border-bottom: 1px solid var(--line); }
+.data-navigation h1, .app-settings h1 { margin: 0 0 16px; font-size: 24px; }
+.compact-subnav { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.compact-subnav button, .settings-card button, .app-settings > button { padding: 10px 16px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--panel); color: var(--text); cursor: pointer; transition: border-color .16s, background .16s; }
+.compact-subnav button[aria-current], .compact-subnav button:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+.compact-subnav button:focus-visible, .workspace-nav-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.app-settings { flex: 1; min-height: 0; overflow: auto; }
+.settings-card { margin-top: 22px; padding: 24px; border: 1px solid var(--line); border-radius: 18px; background: var(--panel); }
+.settings-card button { margin: 8px 8px 0 0; }

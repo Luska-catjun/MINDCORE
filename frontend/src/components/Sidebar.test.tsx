@@ -5,8 +5,8 @@ import { Sidebar } from "./Sidebar";
 describe("Sidebar proactive unread badge", () => {
   it("shows unread proactive count on Chat and omits it at zero", () => {
     const props = {
-      activeView: "messages" as const,
-      onViewChange: vi.fn(),
+      activeSection: "data" as const,
+      onSectionChange: vi.fn(),
       isOpen: false,
       onClose: vi.fn(),
       backendStatus: "connected" as const,
@@ -17,9 +17,10 @@ describe("Sidebar proactive unread badge", () => {
     expect(screen.queryByLabelText(/unread proactive messages/)).toBeNull();
   });
 
-  it("exposes Persona Connection and removes deprecated sync navigation", () => {
-    render(<Sidebar activeView="chat" onViewChange={vi.fn()} isOpen={false} onClose={vi.fn()} backendStatus="connected" />);
-    expect(screen.getByRole("button", { name: "Persona Connection" })).toBeTruthy();
+  it("exposes only four product entries and removes domain navigation", () => {
+    render(<Sidebar activeSection="chat" onSectionChange={vi.fn()} isOpen={false} onClose={vi.fn()} backendStatus="connected" />);
+    expect(screen.getAllByRole("button").map(item => item.textContent)).toEqual(["대화", "데이터 관리", "앱 설정", "피드백"]);
+    expect(screen.queryByRole("button", { name: "Persona Connection" })).toBeNull();
     expect(screen.queryByRole("button", { name: /sync|devices/i })).toBeNull();
     expect(screen.queryByRole("button", { name: "Debug" })).toBeNull();
   });

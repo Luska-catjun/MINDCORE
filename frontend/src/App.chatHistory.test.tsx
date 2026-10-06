@@ -107,10 +107,12 @@ describe("Chat history across Observation views", () => {
   it("restores durable history after Chat → Observation → Chat without resetting the selected conversation", async () => {
     await renderReadyApp();
 
+    await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
+    await userEvent.click(screen.getByRole("button", { name: "기억" }));
     await userEvent.click(screen.getByRole("button", { name: "Memory" }));
     expect(screen.getByTestId("workspace").textContent).toContain("Observation: memory");
 
-    await userEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await userEvent.click(screen.getByRole("button", { name: "대화" }));
     await screen.findByText("A");
     expect(screen.getByText("B")).toBeTruthy();
     expect(apiMock.listMessages).toHaveBeenLastCalledWith("conversation-x", 200, 0, true);
@@ -129,8 +131,10 @@ describe("Chat history across Observation views", () => {
     await userEvent.click(screen.getByRole("button", { name: "전송" }));
     await screen.findByText("Diana reply");
 
+    await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
+    await userEvent.click(screen.getByRole("button", { name: "기억" }));
     await userEvent.click(screen.getByRole("button", { name: "Episodes" }));
-    await userEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await userEvent.click(screen.getByRole("button", { name: "대화" }));
 
     await screen.findByText("C");
     expect(screen.getByText("Diana reply")).toBeTruthy();
@@ -152,8 +156,10 @@ describe("Chat history across Observation views", () => {
     await userEvent.click(screen.getByRole("button", { name: "전송" }));
     expect(screen.getByText("C")).toBeTruthy();
 
+    await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
+    await userEvent.click(screen.getByRole("button", { name: "기억" }));
     await userEvent.click(screen.getByRole("button", { name: "Memory" }));
-    await userEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await userEvent.click(screen.getByRole("button", { name: "대화" }));
     await waitFor(() => expect(apiMock.listMessages).toHaveBeenCalledTimes(2));
     expect(screen.getByText(/가 생각 중\.\.\.$/)).toBeTruthy();
     expect((screen.getByRole("button", { name: "전송 중..." }) as HTMLButtonElement).disabled).toBe(true);
@@ -182,8 +188,10 @@ describe("Chat history across Observation views", () => {
 
     fireEvent.change(screen.getByPlaceholderText("메시지를 입력하세요..."), { target: { value: "C" } });
     await userEvent.click(screen.getByRole("button", { name: "전송" }));
+    await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
+    await userEvent.click(screen.getByRole("button", { name: "기억" }));
     await userEvent.click(screen.getByRole("button", { name: "Memory" }));
-    await userEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await userEvent.click(screen.getByRole("button", { name: "대화" }));
     await waitFor(() => expect(apiMock.listMessages).toHaveBeenCalledTimes(2));
 
     remountFetch.resolve(remountRows(durableMessages, durableUser, durableAssistant));
@@ -204,12 +212,14 @@ describe("Chat history across Observation views", () => {
 
     fireEvent.change(screen.getByPlaceholderText("메시지를 입력하세요..."), { target: { value: "C" } });
     await userEvent.click(screen.getByRole("button", { name: "전송" }));
+    await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
+    await userEvent.click(screen.getByRole("button", { name: "기억" }));
     await userEvent.click(screen.getByRole("button", { name: "Memory" }));
     durableMessages = [...durableMessages, durableUser, durableAssistant];
     send.resolve({ user_message: durableUser, diana_message: durableAssistant });
     await waitFor(() => expect(window.__DIANA_CHAT_DEBUG__?.cache?.map((item) => item.id)).toEqual(["a", "b", "c", "d"]));
 
-    await userEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await userEvent.click(screen.getByRole("button", { name: "대화" }));
     await screen.findByText("D");
     expect(screen.getAllByText("C")).toHaveLength(1);
     expect(screen.getAllByText("D")).toHaveLength(1);
@@ -236,8 +246,10 @@ describe("Chat history across Observation views", () => {
 
   it("re-fetches the same selected conversation after a real Chat unmount/remount", async () => {
     await renderReadyApp();
+    await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
+    await userEvent.click(screen.getByRole("button", { name: "상태" }));
     await userEvent.click(screen.getByRole("button", { name: "Emotion" }));
-    await userEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await userEvent.click(screen.getByRole("button", { name: "대화" }));
 
     await waitFor(() => expect(apiMock.listMessages).toHaveBeenCalledTimes(2));
     expect(apiMock.listMessages.mock.calls).toEqual([
@@ -249,12 +261,13 @@ describe("Chat history across Observation views", () => {
   it("invalidates the canonical Chat cache after an Observation message deletion", async () => {
     await renderReadyApp();
 
+    await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
     await userEvent.click(screen.getByRole("button", { name: "Messages" }));
     await userEvent.click(screen.getByRole("button", { name: "Simulate durable message deletion" }));
     durableMessages = durableMessages.filter((item) => item.id !== "b");
     expect(window.__DIANA_CHAT_DEBUG__?.cache?.map((item) => item.id)).toEqual(["a"]);
 
-    await userEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await userEvent.click(screen.getByRole("button", { name: "대화" }));
     await screen.findByText("A");
     expect(screen.queryByText("B")).toBeNull();
     await waitFor(() => expect(apiMock.listMessages).toHaveBeenCalledTimes(2));
@@ -276,8 +289,10 @@ describe("Chat history across Observation views", () => {
     await userEvent.click(screen.getByRole("button", { name: "전송" }));
     await screen.findByText("Diana reply");
 
+    await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
+    await userEvent.click(screen.getByRole("button", { name: "기억" }));
     await userEvent.click(screen.getByRole("button", { name: "Memory" }));
-    await userEvent.click(screen.getByRole("button", { name: "Chat" }));
+    await userEvent.click(screen.getByRole("button", { name: "대화" }));
     await screen.findByText("C");
     expect(screen.getByText("Diana reply")).toBeTruthy();
     expect(apiMock.listMessages).toHaveBeenLastCalledWith("conversation-x", 200, 0, true);

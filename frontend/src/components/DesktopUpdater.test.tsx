@@ -39,4 +39,13 @@ describe("DesktopUpdater", () => {
  it("check failure is nonfatal and allows retry", async () => {
   service.check = vi.fn().mockRejectedValue(new Error("private-token")); render(<DesktopUpdater service={service} autoCheck={false} />); await userEvent.click(screen.getByRole("button", {name:"업데이트 확인"})); expect(await screen.findByText("업데이트를 확인할 수 없습니다.")).toBeTruthy(); expect(screen.queryByText("private-token")).toBeNull(); expect(screen.getByRole("button",{name:"다시 시도"})).toBeTruthy();
  });
+ it("settings requests use the existing updater and do not replay a handled request", async () => {
+  const result = render(<DesktopUpdater service={service} autoCheck={false} request={{id:1,action:"check"}} />);
+  await screen.findByText("최신 버전을 사용 중입니다."); expect(service.check).toHaveBeenCalledTimes(1);
+  result.rerender(<DesktopUpdater service={service} autoCheck={false} request={{id:1,action:"check"}} />);
+  expect(service.check).toHaveBeenCalledTimes(1);
+  result.rerender(<DesktopUpdater service={service} autoCheck={false} request={{id:2,action:"notes"}} />);
+  expect(await screen.findByRole("dialog",{name:"업데이트 내용"})).toBeTruthy();
+ });
+
 });

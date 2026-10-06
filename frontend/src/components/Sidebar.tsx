@@ -1,8 +1,9 @@
 export type WorkspaceView = "chat" | "messages" | "memory" | "emotion" | "knowledge" | "preferences" | "episodes" | "decisions" | "intentions" | "narratives" | "self-model" | "world-model" | "relationship" | "goals-needs" | "stats" | "debug" | "persona-connection";
 
+export type ProductSection = "chat" | "data" | "settings" | "feedback";
 interface SidebarProps {
-  activeView: WorkspaceView;
-  onViewChange: (view: WorkspaceView) => void;
+  activeSection: ProductSection;
+  onSectionChange: (section: ProductSection) => void;
   isOpen: boolean;
   onClose: () => void;
   backendStatus: "checking" | "connected" | "error";
@@ -10,28 +11,14 @@ interface SidebarProps {
   unreadCount?: number;
 }
 
-const NAVIGATION: Array<{ id: WorkspaceView; label: string }> = [
-  { id: "chat", label: "Chat" },
-  { id: "messages", label: "Messages" },
-  { id: "memory", label: "Memory" },
-  { id: "emotion", label: "Emotion" },
-  { id: "knowledge", label: "Knowledge" },
-  { id: "preferences", label: "Preferences" },
-  { id: "episodes", label: "Episodes" },
-  { id: "decisions", label: "Decisions" },
-  { id: "intentions", label: "Intentions" },
-  { id: "narratives", label: "Narrative" },
-  { id: "self-model", label: "Self Model" },
-  { id: "world-model", label: "World Model" },
-  { id: "relationship", label: "Relationship" },
-  { id: "goals-needs", label: "Goals & Needs" },
-  { id: "stats", label: "Stats" },
-  { id: "persona-connection", label: "Persona Connection" },
+const NAVIGATION: Array<{ id: ProductSection; label: string }> = [
+  { id: "chat", label: "대화" }, { id: "data", label: "데이터 관리" },
+  { id: "settings", label: "앱 설정" }, { id: "feedback", label: "피드백" },
 ];
 
 export function Sidebar({
-  activeView,
-  onViewChange,
+  activeSection,
+  onSectionChange,
   isOpen,
   onClose,
   backendStatus,
@@ -54,11 +41,11 @@ export function Sidebar({
               type="button"
               key={item.id}
               className={`workspace-nav-item ${
-                activeView === item.id ? "workspace-nav-item-active" : ""
+                activeSection === item.id ? "workspace-nav-item-active" : ""
               }`}
-              aria-current={activeView === item.id ? "page" : undefined}
+              aria-current={activeSection === item.id ? "page" : undefined}
               onClick={() => {
-                onViewChange(item.id);
+                onSectionChange(item.id);
                 onClose();
               }}
             >

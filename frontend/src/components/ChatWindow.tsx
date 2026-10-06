@@ -24,6 +24,8 @@ interface ChatWindowProps {
   messages: LocalMessage[];
   historyRevision: number;
   sending: boolean;
+  draft?: string;
+  onDraftChange?: (value: string) => void;
   sendBlocked?: boolean;
   sendBlockedMessage?: string;
   onDurableMessagesLoaded: (conversationId: string, messages: LocalMessage[], expectedRevision: number) => void;
@@ -46,6 +48,8 @@ export function ChatWindow({
   messages,
   historyRevision,
   sending,
+  draft,
+  onDraftChange,
   sendBlocked = false,
   sendBlockedMessage = "Protected actions are unavailable.",
   onDurableMessagesLoaded,
@@ -217,7 +221,7 @@ export function ChatWindow({
 
       {sending && <div className="thinking-indicator">{personaDisplayName}가 생각 중...</div>}
       {sendBlocked && <p className="send-blocked" role="status">{sendBlockedMessage}</p>}
-      <MessageInput onSend={handleSend} disabled={loading || sendBlocked} sending={sending} />
+      <MessageInput draft={draft} onDraftChange={onDraftChange} onSend={handleSend} disabled={loading || sendBlocked} sending={sending} />
     </div>
   );
 }

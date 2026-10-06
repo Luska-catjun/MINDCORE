@@ -17,6 +17,9 @@ import { ChatWindow } from "./components/ChatWindow";
 import { WorkspacePanel } from "./components/WorkspacePanel";
 import { LoginScreen } from "./components/LoginScreen";
 import { SetupWizard } from "./components/SetupWizard";
+import { DataNavigation, type DataView } from "./components/DataNavigation";
+import { AppSettings } from "./components/AppSettings";
+import type { ProductSection } from "./components/Sidebar";
 import { ProductSupport } from "./components/ProductSupport";
 import { invoke } from "@tauri-apps/api/core";
 import "./buildRevision";
@@ -39,7 +42,7 @@ type SetupState = "checking" | "needed" | "configured";
 const healthIsConnected = (health: { status: string; db?: string }) =>
   health.db ? health.db === "connected" : health.status === "ok";
 
-function MindCoreWorkspace({ onProductState }: { onProductState: (ready: boolean, provider?: string, connection?: string) => void }) {
+function MindCoreWorkspace({ onProductState, onFeedback, onUpdate }: { onFeedback: () => void; onUpdate: (action: "check" | "notes") => void; onProductState: (ready: boolean, provider?: string, connection?: string) => void }) {
   const [personaDisplayName, setPersonaDisplayName] = useState(DEFAULT_PERSONA_DISPLAY_NAME);
   const [userDisplayName, setUserDisplayName] = useState(DEFAULT_USER_DISPLAY_NAME);
   const [activePersonaId, setActivePersonaId] = useState<string | null>(null);
@@ -55,6 +58,10 @@ function MindCoreWorkspace({ onProductState }: { onProductState: (ready: boolean
   const sessionGenerationRef = useRef(0);
   const [conversationLoading, setConversationLoading] = useState(true);
   const [activeView, setActiveView] = useState<WorkspaceView>("chat");
+  const [activeSection, setActiveSection] = useState<ProductSection>("chat");
+  const [dataView, setDataView] = useState<DataView>("messages");
+  const [dataVisited, setDataVisited] = useState(false);
+  const [chatDraft, setChatDraft] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [backendStatus, setBackendStatus] = useState<BackendStatus>("checking");
   const [personaBindingState, setPersonaBindingState] = useState<string>("NOT_APPLICABLE");
@@ -370,9 +377,13 @@ function MindCoreWorkspace({ onProductState }: { onProductState: (ready: boolean
     }
   }, []);
 
-  const handleViewChange = (view: WorkspaceView) => {
-    setActiveView(view);
+  const handleSectionChange = (section: ProductSection) => {
+    setActiveSection(section);
+    if (section === "data") { setDataVisited(true); setActiveView(dataView); }
+    else setActiveView(section === "chat" ? "chat" : "persona-connection");
+    if (section === "feedback") onFeedback();
   };
+  const configurePersona = () => { void invoke("stop_mindcore_backend").finally(() => { setReconfiguring(true); setSetupState("needed"); }); };
 
   const switchPersona = useCallback(async (personaId: string) => {
     if (!isDesktopRuntime() || personaId === activePersonaId) return;
@@ -384,6 +395,8 @@ function MindCoreWorkspace({ onProductState }: { onProductState: (ready: boolean
     setChatHistory({});
     setPendingSends({});
     setActiveView("chat");
+    setActiveSection("chat");
+    setChatDraft("");
     try {
       const active = await invoke<PersonaSummary>("switch_active_persona", { personaId });
       setActivePersonaId(active.persona_id);
@@ -399,7 +412,7 @@ function MindCoreWorkspace({ onProductState }: { onProductState: (ready: boolean
     setProactiveToast(null);
     window.localStorage.setItem(`${MAIN_CONVERSATION_STORAGE_KEY}:${event.persona_id}`, event.conversation_id);
     if (event.persona_id !== activePersonaId) await switchPersona(event.persona_id);
-    else { setMainConversationId(event.conversation_id); setActiveView("chat"); }
+    else { setMainConversationId(event.conversation_id); setActiveView("chat"); setActiveSection("chat"); }
     const unreadKey = proactiveUnreadKey(event.persona_id, event.conversation_id);
     setUnreadByConversation((current) => { const next = { ...current }; delete next[unreadKey]; return next; });
     try {
@@ -586,8 +599,8 @@ function MindCoreWorkspace({ onProductState }: { onProductState: (ready: boolean
   return (
     <div className="app-shell">
       <Sidebar
-        activeView={activeView}
-        onViewChange={handleViewChange}
+        activeSection={activeSection}
+        onSectionChange={handleSectionChange}
         isOpen={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
         backendStatus={backendStatus}
@@ -597,7 +610,8 @@ function MindCoreWorkspace({ onProductState }: { onProductState: (ready: boolean
 
       <main className="main-area">
         <div className="session-toolbar">
-          {isDesktopRuntime() && <><label className="persona-selector"><PersonaAvatar personaId={activePersona?.persona_id ?? activePersonaId} displayName={activePersona?.display_name ?? personaDisplayName} avatarExtension={activePersona?.avatar_extension} revision={avatarRevision} className="persona-avatar-small" />Persona<select aria-label="Current Persona" value={activePersonaId ?? ""} onChange={(event) => void switchPersona(event.target.value)}>{personas.map((persona) => <option key={persona.persona_id} value={persona.persona_id}>{persona.display_name}</option>)}</select></label><button type="button" onClick={() => setPersonaManagerMode("add")}>+ Add Persona</button><button type="button" onClick={() => setPersonaManagerMode("manage")}>Manage Personas</button><button type="button" onClick={() => void invoke("open_configuration_folder")}>Open Configuration</button><button type="button" onClick={() => void invoke("open_identity_file")}>Open Identity File</button><button type="button" onClick={() => { void invoke("stop_mindcore_backend").finally(() => { setReconfiguring(true); setSetupState("needed"); }); }}>Reconfigure Active Persona</button></>}
+          <button className="navigation-toggle" onClick={() => setSidebarOpen(open => !open)}>메뉴</button>
+          {isDesktopRuntime() && <label className="persona-selector"><PersonaAvatar personaId={activePersona?.persona_id ?? activePersonaId} displayName={activePersona?.display_name ?? personaDisplayName} avatarExtension={activePersona?.avatar_extension} revision={avatarRevision} className="persona-avatar-small" />Persona<select aria-label="Current Persona" value={activePersonaId ?? ""} onChange={(event) => void switchPersona(event.target.value)}>{personas.map((persona) => <option key={persona.persona_id} value={persona.persona_id}>{persona.display_name}</option>)}</select></label>}
           {!isDesktopRuntime() && <><span>Private access</span><button type="button" onClick={handleLogout}>Log out</button></>}
         </div>
         {backendStatus === "error" && (
@@ -606,8 +620,10 @@ function MindCoreWorkspace({ onProductState }: { onProductState: (ready: boolean
         {globalError && <div className="error-banner error-banner-top">{globalError}</div>}
 
 
-        {activeView === "chat" ? (
+        {activeSection === "chat" && (
           <ChatWindow
+            draft={chatDraft}
+            onDraftChange={setChatDraft}
             personaDisplayName={personaDisplayName}
             userDisplayName={userDisplayName}
             personaAvatarExtension={activePersona?.avatar_extension}
@@ -628,17 +644,18 @@ function MindCoreWorkspace({ onProductState }: { onProductState: (ready: boolean
             onSendSucceeded={handleSendSucceeded}
             onSendFailed={handleSendFailed}
           />
-        ) : activeView === "persona-connection" ? (
-          <PersonaConnection personaName={activePersona?.display_name ?? personaDisplayName} bindingState={personaBindingState} runtimeConnected={backendStatus === "connected"} databaseStatus={databaseStatus} onReconnect={reconnectPersona} />
-        ) : (
-          <WorkspacePanel
-            key={activePersonaId ?? "web"}
-            view={activeView}
-            backendStatus={backendStatus}
-            onToggleSidebar={() => setSidebarOpen((open) => !open)}
-            onMessageDeleted={handleMessageDeleted}
-          />
         )}
+        {dataVisited && <div className="product-surface" hidden={activeSection !== "data"}>
+          <DataNavigation view={dataView} onChange={view => { setDataView(view); setActiveView(view); }} />
+          <WorkspacePanel key={activePersonaId ?? "web"} view={dataView} backendStatus={backendStatus} onToggleSidebar={() => setSidebarOpen(open => !open)} onMessageDeleted={handleMessageDeleted} />
+        </div>}
+        <div className="product-surface" hidden={activeSection !== "settings"}>
+          <AppSettings onConfigure={configurePersona} onOpenConfiguration={() => void invoke("open_configuration_folder")} onUpdate={onUpdate}
+            personaControls={<><p>현재 Persona: {personaDisplayName}</p><button onClick={() => setPersonaManagerMode("add")}>Add Persona</button><button onClick={() => setPersonaManagerMode("manage")}>Manage Personas</button><button onClick={() => void invoke("open_identity_file")}>Open Identity File</button><button onClick={configurePersona}>Reconfigure Active Persona</button></>}
+            connection={<PersonaConnection personaName={activePersona?.display_name ?? personaDisplayName} bindingState={personaBindingState} runtimeConnected={backendStatus === "connected"} databaseStatus={databaseStatus} onReconnect={reconnectPersona} />} />
+        </div>
+        {activeSection === "feedback" && <section className="app-settings"><h1>피드백</h1><p>MindCore에 대한 의견을 남겨 주세요. 전송 전에 내용을 확인할 수 있습니다.</p><button onClick={onFeedback}>Feedback</button></section>}
+
       </main>
       {personaManagerMode && <PersonaManager mode={personaManagerMode} personas={personas} avatarRevision={avatarRevision} onClose={() => setPersonaManagerMode(null)} onChanged={handlePersonasChanged} />}
       {proactiveToast && <button className="proactive-toast" type="button" onClick={() => void openProactiveEvent(proactiveToast)}>{personaDisplayName}가 새 메시지를 보냈어요. 열기</button>}
@@ -648,7 +665,11 @@ function MindCoreWorkspace({ onProductState }: { onProductState: (ready: boolean
 
 function App() {
   const [support, setSupport] = useState<{ ready: boolean; provider?: string; connection?: string }>({ ready: false });
+  const [feedbackRequest, setFeedbackRequest] = useState(0);
+  const [updateRequest, setUpdateRequest] = useState<{ id: number; action: "check" | "notes" }>();
+  const onFeedback = () => setFeedbackRequest(value => value + 1);
+  const onUpdate = (action: "check" | "notes") => setUpdateRequest(value => ({ id: (value?.id ?? 0) + 1, action }));
   const onProductState = useCallback((ready: boolean, provider?: string, connection?: string) => setSupport({ ready, provider, connection }), []);
-  return <><MindCoreWorkspace onProductState={onProductState} />{isDesktopRuntime() && <ProductSupport {...support} />}</>;
+  return <><MindCoreWorkspace onProductState={onProductState} onFeedback={onFeedback} onUpdate={onUpdate} />{isDesktopRuntime() && <ProductSupport {...support} feedbackRequest={feedbackRequest} updateRequest={updateRequest} />}</>;
 }
 export default App;
