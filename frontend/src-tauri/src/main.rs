@@ -299,6 +299,14 @@ fn existing_secret(app: &AppHandle, key: &str) -> Option<String> {
         .ok()
         .and_then(|text| env_value_from(&text, key))
 }
+fn database_credential_output(stdout: &[u8]) -> String {
+    // tauri-plugin-shell's output() appends a newline to each stdout event,
+    // including the credential CLI's otherwise newline-free token. Remove
+    // that transport framing before using the token in an HTTP auth header.
+    String::from_utf8_lossy(stdout)
+        .trim_end_matches(['\r', '\n'])
+        .to_string()
+}
 fn database_credential(
     app: &AppHandle,
     action: &str,
@@ -315,7 +323,7 @@ fn database_credential(
     if !output.status.success() {
         return Err("The OS credential store is unavailable or the database credential is missing.".into());
     }
-    let result = String::from_utf8_lossy(&output.stdout).into_owned();
+    let result = database_credential_output(&output.stdout);
     if action == "get" { Ok(result) } else { Ok(result.trim().to_string()) }
 }
 fn profile_credential_id(path: &Path) -> Result<String, String> {
@@ -1887,6 +1895,23 @@ fn stop_sidecar(app: &AppHandle) {
 #[cfg(test)]
 mod setup_validation_tests {
     use super::*;
+
+    #[test]
+    fn database_credential_output_removes_shell_line_framing() {
+        for stdout in [
+            b"synthetic-token".as_slice(),
+            b"synthetic-token\n".as_slice(),
+            b"synthetic-token\r\n".as_slice(),
+        ] {
+            assert_eq!(database_credential_output(stdout), "synthetic-token");
+        }
+    }
+
+    #[test]
+    fn database_credential_output_preserves_non_framing_bytes() {
+        assert_eq!(database_credential_output(b" synthetic-token \n"), " synthetic-token ");
+        assert_eq!(database_credential_output(b"\n"), "");
+    }
 
     #[test]
     fn manual_sync_storage_contract_rejects_remote_before_sidecar_state() {
