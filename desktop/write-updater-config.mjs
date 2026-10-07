@@ -14,11 +14,9 @@ const updaterDisabled = process.env.MINDCORE_UPDATER_DISABLED === "1";
 const endpoint = process.env.MINDCORE_UPDATE_ENDPOINT
   ?? "https://updates.mindcore.invalid/{{target}}/{{arch}}/{{current_version}}";
 const pubkey = process.env.MINDCORE_UPDATER_PUBKEY ?? developmentPublicKey;
-const permissions = [
-  "core:default",
-  ...(updaterDisabled ? [] : ["updater:default"]),
-  "process:default",
-];
+// Preserve the app's canonical notification/dialog grants in both build modes.
+const capability = JSON.parse(await readFile(resolve(desktopRoot, "capabilities/default.json"), "utf8"));
+const permissions = capability.permissions.filter(permission => !updaterDisabled || permission !== "updater:default");
 
 if (!updaterDisabled && !endpoint.startsWith("https://")) {
   throw new Error("MINDCORE_UPDATE_ENDPOINT must use HTTPS.");

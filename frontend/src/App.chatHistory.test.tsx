@@ -109,7 +109,7 @@ describe("Chat history across Observation views", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
     await userEvent.click(screen.getByRole("button", { name: "기억" }));
-    await userEvent.click(screen.getByRole("button", { name: "Memory" }));
+    await userEvent.click(screen.getByRole("button", { name: "장기 기억" }));
     expect(screen.getByTestId("workspace").textContent).toContain("Observation: memory");
 
     await userEvent.click(screen.getByRole("button", { name: "대화" }));
@@ -133,7 +133,7 @@ describe("Chat history across Observation views", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
     await userEvent.click(screen.getByRole("button", { name: "기억" }));
-    await userEvent.click(screen.getByRole("button", { name: "Episodes" }));
+    await userEvent.click(screen.getByRole("button", { name: "에피소드" }));
     await userEvent.click(screen.getByRole("button", { name: "대화" }));
 
     await screen.findByText("C");
@@ -158,7 +158,7 @@ describe("Chat history across Observation views", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
     await userEvent.click(screen.getByRole("button", { name: "기억" }));
-    await userEvent.click(screen.getByRole("button", { name: "Memory" }));
+    await userEvent.click(screen.getByRole("button", { name: "장기 기억" }));
     await userEvent.click(screen.getByRole("button", { name: "대화" }));
     await waitFor(() => expect(apiMock.listMessages).toHaveBeenCalledTimes(2));
     expect(screen.getByText(/가 생각 중\.\.\.$/)).toBeTruthy();
@@ -190,7 +190,7 @@ describe("Chat history across Observation views", () => {
     await userEvent.click(screen.getByRole("button", { name: "전송" }));
     await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
     await userEvent.click(screen.getByRole("button", { name: "기억" }));
-    await userEvent.click(screen.getByRole("button", { name: "Memory" }));
+    await userEvent.click(screen.getByRole("button", { name: "장기 기억" }));
     await userEvent.click(screen.getByRole("button", { name: "대화" }));
     await waitFor(() => expect(apiMock.listMessages).toHaveBeenCalledTimes(2));
 
@@ -214,7 +214,7 @@ describe("Chat history across Observation views", () => {
     await userEvent.click(screen.getByRole("button", { name: "전송" }));
     await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
     await userEvent.click(screen.getByRole("button", { name: "기억" }));
-    await userEvent.click(screen.getByRole("button", { name: "Memory" }));
+    await userEvent.click(screen.getByRole("button", { name: "장기 기억" }));
     durableMessages = [...durableMessages, durableUser, durableAssistant];
     send.resolve({ user_message: durableUser, diana_message: durableAssistant });
     await waitFor(() => expect(window.__DIANA_CHAT_DEBUG__?.cache?.map((item) => item.id)).toEqual(["a", "b", "c", "d"]));
@@ -248,7 +248,7 @@ describe("Chat history across Observation views", () => {
     await renderReadyApp();
     await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
     await userEvent.click(screen.getByRole("button", { name: "상태" }));
-    await userEvent.click(screen.getByRole("button", { name: "Emotion" }));
+    await userEvent.click(screen.getByRole("button", { name: "감정" }));
     await userEvent.click(screen.getByRole("button", { name: "대화" }));
 
     await waitFor(() => expect(apiMock.listMessages).toHaveBeenCalledTimes(2));
@@ -262,7 +262,7 @@ describe("Chat history across Observation views", () => {
     await renderReadyApp();
 
     await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
-    await userEvent.click(screen.getByRole("button", { name: "Messages" }));
+    await userEvent.click(screen.getByRole("button", { name: "메시지" }));
     await userEvent.click(screen.getByRole("button", { name: "Simulate durable message deletion" }));
     durableMessages = durableMessages.filter((item) => item.id !== "b");
     expect(window.__DIANA_CHAT_DEBUG__?.cache?.map((item) => item.id)).toEqual(["a"]);
@@ -291,7 +291,7 @@ describe("Chat history across Observation views", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "데이터 관리" }));
     await userEvent.click(screen.getByRole("button", { name: "기억" }));
-    await userEvent.click(screen.getByRole("button", { name: "Memory" }));
+    await userEvent.click(screen.getByRole("button", { name: "장기 기억" }));
     await userEvent.click(screen.getByRole("button", { name: "대화" }));
     await screen.findByText("C");
     expect(screen.getByText("Diana reply")).toBeTruthy();

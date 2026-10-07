@@ -18,6 +18,7 @@ import { WorkspacePanel } from "./components/WorkspacePanel";
 import { LoginScreen } from "./components/LoginScreen";
 import { SetupWizard } from "./components/SetupWizard";
 import { DataNavigation, type DataView } from "./components/DataNavigation";
+import { ProactiveSettingsPanel } from "./components/ProactiveSettingsPanel";
 import { AppSettings } from "./components/AppSettings";
 import type { ProductSection } from "./components/Sidebar";
 import { ProductSupport } from "./components/ProductSupport";
@@ -42,7 +43,7 @@ type SetupState = "checking" | "needed" | "configured";
 const healthIsConnected = (health: { status: string; db?: string }) =>
   health.db ? health.db === "connected" : health.status === "ok";
 
-function MindCoreWorkspace({ onProductState, onFeedback, onUpdate }: { onFeedback: () => void; onUpdate: (action: "check" | "notes") => void; onProductState: (ready: boolean, provider?: string, connection?: string) => void }) {
+function MindCoreWorkspace({ onProductState, onFeedback, onUpdateSurface }: { onUpdateSurface: (node: HTMLDivElement | null) => void; onFeedback: () => void; onProductState: (ready: boolean, provider?: string, connection?: string) => void }) {
   const [personaDisplayName, setPersonaDisplayName] = useState(DEFAULT_PERSONA_DISPLAY_NAME);
   const [userDisplayName, setUserDisplayName] = useState(DEFAULT_USER_DISPLAY_NAME);
   const [activePersonaId, setActivePersonaId] = useState<string | null>(null);
@@ -60,6 +61,7 @@ function MindCoreWorkspace({ onProductState, onFeedback, onUpdate }: { onFeedbac
   const [activeView, setActiveView] = useState<WorkspaceView>("chat");
   const [activeSection, setActiveSection] = useState<ProductSection>("chat");
   const [dataView, setDataView] = useState<DataView>("messages");
+  const [settingsTab, setSettingsTab] = useState("Persona");
   const [dataVisited, setDataVisited] = useState(false);
   const [chatDraft, setChatDraft] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -650,11 +652,12 @@ function MindCoreWorkspace({ onProductState, onFeedback, onUpdate }: { onFeedbac
           <WorkspacePanel key={activePersonaId ?? "web"} view={dataView} backendStatus={backendStatus} onToggleSidebar={() => setSidebarOpen(open => !open)} onMessageDeleted={handleMessageDeleted} />
         </div>}
         <div className="product-surface" hidden={activeSection !== "settings"}>
-          <AppSettings onConfigure={configurePersona} onOpenConfiguration={() => void invoke("open_configuration_folder")} onUpdate={onUpdate}
-            personaControls={<><p>현재 Persona: {personaDisplayName}</p><button onClick={() => setPersonaManagerMode("add")}>Add Persona</button><button onClick={() => setPersonaManagerMode("manage")}>Manage Personas</button><button onClick={() => void invoke("open_identity_file")}>Open Identity File</button><button onClick={configurePersona}>Reconfigure Active Persona</button></>}
+          <AppSettings onUpdateSurface={onUpdateSurface} selectedTab={settingsTab} onTabChange={setSettingsTab} onConfigure={configurePersona} onOpenConfiguration={() => void invoke("open_configuration_folder")}
+            proactive={isDesktopRuntime() ? <ProactiveSettingsPanel key={activePersonaId} personaId={activePersonaId ?? undefined} onSaved={() => handlePersonasChanged(activePersonaId ?? undefined)} /> : <p>먼저 말 걸기는 Desktop 앱에서 사용할 수 있습니다.</p>}
+            personaControls={<><p>현재 Persona: {personaDisplayName}</p><button onClick={() => setPersonaManagerMode("add")}>Persona 추가</button><button onClick={() => setPersonaManagerMode("manage")}>Persona 관리</button><button onClick={() => void invoke("open_identity_file")}>Identity 파일 열기</button><button onClick={configurePersona}>현재 Persona 재설정</button></>}
             connection={<PersonaConnection personaName={activePersona?.display_name ?? personaDisplayName} bindingState={personaBindingState} runtimeConnected={backendStatus === "connected"} databaseStatus={databaseStatus} onReconnect={reconnectPersona} />} />
         </div>
-        {activeSection === "feedback" && <section className="app-settings"><h1>피드백</h1><p>MindCore에 대한 의견을 남겨 주세요. 전송 전에 내용을 확인할 수 있습니다.</p><button onClick={onFeedback}>Feedback</button></section>}
+        {activeSection === "feedback" && <section className="app-settings"><h1>피드백</h1><p>MindCore에 대한 의견을 남겨 주세요. 전송 전에 내용을 확인할 수 있습니다.</p><button onClick={onFeedback}>피드백 작성</button></section>}
 
       </main>
       {personaManagerMode && <PersonaManager mode={personaManagerMode} personas={personas} avatarRevision={avatarRevision} onClose={() => setPersonaManagerMode(null)} onChanged={handlePersonasChanged} />}
@@ -664,12 +667,11 @@ function MindCoreWorkspace({ onProductState, onFeedback, onUpdate }: { onFeedbac
 }
 
 function App() {
+  const [updateSurface, setUpdateSurface] = useState<HTMLDivElement | null>(null);
   const [support, setSupport] = useState<{ ready: boolean; provider?: string; connection?: string }>({ ready: false });
   const [feedbackRequest, setFeedbackRequest] = useState(0);
-  const [updateRequest, setUpdateRequest] = useState<{ id: number; action: "check" | "notes" }>();
   const onFeedback = () => setFeedbackRequest(value => value + 1);
-  const onUpdate = (action: "check" | "notes") => setUpdateRequest(value => ({ id: (value?.id ?? 0) + 1, action }));
   const onProductState = useCallback((ready: boolean, provider?: string, connection?: string) => setSupport({ ready, provider, connection }), []);
-  return <><MindCoreWorkspace onProductState={onProductState} onFeedback={onFeedback} onUpdate={onUpdate} />{isDesktopRuntime() && <ProductSupport {...support} feedbackRequest={feedbackRequest} updateRequest={updateRequest} />}</>;
+  return <><MindCoreWorkspace onUpdateSurface={setUpdateSurface} onProductState={onProductState} onFeedback={onFeedback} />{isDesktopRuntime() && <ProductSupport updateSurface={updateSurface} {...support} feedbackRequest={feedbackRequest} />}</>;
 }
 export default App;

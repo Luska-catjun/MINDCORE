@@ -49,3 +49,27 @@ describe("DesktopUpdater", () => {
  });
 
 });
+
+describe("settings-only update surface", () => {
+ it("keeps recommendations and notes available while settings controls are hidden", async () => {
+  const target=document.createElement("div"); target.hidden=true; document.body.appendChild(target);
+  const service: UpdateService={getCurrentVersion:vi.fn().mockResolvedValue("0.4.0"),check:vi.fn().mockResolvedValue({...update,version:"0.4.91"}),installAndRelaunch:vi.fn()};
+  const view=render(<DesktopUpdater service={service} controlsTarget={target} autoCheck={false} request={{id:1,action:"check"}}/>);
+  expect(await screen.findByRole("dialog",{name:"MindCore 업데이트"})).toBeTruthy();
+  expect(screen.queryByRole("button",{name:"업데이트 확인"})).toBeNull();
+  await userEvent.click(screen.getByRole("button",{name:"업데이트 내용 보기"})); expect(screen.getByRole("dialog",{name:"업데이트 내용"})).toBeTruthy();
+  await userEvent.click(screen.getByRole("button",{name:"닫기"})); await userEvent.click(screen.getByRole("button",{name:"나중에"}));
+  target.hidden=false; expect(screen.getByRole("button",{name:"업데이트 확인"})).toBeTruthy();
+  view.rerender(<DesktopUpdater service={service} controlsTarget={target} autoCheck={false} request={{id:1,action:"check"}}/>); expect(service.check).toHaveBeenCalledOnce();
+  view.unmount(); target.remove();
+ });
+ it("keeps update errors and retry in the settings surface across navigation", async () => {
+  const target=document.createElement("div"); document.body.appendChild(target);
+  const service: UpdateService={getCurrentVersion:vi.fn().mockResolvedValue("0.4.0"),check:vi.fn().mockRejectedValue(new Error("check failed")),installAndRelaunch:vi.fn()};
+  const view=render(<DesktopUpdater service={service} controlsTarget={target} autoCheck={false}/>);
+  await userEvent.click(screen.getByRole("button",{name:"업데이트 확인"})); expect(await screen.findByRole("status")).toBeTruthy(); expect(target.contains(screen.getByRole("button",{name:"다시 시도"}))).toBe(true);
+  target.hidden=true; expect(screen.queryByRole("status")).toBeNull(); expect(screen.queryByRole("button",{name:"다시 시도"})).toBeNull();
+  target.hidden=false; service.check=vi.fn().mockResolvedValue(null); await userEvent.click(screen.getByRole("button",{name:"다시 시도"})); expect(await screen.findByText("최신 버전을 사용 중입니다.")).toBeTruthy();
+  view.unmount(); target.remove();
+ });
+});

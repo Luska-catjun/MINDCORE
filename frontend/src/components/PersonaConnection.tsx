@@ -12,10 +12,10 @@ interface Props {
 type ProviderMetadata = { llm_provider: string; provider_key_configured: Record<string, boolean> };
 
 const bindingCopy: Record<string, { title: string; detail: string; tone: string }> = {
-  BOUND_MATCH: { title: "Persona connected", detail: "This device is connected to the selected Persona.", tone: "success" },
-  UNBOUND: { title: "Not connected yet", detail: "The Persona will bind when its first protected action runs.", tone: "warning" },
-  BOUND_MISMATCH: { title: "Persona mismatch", detail: "This MindCore is bound to a different Persona. Protected actions are paused.", tone: "error" },
-  DB_UNAVAILABLE: { title: "Connection unavailable", detail: "MindCore cannot verify the Persona connection right now.", tone: "error" },
+  BOUND_MATCH: { title: "Persona 연결됨", detail: "이 기기는 선택한 Persona에 연결되어 있습니다.", tone: "success" },
+  UNBOUND: { title: "아직 연결되지 않음", detail: "첫 번째 보호된 작업을 실행하면 Persona가 연결됩니다.", tone: "warning" },
+  BOUND_MISMATCH: { title: "Persona 불일치", detail: "다른 Persona에 연결되어 있어 보호된 작업을 멈췄습니다.", tone: "error" },
+  DB_UNAVAILABLE: { title: "연결 확인 불가", detail: "현재 Persona 연결을 확인할 수 없습니다.", tone: "error" },
 };
 
 export function PersonaConnection({ personaName, bindingState, runtimeConnected, databaseStatus, onReconnect }: Props) {
@@ -30,12 +30,12 @@ export function PersonaConnection({ personaName, bindingState, runtimeConnected,
   const providerName = provider?.llm_provider ?? "Provider";
   const providerConfigured = provider?.provider_key_configured?.[providerName] === true;
   return <section className="connection-page" aria-labelledby="connection-title">
-    <div className="connection-heading"><span className="connection-orbit" aria-hidden="true"><i /><b /></span><div><p className="workspace-kicker">MINDCORE / CONNECTION</p><h1 id="connection-title">Persona Connection</h1><p>Connection, Persona identity, and provider setup are shown separately.</p></div></div>
+    <div className="connection-heading"><span className="connection-orbit" aria-hidden="true"><i /><b /></span><div><p className="workspace-kicker">MINDCORE / 연결</p><h1 id="connection-title">Persona 연결</h1><p>저장소 연결, Persona 연결, AI 설정의 상태를 확인합니다.</p></div></div>
     <div className="connection-grid">
       <article className="connection-card"><span className="connection-label">Persona</span><h2>{personaName}</h2><p className={`connection-state connection-${binding.tone}`}>{binding.title}</p><p>{binding.detail}</p></article>
-      <article className="connection-card"><span className="connection-label">Persona database</span><h2 className={`connection-state connection-${databaseStatus === "connected" ? "success" : databaseStatus === "error" ? "error" : "pending"}`}>{databaseStatus === "connected" ? "Connected" : databaseStatus === "error" ? "Unavailable" : "Connecting"}</h2><p>{databaseStatus === "connected" ? "The database health check completed successfully." : "Database connectivity is independent from Persona binding."}</p></article>
-      <article className="connection-card"><span className="connection-label">Provider setup</span><h2>{providerName}</h2><p className={`connection-state connection-${providerConfigured ? "success" : "warning"}`}>{providerConfigured ? "Credential configured" : "Credential not configured"}</p><p>Credential presence only; provider connectivity is checked when a request is made.</p></article>
+      <article className="connection-card"><span className="connection-label">Persona 데이터베이스</span><h2 className={`connection-state connection-${databaseStatus === "connected" ? "success" : databaseStatus === "error" ? "error" : "pending"}`}>{databaseStatus === "connected" ? "연결됨" : databaseStatus === "error" ? "연결 불가" : "연결 중"}</h2><p>{databaseStatus === "connected" ? "데이터베이스 연결 확인을 완료했습니다." : "데이터베이스 연결과 Persona 연결은 각각 확인합니다."}</p></article>
+      <article className="connection-card"><span className="connection-label">AI 제공자 설정</span><h2>{providerName}</h2><p className={`connection-state connection-${providerConfigured ? "success" : "warning"}`}>{providerConfigured ? "인증 정보 설정됨" : "인증 정보 미설정"}</p><p>인증 정보 설정 여부입니다. 제공자 연결은 요청할 때 확인합니다.</p></article>
     </div>
-    <button className="connection-retry" type="button" disabled={reconnecting} onClick={() => { setReconnecting(true); void onReconnect().finally(() => setReconnecting(false)); }}>{reconnecting ? "Checking…" : "Reconnect"}</button>
+    <button className="connection-retry" type="button" disabled={reconnecting} onClick={() => { setReconnecting(true); void onReconnect().finally(() => setReconnecting(false)); }}>{reconnecting ? "확인 중…" : "다시 연결"}</button>
   </section>;
 }

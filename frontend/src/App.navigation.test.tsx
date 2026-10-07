@@ -17,16 +17,16 @@ describe("native app navigation continuity", () => {
  it("keeps Persona and configuration controls in app settings, and opens top-level Feedback", async () => {
   render(<App/>); await screen.findByLabelText("Chat draft");
   expect(within(screen.getByRole("navigation",{name:"MindCore workspace"})).getAllByRole("button").map(button=>button.textContent)).toEqual(["대화","데이터 관리","앱 설정","피드백"]);
-  expect(screen.queryByRole("button",{name:"Add Persona"})).toBeNull();
+  expect(screen.queryByRole("button",{name:"Persona 추가"})).toBeNull();
   fireEvent.click(screen.getByRole("button",{name:"앱 설정"}));
-  for(const label of ["Add Persona","Manage Personas","Open Identity File","Reconfigure Active Persona"]) expect(screen.getByRole("button",{name:label})).toBeTruthy();
-  fireEvent.click(screen.getByRole("button",{name:"연결"})); expect(await screen.findByRole("heading",{name:"Persona Connection"})).toBeTruthy();
-  fireEvent.click(screen.getByRole("button",{name:"피드백"})); expect(await screen.findByRole("dialog",{name:"Feedback"})).toBeTruthy();
+  for(const label of ["Persona 추가","Persona 관리","Identity 파일 열기","현재 Persona 재설정"]) expect(screen.getByRole("button",{name:label})).toBeTruthy();
+  fireEvent.click(screen.getByRole("button",{name:"연결"})); expect(await screen.findByRole("heading",{name:"Persona 연결"})).toBeTruthy();
+  fireEvent.click(screen.getByRole("button",{name:"피드백"})); expect(await screen.findByRole("dialog",{name:"피드백"})).toBeTruthy();
  });
  it("preserves chat draft, selected conversation and data tab across product sections", async () => {
   render(<App/>); const draft=await screen.findByLabelText("Chat draft"); fireEvent.change(draft,{target:{value:"synthetic unsent draft"}});
-  fireEvent.click(screen.getByRole("button",{name:"데이터 관리"})); fireEvent.click(screen.getByRole("button",{name:"기억"})); fireEvent.click(screen.getByRole("button",{name:"Episodes"})); expect(screen.getByText("Domain: episodes")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button",{name:"데이터 관리"})); fireEvent.click(screen.getByRole("button",{name:"기억"})); fireEvent.click(screen.getByRole("button",{name:"에피소드"})); expect(screen.getByText("Domain: episodes")).toBeTruthy();
   fireEvent.click(screen.getByRole("button",{name:"대화"})); expect((await screen.findByLabelText("Chat draft") as HTMLInputElement).value).toBe("synthetic unsent draft");
-  fireEvent.click(screen.getByRole("button",{name:"데이터 관리"})); expect(screen.getByRole("button",{name:"Episodes"}).getAttribute("aria-current")).toBe("page"); expect(apiMock.createConversation).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button",{name:"데이터 관리"})); expect(screen.getByRole("button",{name:"에피소드"}).getAttribute("aria-current")).toBe("page"); expect(apiMock.createConversation).not.toHaveBeenCalled();
  });
 });

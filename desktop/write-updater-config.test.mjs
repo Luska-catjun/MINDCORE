@@ -32,7 +32,7 @@ test("updater-disabled config omits the updater plugin and artifacts", async () 
   const config = await generateConfig({ MINDCORE_UPDATER_DISABLED: "1" });
   assert.equal(config.plugins, undefined);
   assert.equal(config.bundle.createUpdaterArtifacts, false);
-  assert.deepEqual(config.app.security.capabilities[0].permissions, ["core:default", "process:default"]);
+  assert.deepEqual(config.app.security.capabilities[0].permissions, ["core:default", "process:default", "notification:default", "dialog:default"]);
 });
 
 test("updater-enabled config retains the configured updater contract", async () => {
@@ -51,6 +51,8 @@ test("updater-enabled config retains the configured updater contract", async () 
     "core:default",
     "updater:default",
     "process:default",
+    "notification:default",
+    "dialog:default",
   ]);
 });
 

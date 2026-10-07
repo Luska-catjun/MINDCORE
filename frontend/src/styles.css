@@ -146,3 +146,41 @@ button { color: inherit; }
 .app-settings { flex: 1; min-height: 0; overflow: auto; }
 .settings-card { margin-top: 22px; padding: 24px; border: 1px solid var(--line); border-radius: 18px; background: var(--panel); }
 .settings-card button { margin: 8px 8px 0 0; }
+
+/* Final product polish: hierarchy comes from type and space, not repeated pills. */
+.sidebar { flex-basis: 196px; width: 196px; }
+.sidebar-header { min-height: 78px; padding: 18px; }
+.workspace-nav { padding: 8px 12px; gap: 4px; }
+.workspace-nav-item { min-height: 44px; border-radius: 8px; }
+.sidebar-status { margin-top: 0; min-height: 28px; padding: 0 18px; border: 0; }
+.workspace-nav + .sidebar-status { margin-top: auto; }
+.sidebar-status:last-child { padding-bottom: 16px; }
+.app-shell { padding-bottom: 0; }
+.session-toolbar { border-bottom: 0; min-height: 46px; }
+.data-navigation { padding: 20px 28px 8px; border: 0; }
+.underline-nav { display: flex; flex-wrap: wrap; gap: 4px 20px; margin: 0; }
+.underline-nav button { appearance: none; min-height: 44px; padding: 8px 0; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-size: 14px; transition: color .15s, border-color .15s; }
+.underline-nav button[aria-current] { color: var(--accent); border-bottom-color: var(--accent); }
+.underline-nav button:hover { color: var(--text); }
+.underline-nav button:focus-visible, .app-settings button:focus-visible, .app-settings input:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.data-secondary-nav { gap: 18px; margin-top: 6px; }
+.data-secondary-nav button { min-height: 34px; font-size: 12px; border-bottom-width: 1px; }
+.workspace-content { padding-top: 20px; }
+.workspace-heading { padding-bottom: 14px; border: 0; }
+.workspace-heading h1 { font-size: 20px; }
+.settings-card { margin-top: 24px; padding: 0; border: 0; border-radius: 0; background: transparent; max-width: 740px; }
+.settings-card[hidden], .app-settings > div[hidden] { display: none; }
+.settings-card h2 { font-size: 19px; }
+.settings-card p { color: var(--muted); line-height: 1.6; }
+.settings-card button, .desktop-updater button { padding: 9px 14px; min-height: 38px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--panel); color: var(--text); cursor: pointer; }
+.desktop-updater { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.desktop-updater > span { flex-basis: 100%; color: var(--muted); }
+.proactive-settings { padding: 0; border: 0; }
+.proactive-settings fieldset { border: 0; padding: 0; margin: 0; display: grid; gap: 16px; }
+.proactive-settings label { display: flex; align-items: center; gap: 10px; color: var(--text); font-size: 14px; }
+.proactive-settings input[type=number], .proactive-settings input[type=time] { background: var(--panel); color: var(--text); border: 1px solid var(--line-strong); border-radius: 6px; padding: 8px; max-width: 140px; }
+.proactive-hours { display: flex; flex-wrap: wrap; gap: 16px; }
+.setup-update-support { position: fixed; bottom: 54px; left: 0; right: 0; z-index: 80; background: var(--panel); padding: 10px 20px; }
+.product-modal { border-radius: 12px; box-shadow: none; }
+.connection-card { background: var(--panel); box-shadow: none; }
+@media(max-width:720px) { .data-navigation, .app-settings { padding-left: 18px; padding-right: 18px; } .underline-nav { gap: 4px 14px; } }

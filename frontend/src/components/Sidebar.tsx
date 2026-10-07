@@ -32,7 +32,7 @@ export function Sidebar({
       <aside className={`sidebar ${isOpen ? "sidebar-open" : ""}`}>
         <div className="sidebar-header">
           <span className="sidebar-title">MINDCORE</span>
-          <span className="sidebar-subtitle">Persona console</span>
+          <span className="sidebar-subtitle">나의 Persona</span>
         </div>
 
         <nav className="workspace-nav" aria-label="MindCore workspace">
@@ -56,10 +56,10 @@ export function Sidebar({
 
         <div className="sidebar-status">
           <span className={`status-dot status-dot-${backendStatus}`} aria-hidden="true" />
-          <span>{backendStatus === "connected" ? "Backend connected" : backendStatus === "error" ? "Backend unavailable" : "Checking backend"}</span>
+          <span>{backendStatus === "connected" ? "백엔드 연결됨" : backendStatus === "error" ? "백엔드 연결 불가" : "백엔드 확인 중"}</span>
         </div>
         {backendStatus === "connected" && personaBindingState !== "NOT_APPLICABLE" && <div className="sidebar-status">
-          <span>{personaBindingState === "BOUND_MATCH" ? "Persona connected" : personaBindingState === "UNBOUND" ? "Persona not yet bound" : personaBindingState === "BOUND_MISMATCH" ? "Persona mismatch" : "Persona connection unavailable"}</span>
+          <span>{personaBindingState === "BOUND_MATCH" ? "Persona 연결됨" : personaBindingState === "UNBOUND" ? "Persona 연결 대기" : personaBindingState === "BOUND_MISMATCH" ? "Persona 불일치" : "Persona 연결 불가"}</span>
         </div>}
       </aside>
     </>

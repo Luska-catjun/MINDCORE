@@ -1843,6 +1843,22 @@ fn get_product_support_metadata(app: AppHandle) -> BTreeMap<String, String> {
     }
     values
 }
+fn notification_settings_url() -> Result<&'static str, String> {
+    if cfg!(target_os = "macos") {
+        Ok("x-apple.systempreferences:com.apple.Notifications-Settings.extension")
+    } else if cfg!(target_os = "windows") {
+        Ok("ms-settings:notifications")
+    } else {
+        Err("System notification settings must be opened through your desktop environment.".into())
+    }
+}
+
+// Only a fixed OS settings destination is allowed; no URL or command input.
+#[tauri::command]
+fn open_notification_settings() -> Result<(), String> {
+    open_managed_path(Path::new(notification_settings_url()?))
+}
+
 #[tauri::command]
 fn open_configuration_folder(app: AppHandle) -> Result<(), String> {
     let path = config_path(&app)?;
@@ -1989,6 +2005,17 @@ mod setup_validation_tests {
             preserve_database_auth_token: false,
             preserve_api_key: false,
             preserve_identity: false,
+        }
+    }
+
+    #[test]
+    fn notification_settings_are_a_fixed_os_destination() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(notification_settings_url().unwrap(), "x-apple.systempreferences:com.apple.Notifications-Settings.extension");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(notification_settings_url().unwrap(), "ms-settings:notifications");
+        } else {
+            assert!(notification_settings_url().is_err());
         }
     }
 
@@ -2451,6 +2478,7 @@ fn main() {
             get_desktop_session,
             report_frontend_startup_stage,
             stop_mindcore_backend,
+            open_notification_settings,
             open_configuration_folder,
             open_public_url,
             get_product_support_metadata,

@@ -8,17 +8,17 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
 describe("PersonaConnection", () => {
   it.each([
-    ["BOUND_MATCH", "Persona connected"],
-    ["UNBOUND", "Not connected yet"],
-    ["BOUND_MISMATCH", "Persona mismatch"],
-    ["DB_UNAVAILABLE", "Connection unavailable"],
+    ["BOUND_MATCH", "Persona 연결됨"],
+    ["UNBOUND", "아직 연결되지 않음"],
+    ["BOUND_MISMATCH", "Persona 불일치"],
+    ["DB_UNAVAILABLE", "연결 확인 불가"],
   ])("shows binding state %s independently from database and provider", async (bindingState, label) => {
     invoke.mockResolvedValue({ llm_provider: "gemini", provider_key_configured: { gemini: true } });
     render(<PersonaConnection personaName="Mira" bindingState={bindingState} runtimeConnected
       databaseStatus="connected" onReconnect={vi.fn()} />);
     expect(await screen.findByText(label)).toBeTruthy();
-    expect(screen.getByText("Connected", { selector: "h2" })).toBeTruthy();
-    expect(screen.getByText("Credential configured")).toBeTruthy();
+    expect(screen.getByText("연결됨", { selector: "h2" })).toBeTruthy();
+    expect(screen.getByText("인증 정보 설정됨")).toBeTruthy();
     expect(screen.queryByText(/DATABASE_AUTH_TOKEN|GEMINI_API_KEY/)).toBeNull();
   });
 
@@ -27,8 +27,8 @@ describe("PersonaConnection", () => {
     invoke.mockResolvedValue({ llm_provider: "gemini", provider_key_configured: {} });
     render(<PersonaConnection personaName="Mira" bindingState="UNBOUND" runtimeConnected
       databaseStatus="error" onReconnect={reconnect} />);
-    await userEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+    await userEvent.click(screen.getByRole("button", { name: "다시 연결" }));
     expect(reconnect).toHaveBeenCalledOnce();
-    expect(screen.getByText("Unavailable", { selector: "h2" })).toBeTruthy();
+    expect(screen.getByText("연결 불가", { selector: "h2" })).toBeTruthy();
   });
 });
