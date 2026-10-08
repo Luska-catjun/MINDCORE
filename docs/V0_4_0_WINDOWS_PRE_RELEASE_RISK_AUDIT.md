@@ -1,4 +1,4 @@
-> **Current WRA-01/02 closure:** Local acceptance PASS; Windows signed CI pending; RELEASE_READY=FALSE. See the final closure section. Earlier audit/readiness statements below are historical evidence.
+> **Current WRA-01/02 closure:** CLOSED; RELEASE_READY=TRUE. See the final closure section. Earlier audit/readiness statements below are historical evidence.
 
 # MindCore 0.4.0 Windows Pre-Release Risk Audit
 
@@ -315,25 +315,25 @@ This section supersedes the original WRA-01/02 disposition. The original audit f
 ### WRA-01 closure
 
 - ROOT_CAUSE_CONFIRMED = YES. LLM staging deliberately omitted the DB credential reference, but native setup performed unconditional DB lookup before calling the provider.
-- FIX_COMMIT = `THIS_VERIFICATION_COMMIT (SHA recorded after commit)`.
+- FIX_COMMIT = `c37436657ec69fa671775e126119707b78834659`.
 - FIX = action-specific credential boundary: llm reads only global selected-provider settings and never loads/migrates a Persona or resolves a DB credential; database/classify/initialize still require a real reference and token. New/replacement DB tokens remain in memory until final save; preserved tokens use the existing native secure-store lookup. No dummy credential/reference or plaintext-token fallback.
 - TARGETED_TESTS = PASS: LLM reaches real Python `_setup_action` and real Gemini key/request handling without DB reference/lookup; missing provider key/preserved key fails closed; other provider preserved-key absence does not block selected-provider-only preflight; missing DB reference/token/store entry prevents execution; synthetic valid DB SELECT 1 succeeds; real Gemini 404 classification remains model_or_api_version, not a DB failure.
 - NATIVE_SETUP_ACCEPTANCE = PASS (isolated production-helper command composition).
 - TOKEN_REPLACEMENT_ACCEPTANCE = PASS.
-- WINDOWS_CI = PENDING — existing Windows Release, build_only=true, signed_build_only=true.
+- WINDOWS_CI = PASS — [37729528555](https://github.com/Luska-catjun/MINDCORE/actions/runs/37729528555) / attempt 1 / source `c37436657ec69fa671775e126119707b78834659`.
 - RESIDUAL_RISK = installed Windows UI and actual Windows Credential Manager integration NOT_RUN; synthetic adapters cover external I/O only. No live provider request was required or sent.
 
 ### WRA-02 closure
 
 - ROOT_CAUSE_CONFIRMED = YES. Draft generation stored under random credential ID A, while initial registry generated Persona ID B; replacement generated another A. Loader correctly rejected A != B.
-- FIX_COMMIT = `THIS_VERIFICATION_COMMIT (SHA recorded after commit)`.
+- FIX_COMMIT = `c37436657ec69fa671775e126119707b78834659`.
 - FIX = final draft decides stable Persona ID before credential persistence; first registry receives that same ID explicitly. Existing token replacement updates the existing Persona ID slot, never creates a new identity/reference or deletes the working slot after success. Loader reference == Persona ID rule unchanged. Obsolete second draft/save allocation path removed.
 - Native integration also exposed Settings extra_forbidden for DATABASE_CREDENTIAL_ID in the real staged config. Python now accepts exactly that native metadata field, excludes it from repr/model_dump, and never treats it as a token/resolver. Unknown settings still fail closed. No broad extra=ignore change.
 - Failure handling = snapshot setup/config/registry/profile/identity files and previous credential before writes; credential-store failure prevents file success; file/registry failure restores prior files and token or removes the fresh slot; unsuccessful rollback returns an explicit error. This is bounded setup rollback, not a crash-proof multi-resource transaction or new persistence architecture.
 - TARGETED_TESTS = PASS: new Persona/reference equality; actual save/load/native credential migration; recreated registry/restart; canonical token lookup; backend-start eligibility; replacement identity/reference unchanged; DB fixture bytes unchanged; injected credential/profile/registry/global save errors preserve existing files and credential; fresh registry failure removes new credential/config; injected restore failure reports incomplete rollback; invalid historical mismatch remains rejected before credential I/O; initial registry rejects conflicting reference.
 - NATIVE_SETUP_ACCEPTANCE = PASS.
 - TOKEN_REPLACEMENT_ACCEPTANCE = PASS.
-- WINDOWS_CI = PENDING — existing Windows Release, build_only=true, signed_build_only=true.
+- WINDOWS_CI = PASS — [37729528555](https://github.com/Luska-catjun/MINDCORE/actions/runs/37729528555) / attempt 1 / source `c37436657ec69fa671775e126119707b78834659`.
 - RESIDUAL_RISK = sudden process/power loss across secure-store/files is not proven atomic. If OS/filesystem rollback itself fails, explicit failure is returned rather than claiming restoration. Existing already-mismatched historical configurations remain rejected; no row rewrite or permissive migration was added.
 
 ### Native first-run and replacement evidence
@@ -374,19 +374,39 @@ WRA_08 = UNCHANGED
 
 ### Current decision
 
-WRA_01 = LOCAL_ACCEPTANCE_PASS / WINDOWS_CI_PENDING
-WRA_02 = LOCAL_ACCEPTANCE_PASS / WINDOWS_CI_PENDING
-WINDOWS_RELEASE_BLOCKERS = WINDOWS_SIGNED_BUILD_ACCEPTANCE_PENDING
-DESKTOP_RELEASE_READINESS = PENDING
+WRA_01 = CLOSED
+WRA_02 = CLOSED
+WINDOWS_RELEASE_BLOCKERS = 0
+DESKTOP_RELEASE_READINESS = PASS
 ANDROID_RELEASE_READINESS = PASS (previous accepted evidence; unchanged)
 FEEDBACK_PRODUCTION_PATH = PASS (previous accepted evidence; unchanged)
-CROSS_PLATFORM_RELEASE_READINESS = PENDING
-RELEASE_READY = FALSE
+CROSS_PLATFORM_RELEASE_READINESS = PASS
+RELEASE_READY = TRUE
 INSTALLED_WINDOWS_E2E = NOT_RUN (no Windows machine/VM available)
 REMOTE_TAG = NO
 REMOTE_RELEASE = NO
 DESKTOP_VERSION = 0.4.0
 ANDROID_VERSION_NAME = 0.1.0
 ANDROID_VERSION_CODE = 3
+
+### Current signed artifact
+
+- Installer: `MindCore_0.4.0_x64-setup.exe`; 30,438,016 bytes.
+- Installer SHA256: `41134e5a582f90ded031134647e39258745cb339712e577d26c9a5e0a2fb87c6`.
+- Updater signature: 420 bytes; SHA256 `60f287b3eeaeeb77cf96a2bbefccc7a8c2a05b0d0696bd290b6320ad7bdb2399`.
+- Independent production-public-key minisign verification: **PASS**. No private key was exported.
+- Actual uploaded installer extracted: native executable and sidecar present; extracted sidecar dependency boundary PASS; packaged app.config semantically matches the fixed source; new test fixtures not packaged.
+- Final report update is docs-only; product/runtime and existing workflow remain exactly the CI source SHA above.
+- Required CI steps: all SUCCESS, including portable Python, frontend, updater config, lint/build, Windows sidecar/dependency boundary, Rust/check, signing configuration, signed NSIS, signature validation and upload.
+- Publishing GitHub Release and unsigned dry-run artifact: SKIPPED by the unchanged signed-build-only workflow.
+
+### Current Windows test evidence
+
+- Python unittest: **650 discovered / 641 PASS / 9 SKIP / 0 FAIL / 0 ERROR**, 166.222s.
+- Frontend: **162 PASS**. Rust: **75 PASS / 0 FAIL / 0 ignored**, including **all 11 targeted native setup tests PASS on Windows**.
+- Windows skip reasons unchanged: remote credentials (1), shallow-checkout historical fixture (2), POSIX permissions not Windows ACLs (5), unsupported native sqld lifecycle (1). No new skips/assertion changes.
+- Python metadata-boundary tests: 2 PASS in the full Windows portable suite.
+- Existing lint warnings (6) and workflow Actions runtime deprecation annotation remain unchanged; no dependency/workflow upgrade in this task.
+
 
 Evidence root: `.toolchain/wra-blocker-fix/` — targeted.log, regression-results.json and individual logs, scope-preservation.json, source-privacy-scan.json, CI metadata/log, signature-verification.log and signed-windows-artifact.json when complete. IMPLEMENTED != ACCEPTANCE-PROVEN; only the stated gates are accepted.
