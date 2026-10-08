@@ -2,6 +2,8 @@
 
 mod persona_registry;
 mod sidecar_lifecycle;
+#[cfg(test)]
+mod setup_acceptance_tests;
 
 use persona_registry::{PersonaProfile, PersonaRegistry, PersonaSummary};
 use serde::{Deserialize, Serialize};
@@ -263,7 +265,18 @@ fn identity_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 fn config_is_complete(app: &AppHandle) -> Result<bool, String> {
     let config = config_path(app)?;
-    let Ok(text) = fs::read_to_string(&config) else {
+    config_is_complete_with(
+        &config,
+        || registry(app),
+        |id| database_credential(app, "get", id, None),
+    )
+}
+fn config_is_complete_with(
+    config: &Path,
+    mut load: impl FnMut() -> Result<Option<PersonaRegistry>, String>,
+    mut lookup: impl FnMut(&str) -> Result<String, String>,
+) -> Result<bool, String> {
+    let Ok(text) = fs::read_to_string(config) else {
         return Ok(false);
     };
     let provider_ready = ["LLM_PROVIDER="].iter().all(|key| {
@@ -271,20 +284,23 @@ fn config_is_complete(app: &AppHandle) -> Result<bool, String> {
             line.starts_with(key) && line[key.len()..].trim_matches('"').trim().len() > 0
         })
     });
-    let Some(registry) = registry(app)? else {
+    let Some(registry) = load()? else {
         return Ok(false);
     };
     let profile = persona_registry::active_profile(&registry)?;
     let profile_values = persona_registry::profile_overrides(profile)?;
-    let credential_id = profile_values.get("DATABASE_CREDENTIAL_ID")
+    let credential_id = profile_values
+        .get("DATABASE_CREDENTIAL_ID")
         .ok_or_else(|| "The Persona database credential reference is missing.".to_string())?;
-    if database_credential(app, "get", credential_id, None).is_err() {
+    if lookup(credential_id).is_err() {
         return Ok(false);
     }
     Ok(provider_ready
         && Path::new(&profile.identity_path).is_file()
         && Path::new(&profile.config_path).is_file()
-        && !profile_values.get("DATABASE_URL").is_none_or(String::is_empty))
+        && !profile_values
+            .get("DATABASE_URL")
+            .is_none_or(String::is_empty))
 }
 fn env_value_from(text: &str, key: &str) -> Option<String> {
     text.lines()
@@ -337,15 +353,29 @@ fn migrate_profile_database_credential(
     app: &AppHandle,
     profile: &PersonaProfile,
 ) -> Result<(), String> {
+    migrate_profile_database_credential_with(
+        profile,
+        |action, id, value| database_credential(app, action, id, value),
+        persona_registry::secure_atomic_write,
+    )
+}
+fn migrate_profile_database_credential_with(
+    profile: &PersonaProfile,
+    mut credential: impl FnMut(&str, &str, Option<&str>) -> Result<String, String>,
+    mut write: impl FnMut(&Path, &str) -> Result<(), String>,
+) -> Result<(), String> {
     let path = Path::new(&profile.config_path);
     let text = fs::read_to_string(path)
         .map_err(|_| "Could not read the Persona configuration.".to_string())?;
     let values = persona_registry::parse_env(&text);
-    let token = values.get("DATABASE_AUTH_TOKEN").filter(|value| !value.trim().is_empty());
+    let token = values
+        .get("DATABASE_AUTH_TOKEN")
+        .filter(|value| !value.trim().is_empty());
     if let Some(token) = token {
-        database_credential(app, "store", &profile.persona_id, Some(token))?;
+        credential("store", &profile.persona_id, Some(token))?;
     } else {
-        let reference = values.get("DATABASE_CREDENTIAL_ID")
+        let reference = values
+            .get("DATABASE_CREDENTIAL_ID")
             .ok_or_else(|| "The Persona database credential reference is missing.".to_string())?;
         if reference != &profile.persona_id {
             return Err("The Persona database credential reference is invalid.".into());
@@ -358,7 +388,7 @@ fn migrate_profile_database_credential(
         &values,
     );
     if next != text {
-        persona_registry::secure_atomic_write(path, &next)?;
+        write(path, &next)?;
     }
     Ok(())
 }
@@ -376,12 +406,6 @@ fn cleanup_profile_and_database_credential(
 }
 fn configured_user_display_name(text: &str) -> String {
     env_value_from(text, "USER_DISPLAY_NAME").unwrap_or_else(default_user_display_name)
-}
-fn active_config_value(app: &AppHandle, key: &str) -> Option<String> {
-    active_profile(app)
-        .ok()
-        .and_then(|profile| fs::read_to_string(profile.config_path).ok())
-        .and_then(|text| persona_registry::parse_env(&text).get(key).cloned())
 }
 fn validate_database_draft(d: &SetupDraft) -> Result<(), String> {
     if d.database_url.trim().is_empty()
@@ -521,66 +545,106 @@ fn preflight_persona_display_name<'a>(action: &str, d: &'a SetupDraft) -> &'a st
         d.persona_display_name.trim()
     }
 }
+fn provider_draft_values(
+    d: &SetupDraft,
+    mut values: BTreeMap<String, String>,
+    selected_only: bool,
+) -> Result<BTreeMap<String, String>, String> {
+    let active_key = provider_key_name(&d.llm_provider)?;
+    let api_key = if d.preserve_api_key {
+        values
+            .get(active_key)
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .ok_or_else(|| "Stored provider key is unavailable.".to_string())?
+    } else {
+        d.api_key.trim().to_string()
+    };
+    update_provider_config_values(&mut values, &d.llm_provider, &d.llm_model, api_key)?;
+    for provider in LLM_PROVIDERS {
+        if selected_only && provider != d.llm_provider {
+            continue;
+        }
+        if let Some(model) = d.provider_models.get(provider) {
+            values.insert(provider_model_name(provider)?.into(), model.trim().into());
+        }
+        if let Some(key) = d
+            .provider_api_keys
+            .get(provider)
+            .filter(|key| !key.trim().is_empty())
+        {
+            values.insert(provider_key_name(provider)?.into(), key.trim().into());
+        } else if d
+            .provider_preserve_keys
+            .get(provider)
+            .copied()
+            .unwrap_or(false)
+            && !values.contains_key(provider_key_name(provider)?)
+        {
+            return Err("Stored provider key is unavailable.".into());
+        }
+    }
+    Ok(values)
+}
 fn draft_env_for_persona_name(
     app: &AppHandle,
     d: &SetupDraft,
     persona_display_name: &str,
 ) -> Result<String, String> {
     let identity = identity_path(app)?;
-    let mut values = fs::read_to_string(config_path(app)?)
+    let values = fs::read_to_string(config_path(app)?)
         .ok()
         .map(|text| persona_registry::parse_env(&text))
         .unwrap_or_default();
-    let configured_database_url = active_config_value(app, "DATABASE_URL")
+    let existing = registry(app)?;
+    let profile = existing
+        .as_ref()
+        .map(persona_registry::active_profile)
+        .transpose()?;
+    draft_env_values(d, persona_display_name, &identity, values, profile)
+}
+fn draft_env_values(
+    d: &SetupDraft,
+    persona_display_name: &str,
+    identity: &Path,
+    values: BTreeMap<String, String>,
+    profile: Option<&PersonaProfile>,
+) -> Result<String, String> {
+    let configured_url = profile
+        .map(persona_registry::profile_overrides)
+        .transpose()?
+        .and_then(|values| values.get("DATABASE_URL").cloned())
         .or_else(|| values.get("DATABASE_URL").cloned());
     validate_preserved_database_token_scope(
         &d.database_url,
         d.preserve_database_auth_token,
-        configured_database_url.as_deref(),
+        configured_url.as_deref(),
     )?;
-    let credential_id = if d.preserve_database_auth_token {
-        let profile = active_profile(app)?;
-        profile_credential_id(Path::new(&profile.config_path))?
-    } else {
-        persona_registry::new_persona_id()?
+    let persona_id = match profile {
+        Some(profile) => profile.persona_id.clone(),
+        None if d.preserve_database_auth_token => {
+            return Err("Stored database credential is unavailable.".into())
+        }
+        None => persona_registry::new_persona_id()?,
     };
-    if d.preserve_database_auth_token {
-        database_credential(app, "get", &credential_id, None)?;
-    } else {
-        database_credential(app, "store", &credential_id, Some(d.database_auth_token.trim()))?;
-    }
-    let active_key = provider_key_name(&d.llm_provider)?;
-    let api_key = if d.preserve_api_key {
-        values.get(active_key).filter(|value| !value.is_empty()).cloned()
-            .ok_or_else(|| "Stored provider key is unavailable.".to_string())?
-    } else {
-        d.api_key.trim().to_string()
-    };
+    let mut values = provider_draft_values(d, values, false)?;
     values.insert("DATABASE_BACKEND".into(), "turso".into());
     values.insert("DATABASE_URL".into(), d.database_url.trim().into());
     values.remove("DATABASE_AUTH_TOKEN");
-    values.insert("DATABASE_CREDENTIAL_ID".into(), credential_id);
-    update_provider_config_values(&mut values, &d.llm_provider, &d.llm_model, api_key)?;
-    for provider in LLM_PROVIDERS {
-        if let Some(model) = d.provider_models.get(provider) {
-            values.insert(provider_model_name(provider)?.into(), model.trim().into());
-        }
-        if let Some(key) = d.provider_api_keys.get(provider).filter(|key| !key.trim().is_empty()) {
-            values.insert(provider_key_name(provider)?.into(), key.trim().into());
-        } else if d.provider_preserve_keys.get(provider).copied().unwrap_or(false)
-            && !values.contains_key(provider_key_name(provider)?)
-        {
-            return Err("Stored provider key is unavailable.".into());
-        }
-    }
+    // Decide the stable Persona identity before saving its canonical credential.
+    values.insert("DATABASE_CREDENTIAL_ID".into(), persona_id);
     values.insert("PERSONA_DISPLAY_NAME".into(), persona_display_name.into());
     values.insert(
         "USER_DISPLAY_NAME".into(),
         d.user_display_name.trim().into(),
     );
-    values.insert("PERSONA_IDENTITY_PATH".into(), identity.to_string_lossy().into_owned());
+    values.insert(
+        "PERSONA_IDENTITY_PATH".into(),
+        identity.to_string_lossy().into_owned(),
+    );
     Ok(render_env_values(values))
 }
+
 fn render_env_values(values: BTreeMap<String, String>) -> String {
     values
         .into_iter()
@@ -628,6 +692,19 @@ fn draft_env(app: &AppHandle, d: &SetupDraft) -> Result<String, String> {
     draft_env_for_persona_name(app, d, d.persona_display_name.trim())
 }
 fn preflight_draft_env(app: &AppHandle, action: &str, d: &SetupDraft) -> Result<String, String> {
+    if action == "llm" {
+        // Provider preflight does not read/migrate a Persona or touch its DB credential.
+        let global = fs::read_to_string(config_path(app)?)
+            .ok()
+            .map(|text| persona_registry::parse_env(&text))
+            .unwrap_or_default();
+        let mut values = provider_draft_values(d, global, true)?;
+        values.insert(
+            "PERSONA_DISPLAY_NAME".into(),
+            preflight_persona_display_name(action, d).into(),
+        );
+        return preflight_env_for_action(action, &render_env_values(values));
+    }
     let full = draft_env_for_persona_name(app, d, preflight_persona_display_name(action, d))?;
     preflight_env_for_action(action, &full)
 }
@@ -750,32 +827,75 @@ fn setup_action(app: &AppHandle, action: &str, draft: &SetupDraft) -> Result<Str
         .parent()
         .ok_or_else(|| "Configuration directory is unavailable".to_string())?
         .join(format!(".mindcore-setup-{}.env", std::process::id()));
-    atomic_write(&staging, &preflight_draft_env(app, action, draft)?)?;
-    let credential_id = profile_credential_id(&staging)?;
-    let token = database_credential(app, "get", &credential_id, None)?;
-    let output = tauri::async_runtime::block_on(
-        sidecar(app)?
-            .args(["--setup-action", action, "--config"])
-            .arg(&staging)
-            .env("DATABASE_AUTH_TOKEN", token)
-            .output(),
+    let staged = preflight_draft_env(app, action, draft)?;
+    execute_staged_setup_with(
+        action,
+        draft,
+        &staging,
+        &staged,
+        |id| database_credential(app, "get", id, None),
+        |path, token| {
+            let mut command = sidecar(app)?
+                .args(["--setup-action", action, "--config"])
+                .arg(path);
+            if let Some(token) = token {
+                command = command.env("DATABASE_AUTH_TOKEN", token);
+            }
+            let output = tauri::async_runtime::block_on(command.output())
+                .map_err(|_| "MindCore setup service could not start.".to_string())?;
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                print_setup_failure_diagnostic(action, output.status.code(), &output.stderr);
+                if action == "initialize" && setup_failure_is_schema_incompatible(&output.stderr) {
+                    return Err("SETUP_SCHEMA_INCOMPATIBLE".into());
+                }
+                if action == "initialize" {
+                    return Err("SETUP_DATABASE_INITIALIZE_FAILED".into());
+                }
+                Err("Setup validation failed. Check the values and try again.".into())
+            }
+        },
     )
-    .map_err(|_| "MindCore setup service could not start.".to_string());
-    let _ = fs::remove_file(&staging);
-    let output = output?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        print_setup_failure_diagnostic(action, output.status.code(), &output.stderr);
-        if action == "initialize" && setup_failure_is_schema_incompatible(&output.stderr) {
-            return Err("SETUP_SCHEMA_INCOMPATIBLE".into());
-        }
-        if action == "initialize" {
-            return Err("SETUP_DATABASE_INITIALIZE_FAILED".into());
-        }
-        Err("Setup validation failed. Check the values and try again.".into())
-    }
 }
+fn execute_staged_setup_with(
+    action: &str,
+    draft: &SetupDraft,
+    staging: &Path,
+    staged: &str,
+    mut lookup: impl FnMut(&str) -> Result<String, String>,
+    mut execute: impl FnMut(&Path, Option<&str>) -> Result<String, String>,
+) -> Result<String, String> {
+    validate_setup_action(action, draft)?;
+    atomic_write(staging, staged)?;
+    let result = (|| {
+        let token = match action {
+            "llm" => None,
+            "database" | "classify" | "initialize" => {
+                let id = profile_credential_id(staging)?;
+                let token = if draft.preserve_database_auth_token {
+                    lookup(&id)?
+                } else {
+                    // New/replacement tokens stay in memory during preflight.
+                    // Only the final save updates the OS credential slot.
+                    draft.database_auth_token.trim().to_string()
+                };
+                if token.is_empty() {
+                    return Err("Stored database credential is unavailable.".into());
+                }
+                Some(token)
+            }
+            _ => return Err("Unsupported setup action.".into()),
+        };
+        execute(staging, token.as_deref())
+    })();
+    let removed = fs::remove_file(staging);
+    if removed.is_err() && result.is_ok() {
+        return Err("Could not remove the temporary setup configuration.".into());
+    }
+    result
+}
+
 fn ensure_desktop_auth(app: &AppHandle) -> Result<(), String> {
     let config = config_path(app)?;
     ensure_desktop_auth_config(&config)
@@ -1188,32 +1308,6 @@ fn run_setup_with_config(app: &AppHandle, action: &str, config: &Path) -> Result
     }
 }
 
-fn persist_active_draft(app: &AppHandle, draft: &SetupDraft) -> Result<(), String> {
-    let config = config_path(app)?;
-    let Some(mut registry) = persona_registry::load_registry(&config)? else {
-        return Ok(());
-    };
-    let global = persona_registry::parse_env(&draft_env(app, draft)?);
-    let active_persona_id = registry.active_persona_id.clone();
-    let profile = persona_registry::active_profile(&registry)?;
-    let old_credential_id = profile_credential_id(Path::new(&profile.config_path))?;
-    let new_credential_id = global.get("DATABASE_CREDENTIAL_ID")
-        .ok_or_else(|| "The Persona database credential reference is missing.".to_string())?
-        .clone();
-    persona_registry::persist_profile_update_with(
-        &config,
-        &mut registry,
-        &active_persona_id,
-        draft.persona_display_name.trim(),
-        &global,
-        persona_registry::secure_atomic_write,
-        persona_registry::save_registry,
-    )?;
-    if old_credential_id != new_credential_id {
-        let _ = database_credential(app, "delete", &old_credential_id, None);
-    }
-    Ok(())
-}
 
 #[tauri::command]
 fn list_personas(app: AppHandle) -> Result<Vec<PersonaSummary>, String> {
@@ -1712,36 +1806,137 @@ fn save_mindcore_config_inner(
     draft: &SetupDraft,
     identity: &str,
 ) -> Result<(), String> {
+    let config = config_path(app)?;
+    let identity_path = identity_path(app)?;
+    let existing = registry(app)?;
+    let values = persona_registry::parse_env(&draft_env(app, draft)?);
+    save_mindcore_config_with(
+        &config,
+        &identity_path,
+        draft,
+        identity,
+        &values,
+        existing,
+        |action, id, value| database_credential(app, action, id, value),
+        persona_registry::secure_atomic_write,
+        persona_registry::save_registry,
+    )
+}
+fn save_mindcore_config_with(
+    config: &Path,
+    identity_path: &Path,
+    draft: &SetupDraft,
+    identity: &str,
+    values: &BTreeMap<String, String>,
+    existing: Option<PersonaRegistry>,
+    mut credential: impl FnMut(&str, &str, Option<&str>) -> Result<String, String>,
+    mut write: impl FnMut(&Path, &str) -> Result<(), String>,
+    mut save: impl FnMut(&Path, &PersonaRegistry) -> Result<(), String>,
+) -> Result<(), String> {
+    validate_draft(draft)?;
     if !draft.preserve_identity
         && (identity.is_empty() || identity.len() > MAX_IDENTITY_BYTES || identity.contains('\0'))
     {
         return Err("Identity must be UTF-8 plain text under 64 KB.".into());
     }
-    validate_draft(draft)?;
-    let config = config_path(app)?;
-    let identity_path = identity_path(app)?;
-    let existing_registry = registry(app)?;
-    let full_values = persona_registry::parse_env(&draft_env(app, draft)?);
-    let global = render_env_values(persona_registry::global_config_values(&full_values));
-    if !draft.preserve_identity {
-        atomic_write(&identity_path, &identity)?;
-    }
-    if existing_registry.is_some() {
-        persist_active_draft(app, draft)?;
-        atomic_write(&config, &global)?;
+    let id = values
+        .get("DATABASE_CREDENTIAL_ID")
+        .ok_or_else(|| "The Persona database credential reference is missing.".to_string())?;
+    let profile_path = if let Some(registry) = &existing {
+        let profile = persona_registry::active_profile(registry)?;
+        if id != &profile.persona_id
+            || profile_credential_id(Path::new(&profile.config_path))? != *id
+        {
+            return Err("The Persona database credential reference is invalid.".into());
+        }
+        PathBuf::from(&profile.config_path)
     } else {
-        atomic_write(&config, &global)?;
-        persona_registry::create_initial_registry_with(
-            &config,
-            draft.persona_display_name.trim(),
-            &identity_path,
-            &full_values,
-            persona_registry::secure_atomic_write,
-            persona_registry::save_registry,
-        )?;
+        persona_registry::persona_directory(config, id)?.join("persona.env")
+    };
+    let paths = [
+        config.to_path_buf(),
+        persona_registry::registry_path(config)?,
+        identity_path.to_path_buf(),
+        profile_path,
+    ];
+    let mut snapshots = Vec::new();
+    for path in &paths {
+        let before = match fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err("Could not read the existing setup configuration.".into()),
+        };
+        snapshots.push((path.clone(), before));
     }
-    Ok(())
+    let previous_token = if existing.is_some() {
+        Some(credential("get", id, None)?)
+    } else {
+        None
+    };
+    if draft.preserve_database_auth_token && previous_token.is_none() {
+        return Err("Stored database credential is unavailable.".into());
+    }
+    let replacing = !draft.preserve_database_auth_token;
+    if replacing {
+        credential("store", id, Some(draft.database_auth_token.trim()))?;
+    }
+    let result = (|| {
+        if !draft.preserve_identity {
+            write(identity_path, identity)?;
+        }
+        if let Some(mut registry) = existing.clone() {
+            persona_registry::persist_profile_update_with(
+                config,
+                &mut registry,
+                id,
+                draft.persona_display_name.trim(),
+                values,
+                &mut write,
+                &mut save,
+            )?;
+        } else {
+            persona_registry::create_initial_registry_with(
+                config,
+                id,
+                draft.persona_display_name.trim(),
+                identity_path,
+                values,
+                &mut write,
+                &mut save,
+            )?;
+        }
+        write(
+            config,
+            &render_env_values(persona_registry::global_config_values(values)),
+        )
+    })();
+    if result.is_err() {
+        let mut restored = true;
+        for (path, before) in snapshots {
+            let restored_file = match before {
+                Some(text) => write(&path, &text),
+                None => match fs::remove_file(&path) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(_) => Err("Setup cleanup failed.".into()),
+                },
+            };
+            restored &= restored_file.is_ok();
+        }
+        if replacing {
+            let restored_credential = match previous_token {
+                Some(token) => credential("store", id, Some(&token)),
+                None => credential("delete", id, None),
+            };
+            restored &= restored_credential.is_ok();
+        }
+        if !restored {
+            return Err("Setup save failed and rollback is incomplete.".into());
+        }
+    }
+    result
 }
+
 #[tauri::command]
 fn start_mindcore_backend(app: AppHandle) -> Result<(), String> {
     start_sidecar(&app).map_err(|error| {

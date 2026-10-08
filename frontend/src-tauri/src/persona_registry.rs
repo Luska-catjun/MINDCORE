@@ -444,6 +444,7 @@ where
 
 pub fn create_initial_registry_with<WriteProfile, SaveRegistry>(
     global_config: &Path,
+    persona_id: &str,
     display_name: &str,
     identity_path: &Path,
     database_source: &BTreeMap<String, String>,
@@ -456,7 +457,11 @@ where
 {
     let name = validate_display_name(display_name)?;
     validate_database_source(database_source)?;
-    let persona_id = new_persona_id()?;
+    validate_persona_id(persona_id)?;
+    if database_source.get("DATABASE_CREDENTIAL_ID").map(String::as_str) != Some(persona_id) {
+        return Err("The Persona database credential reference is invalid.".into());
+    }
+    let persona_id = persona_id.to_string();
     let directory = persona_directory(global_config, &persona_id)?;
     let config_path = directory.join("persona.env");
     if let Err(error) = write_profile(

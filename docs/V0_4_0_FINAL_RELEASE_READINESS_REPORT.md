@@ -1,3 +1,5 @@
+> **Current WRA-01/02 closure:** Local acceptance PASS; Windows signed CI pending; RELEASE_READY=FALSE. See the final closure section. Earlier audit/readiness statements below are historical evidence.
+
 # MindCore Desktop 0.4.0 Final Release Readiness — PASS
 
 기준일: 2026-10-08 (Asia/Seoul).
@@ -158,3 +160,86 @@ RELEASE_READY=TRUE
 남은 것은 실제 public distribution이며 이번 작업 범위에서 수행하지 않았다. IMPLEMENTED != ACCEPTANCE-PROVEN: current Windows build/signature gates는 실제 실행으로 검증됐고 public updater delivery는 아직 NOT_RUN이다.
 
 Evidence: `.toolchain/windows-platform-gate/` — start.json, platform-boundary.json, scope-static-audit.json, product-preservation.json, mac-harness.log, crlf-before.json, crlf-after.json, ci-attempt1.log, ci-attempt2-failed.log, python-abrupt-exit.json, ci-final.json/log, run-final-metadata.json, artifact-inventory.json, signed-windows-artifact.json, signature-verification.log, artifacts/. 이전 보고서는 previous-report.md에 보존했다. Final docs-only commit 이후 clean/diff-check state를 별도 final-git-state.json에 기록한다.
+
+## WRA-01 / WRA-02 blocker closure — 2026-10-08
+
+This section supersedes the original WRA-01/02 disposition. The original audit findings and evidence remain above as the pre-fix record. WRA-03 through WRA-08 remain unchanged.
+
+### WRA-01 closure
+
+- ROOT_CAUSE_CONFIRMED = YES. LLM staging deliberately omitted the DB credential reference, but native setup performed unconditional DB lookup before calling the provider.
+- FIX_COMMIT = `THIS_VERIFICATION_COMMIT (SHA recorded after commit)`.
+- FIX = action-specific credential boundary: llm reads only global selected-provider settings and never loads/migrates a Persona or resolves a DB credential; database/classify/initialize still require a real reference and token. New/replacement DB tokens remain in memory until final save; preserved tokens use the existing native secure-store lookup. No dummy credential/reference or plaintext-token fallback.
+- TARGETED_TESTS = PASS: LLM reaches real Python `_setup_action` and real Gemini key/request handling without DB reference/lookup; missing provider key/preserved key fails closed; other provider preserved-key absence does not block selected-provider-only preflight; missing DB reference/token/store entry prevents execution; synthetic valid DB SELECT 1 succeeds; real Gemini 404 classification remains model_or_api_version, not a DB failure.
+- NATIVE_SETUP_ACCEPTANCE = PASS (isolated production-helper command composition).
+- TOKEN_REPLACEMENT_ACCEPTANCE = PASS.
+- WINDOWS_CI = PENDING — existing Windows Release, build_only=true, signed_build_only=true.
+- RESIDUAL_RISK = installed Windows UI and actual Windows Credential Manager integration NOT_RUN; synthetic adapters cover external I/O only. No live provider request was required or sent.
+
+### WRA-02 closure
+
+- ROOT_CAUSE_CONFIRMED = YES. Draft generation stored under random credential ID A, while initial registry generated Persona ID B; replacement generated another A. Loader correctly rejected A != B.
+- FIX_COMMIT = `THIS_VERIFICATION_COMMIT (SHA recorded after commit)`.
+- FIX = final draft decides stable Persona ID before credential persistence; first registry receives that same ID explicitly. Existing token replacement updates the existing Persona ID slot, never creates a new identity/reference or deletes the working slot after success. Loader reference == Persona ID rule unchanged. Obsolete second draft/save allocation path removed.
+- Native integration also exposed Settings extra_forbidden for DATABASE_CREDENTIAL_ID in the real staged config. Python now accepts exactly that native metadata field, excludes it from repr/model_dump, and never treats it as a token/resolver. Unknown settings still fail closed. No broad extra=ignore change.
+- Failure handling = snapshot setup/config/registry/profile/identity files and previous credential before writes; credential-store failure prevents file success; file/registry failure restores prior files and token or removes the fresh slot; unsuccessful rollback returns an explicit error. This is bounded setup rollback, not a crash-proof multi-resource transaction or new persistence architecture.
+- TARGETED_TESTS = PASS: new Persona/reference equality; actual save/load/native credential migration; recreated registry/restart; canonical token lookup; backend-start eligibility; replacement identity/reference unchanged; DB fixture bytes unchanged; injected credential/profile/registry/global save errors preserve existing files and credential; fresh registry failure removes new credential/config; injected restore failure reports incomplete rollback; invalid historical mismatch remains rejected before credential I/O; initial registry rejects conflicting reference.
+- NATIVE_SETUP_ACCEPTANCE = PASS.
+- TOKEN_REPLACEMENT_ACCEPTANCE = PASS.
+- WINDOWS_CI = PENDING — existing Windows Release, build_only=true, signed_build_only=true.
+- RESIDUAL_RISK = sudden process/power loss across secure-store/files is not proven atomic. If OS/filesystem rollback itself fails, explicit failure is returned rather than claiming restoration. Existing already-mismatched historical configurations remain rejected; no row rewrite or permissive migration was added.
+
+### Native first-run and replacement evidence
+
+`frontend/src-tauri/src/setup_acceptance_tests.rs` composes production draft/provider preparation, preflight staging, action execution, canonical save, initial/profile persistence, registry loading, credential migration and backend eligibility helpers used by native commands. Thin Tauri AppHandle/sidecar-launch adapters are replaced only at external I/O seams. `tests/wra_setup_fixture.py` invokes production Python `_setup_action`; Gemini urlopen is deterministic (existing SyntheticProviderObserver), DB factory uses actual libSQL on a test-owned SQLite file. Actual SELECT/schema bootstrap and real provider key/HTTP-error handling run unchanged. This is not installed-webview click-through or remote Turso/Gemini availability evidence.
+
+- First run: empty directory/incomplete eligibility → synthetic names/DB → DB Test Connection → LLM Test Connection → classify EMPTY → initialize BOOTSTRAPPED → Continue/save helper → registry reload/credential validation → backend eligibility → recreated registry/restart Persona load: **PASS**.
+- Replacement: configured synthetic Persona → replacement DB preflight with in-memory new token (old store unchanged) → save same canonical slot → reload/restart eligibility → new token resolves, ID/reference/identity and DB bytes unchanged → preserved-token DB lookup: **PASS**.
+- Targeted Rust: **11 PASS / 0 FAIL / 0 ignored**. New Python metadata-boundary tests: **2 PASS**. No personal config/DB or credential was used.
+
+### Full local regression
+
+| Gate | Result |
+|---|---|
+| Python full pytest | **659 PASS / 1 SKIP / 380 subtests PASS**, 61.05s |
+| Python compileall app desktop | PASS |
+| Frontend full | **162 PASS / 27 files** |
+| Frontend lint | PASS, 6 existing warnings |
+| Frontend production build | PASS, existing dynamic-import warning |
+| Updater config tests | **3 PASS** |
+| Release notes tests | **1 PASS** |
+| Rust full | **75 PASS / 0 FAIL / 0 ignored** |
+| cargo check --locked | PASS |
+| git diff --check | PASS |
+
+Counts differ from baseline only by 2 new Python tests and 11 new Rust tests. Existing tests/assertions/skips are unchanged. Mac real sqld lifecycle ran through explicit MINDCORE_TEST_SQLD; Windows retains the existing one-case platform boundary (native sqld 0.24.32 has no supported Windows binary/target). No Windows sqld provision/emulation/fake daemon. All commands bounded, no timeout/hang.
+
+### Scope preservation
+
+WRA_03 = UNCHANGED
+WRA_04 = UNCHANGED
+WRA_05 = UNCHANGED
+WRA_06 = UNCHANGED
+WRA_07 = UNCHANGED
+WRA_08 = UNCHANGED
+
+`.toolchain/wra-blocker-fix/scope-preservation.json` compares all top-level native functions with audited HEAD and proves only setup/credential-related functions changed. Workflow, updater config, manifests/lockfiles/version, existing recovery harness/platform boundary, schema baseline and frontend UI are byte-identical. Android and feedback repositories untouched; historical accepted Android/feedback results maintained, not rerun. Production secret-pattern scan: 168 files, zero pattern hits (bounded scan). Rustfmt was installed as a local toolchain component only.
+
+### Current decision
+
+WRA_01 = LOCAL_ACCEPTANCE_PASS / WINDOWS_CI_PENDING
+WRA_02 = LOCAL_ACCEPTANCE_PASS / WINDOWS_CI_PENDING
+WINDOWS_RELEASE_BLOCKERS = WINDOWS_SIGNED_BUILD_ACCEPTANCE_PENDING
+DESKTOP_RELEASE_READINESS = PENDING
+ANDROID_RELEASE_READINESS = PASS (previous accepted evidence; unchanged)
+FEEDBACK_PRODUCTION_PATH = PASS (previous accepted evidence; unchanged)
+CROSS_PLATFORM_RELEASE_READINESS = PENDING
+RELEASE_READY = FALSE
+INSTALLED_WINDOWS_E2E = NOT_RUN (no Windows machine/VM available)
+REMOTE_TAG = NO
+REMOTE_RELEASE = NO
+DESKTOP_VERSION = 0.4.0
+ANDROID_VERSION_NAME = 0.1.0
+ANDROID_VERSION_CODE = 3
+
+Evidence root: `.toolchain/wra-blocker-fix/` — targeted.log, regression-results.json and individual logs, scope-preservation.json, source-privacy-scan.json, CI metadata/log, signature-verification.log and signed-windows-artifact.json when complete. IMPLEMENTED != ACCEPTANCE-PROVEN; only the stated gates are accepted.

@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     database_backend: str = "turso"
     database_url: str | None = None
     database_auth_token: str | None = None
+    # Native profile/setup metadata only. Rust validates this against Persona
+    # identity and supplies the resolved token in memory; it is not a token or
+    # a Python credential fallback. Accept the profile field without relaxing
+    # validation of other settings.
+    database_credential_id: str | None = Field(default=None, exclude=True, repr=False)
     old_database_url: str | None = None
     turso_db_url: str | None = Field(
         default=None,
