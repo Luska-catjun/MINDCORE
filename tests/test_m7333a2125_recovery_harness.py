@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import sys
 import tempfile
 import threading
 import unittest
@@ -56,6 +57,10 @@ class RecoveryHarnessPrimitiveTests(unittest.TestCase):
         finally:
             barrier.close()
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "Native sqld 0.24.32 supports macOS/Linux only; no supported Windows binary/target.",
+    )
     def test_sqld_controller_stops_and_restarts_same_storage(self) -> None:
         executable = Path(os.environ.get(
             "MINDCORE_TEST_SQLD",
