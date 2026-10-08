@@ -1,125 +1,79 @@
-# MindCore Desktop 0.4.0 Final Release Readiness — BLOCKED
+# MindCore Desktop 0.4.0 Final Release Readiness — PASS
 
-## 2026-10-08 Native Windows SQLD blocker closure audit
+기준일: 2026-10-08 (Asia/Seoul).
 
-이번 요청의 native Windows sqld.exe provisioning은 **BLOCKED**다. 기존 missing fixture의 원인을 upstream platform limitation으로 구체화했다. 해소됐다고 보고하지 않는다.
+## 최종 판정
 
-단일 blocker: `SQLD_UPSTREAM_NATIVE_WINDOWS_UNSUPPORTED` (PLATFORM/TOOLCHAIN ISSUE; 기존 TEST_INFRA missing fixture의 근본 제약). 동일한 0.24.32 공식 release에는 native Windows x86_64 artifact가 없으며 upstream source도 Windows native build를 지원하지 않는다. 이 조건에서 실제 sqld.exe 및 신뢰할 수 있는 Windows artifact checksum을 provision할 수 없다.
+DESKTOP_RELEASE_READINESS=PASS
+ANDROID_RELEASE_READINESS=PASS (기존 accepted result 유지; 이번 작업에서 변경/재실행 없음)
+FEEDBACK_PRODUCTION_PATH=PASS (기존 accepted Gmail E2E 유지)
+CROSS_PLATFORM_RELEASE_READINESS=PASS
+RELEASE_READY=TRUE
 
-### 감사 근거 / pin
+TRUE는 현재 source에서 기존 production GitHub Actions signing path가 실제 Windows signed NSIS 및 updater signature artifact를 생성했고 필수 gate가 통과했다는 뜻이다. Public tag/release/updater delivery는 아직 실행하지 않았다. 실제 Windows UI installation/update delivery를 새로 실행했다고 주장하지 않는다.
 
-- Upstream: `tursodatabase/libsql`.
-- Pinned release: `libsql-server-v0.24.32`.
-- Pinned source commit: `40c272de85ee4e62d722c5ccae5da2e76b4253a1`.
-- Existing Mac fixture version: `sqld sqld 0.24.32 (40c272de 2025-02-14)`.
-- Official release asset list: Darwin arm64/x86_64 및 Linux GNU arm64/x86_64만 존재. Windows/MSVC/MinGW/.exe asset count=0.
-- Source Cargo.toml workspace.metadata.dist.targets는 위 네 target만 선언한다.
-- [Pinned upstream build instructions](https://github.com/tursodatabase/libsql/blob/40c272de85ee4e62d722c5ccae5da2e76b4253a1/docs/BUILD-RUN.md#build-from-source-using-rust)는 macOS/Linux(WSL 포함)만 지원하고 native Windows instructions는 준비 중이라고 명시한다.
-- [Pinned source main.rs](https://github.com/tursodatabase/libsql/blob/40c272de85ee4e62d722c5ccae5da2e76b4253a1/libsql-server/src/main.rs#L610-L622)의 shutdown_signal은 `tokio::signal::unix::{signal, SignalKind}`를 cfg guard 없이 사용한다. Unmodified source를 native Windows로 직접 cargo build하는 경로로 해결됐다고 주장할 수 없다.
-- [Official pinned release](https://github.com/tursodatabase/libsql/releases/tag/libsql-server-v0.24.32).
-
-Existing Mac archive `libsql-server-aarch64-apple-darwin.tar.xz` SHA-256:
-`ced2a9d65a5d4b6bd72c67e98ad6c63139e2a139d91769f07fdd15be935381dd`.
-로컬 archive를 다시 hash하여 이전 검증된 official checksum과 일치함을 확인했다. Mac executable SHA-256은 `cc075b5bf145e5e750afd2941f390b46dbfe9ae47158d95ab637a00559681054`다. 이것을 Windows checksum이나 Windows fixture로 사용하지 않았다.
-
-### Exact harness requirement / 실행 결과
-
-`tests/test_m7333a2125_recovery_harness.py` 및 `tests/m7333a2125_recovery_harness.py`를 먼저 읽었다. MINDCORE_TEST_SQLD explicit executable이 authoritative하고 env가 없으면 기존 sibling Android Mac fixture가 fallback이다. Required CLI flags는 `-d <persistent storage directory>`, `--http-listen-addr <loopback host:port>`, `--http-self-url <loopback HTTP URL>`다. Real daemon의 Hrana endpoint, stop 시 실제 unavailable, 동일 sqld directory에서 restart 후 ready를 검사한다. 다른 storage engine이나 daemon behavior를 대체하지 않았다.
-
-기존 Mac native executable을 explicit MINDCORE_TEST_SQLD로 지정해 **기존 recovery harness 테스트 4 PASS / 0 FAIL / 0 SKIP**, 11.025s로 완료했다. Windows executable은 얻지 못했으므로 Windows harness PASS를 주장하지 않는다. Test assertions/meaning/source 변경=NO; harness skip=NO; fake daemon/mock/renamed Mac binary 사용=NO.
-
-### 변경 및 CI 상태
-
-Initial HEAD: `7a3cd6856f7be6d597dd77a85663fd3d60d8da49`; branch `codex/v0.4.0-readiness`; clean; git diff --check PASS. 기존 commits를 보존했다. Reset/clean/stash/restore/rebase/amend 미사용.
-
-이번 tracked 변경은 이 Desktop 보고서뿐이다. Workflow/provisioning helper/product/updater/signing/test/Android source는 변경하지 않았다. 존재하지 않는 download URL/hash를 pin하는 helper를 추가하지 않았다. 최신 버전을 임의 선택하거나 unofficial binary, WSL launcher, fake sqld.exe로 요구사항을 대체하지 않았다. Upstream Windows porting은 이번 최소 CI provisioning 범위 밖이며 수행하지 않았다.
-
-New Windows workflow dispatch=NOT_RUN. 입력 fixture가 없는 동일 source를 재실행해 signing acceptance를 주장하지 않았다. 최근 actual Windows Release run은 `37721096941`, source `3da63a0d2adc3032ec15acd28951f4e7817bcd69`; Python648 tests / failures1 / skipped8이며 missing sqld test에서 실패했다. 기존 updater production signing authority=GitHub Actions, key/secret/publickey/runtime architecture unchanged. Windows installer/SHA/signature/upload acceptance는 여전히 NOT_RUN / UNAVAILABLE다.
-
-보고서만 logical local commit 및 기존 verification branch에 push한다. Main 변경/force push/tag/GitHub Release/public updater manifest/Android APK upload 없음. Android RELEASE_READINESS=PASS 및 Feedback production path=PASS는 이전 accepted result를 유지하며 Android를 변경하거나 다시 테스트하지 않았다.
-
-DESKTOP_RELEASE_READINESS=BLOCKED / ANDROID_RELEASE_READINESS=PASS / FEEDBACK_PRODUCTION_PATH=PASS / CROSS_PLATFORM_RELEASE_READINESS=BLOCKED / RELEASE_READY=FALSE.
-
-Evidence: `.toolchain/windows-sqld-closure/`의 start.json, upstream-release.json, upstream-source/, mac-fixture.json, mac-recovery-harness.log, blocker-audit.json. 기존 최종 보고서 사본은 previous-report.md에 보존. 아래는 앞선 전체 regression/signing audit 기록이다.
-
-## 이전 blocker 정정 / 최종 판정
+## 이전 blocker 판정 정정
 
 local production private key absence was not a product blocker. Production signing is intentionally owned by existing GitHub Actions.
 
-PRODUCTION_SIGNING_AUTHORITY=GITHUB_ACTIONS / LOCAL_PRODUCTION_PRIVATE_KEY_REQUIRED=NO. Production private key를 로컬 복원·export·재생성·대체하지 않았다. Existing updater runtime/endpoint/auto-check/recommendation modal/installer/signature verification architecture 변경 없음.
+Windows release가 sqld.exe를 요구한다는 이전 해석도 정정한다. 실제 문제는 나중에 추가된 **Unix/macOS real-sqld integration case가 Windows unittest discovery에 포함된 test scope 오류**였다. Native sqld 0.24.32는 Windows native binary/target을 지원하지 않는다. Production Windows updater/signing architecture의 결함이나 prerequisite가 아니다.
 
-DESKTOP_RELEASE_READINESS=BLOCKED / ANDROID_RELEASE_READINESS=PASS / FEEDBACK_PRODUCTION_PATH=PASS / CROSS_PLATFORM_RELEASE_READINESS=BLOCKED / RELEASE_READY=FALSE.
+사용자의 최신 correction에 따라 lifecycle **한 case만** `unittest.skipIf(sys.platform == "win32", explicit reason)` boundary로 분리했다. Native exe creation/port/emulation/provisioning/fake daemon/mock replacement 없음. 기존 recovery harness test와 모든 assertions/body를 보존했다. macOS/Linux에서는 decorator가 false이므로 real lifecycle case가 계속 실행되며 fixture가 없으면 기존 assertion으로 실패한다. Linux에서 실행했다고 별도로 주장하지 않는다.
 
-현재 유일한 필수 blocker: Windows Release Python gate의 recovery harness가 real native `sqld` 실행 파일을 요구하지만 Windows provisioning이 없다(TEST_INFRA). 사용자가 재사용할 기존 Windows fixture가 없음을 확인했다. 기존 default는 이 Mac의 sibling Android .toolchain 경로이며 Windows runner에는 존재하지 않는다. 이 조건을 skip/mock/assertion 완화로 우회하지 않았다. 따라서 signed Windows installer/signature/artifact gate가 실행되지 않았다. 로컬 private key 부재로 인한 blocker가 아니다.
+- Platform-neutral 3 cases: provider observer, cognition observer, cross-device barrier — Windows에서 모두 PASS.
+- Native lifecycle case — Windows에서 명시적 NOT APPLICABLE / platform SKIP; Mac에서 실제 sqld로 PASS.
+- Native sqld: upstream tursodatabase/libsql, version0.24.32, commit40c272de85ee4e62d722c5ccae5da2e76b4253a1.
+- [Pinned upstream build instructions](https://github.com/tursodatabase/libsql/blob/40c272de85ee4e62d722c5ccae5da2e76b4253a1/docs/BUILD-RUN.md#build-from-source-using-rust), [official release](https://github.com/tursodatabase/libsql/releases/tag/libsql-server-v0.24.32).
 
-## Initial audit / logical commits
+## 변경 범위 / Git
 
-- Local path: `/Users/noseunghudong-alibujang/Developer/mindcore-desktop`.
-- Initial HEAD: `abc1bb91073033848d35993459601da1991d7d4c`.
-- Initial branch: `backup/mindcore-desktop-current-2026-09-30`.
-- Initial diff --check PASS; 기존 dirty work 보존. reset/clean/stash/restore/rebase/amend 미사용.
-- Current branch: `codex/v0.4.0-readiness`.
-- Product source commit: `3da63a0d2adc3032ec15acd28951f4e7817bcd69`.
-- `801288eb40403e5e443189eeb9e4be591c66f303`: configured message labels, public feedback endpoint, isolated feedback fixtures, ignored local .toolchain.
-- `3da63a0d2adc3032ec15acd28951f4e7817bcd69`: Windows corrupt SQLite initialization handle cleanup 및 real-close regression evidence.
-- 최종 보고서는 후속 docs-only local commit으로 정리한다. 제품 artifact source SHA와 보고서 commit SHA를 구분한다.
+Initial HEAD: c4b7cae0a5ac1d25f7e781a11718974cb39c7406, branch codex/v0.4.0-readiness, clean, diff --check PASS. Existing commits를 보존했고 reset/clean/stash/restore/rebase/amend 미사용.
 
-Initial dirty work:
+1. `c27d9d0d2567db40c16be8c597be6f6fe75d0e48`: sys import 및 lifecycle Windows platform decorator 5lines.
+2. `20275953e96bc438eb9bec38f080903c73dee100`: .gitattributes 2lines, release-notes/*.md text eol=lf.
+3. 후속 docs-only commit: 이 최종 보고서; artifact source SHA와 구분.
 
-```text
- M .gitignore
- M frontend/src/App.multiPersona.test.tsx
- M frontend/src/App.tsx
- M frontend/src/components/FeedbackDialog.test.tsx
- M frontend/src/components/MessageBubble.test.tsx
- M frontend/src/components/MessageBubble.tsx
- M frontend/src/components/ProductSupport.feedback.test.tsx
- M frontend/src/components/WorkspacePanel.tsx
- M frontend/src/product-support.json
- M frontend/src/services/productSupport.test.ts
-?? docs/V0_4_0_FINAL_RELEASE_READINESS_REPORT.md
-?? frontend/src/components/WorkspacePanel.messageLabels.test.tsx
-?? frontend/src/messageLabels.test.ts
-?? frontend/src/messageLabels.ts
-```
+Release workflow `.github/workflows/release.yml`는 요청 시작 전과 byte-identical. CI workflow, app/desktop/frontend product source 및 updater runtime/endpoint/auto-check/recommendation modal/installer/signature verification/signing helper/key/secret/version은 변경하지 않았다. Product source는 이전 accepted Mac package source3da63a0과 동일하다. Android HEAD006309efa2d5e1ff4cd188ed96ab0884731cc2bb 및 source/보고서/artifact를 변경하지 않았다.
 
-Feedback repo는 `dd60dae3c8fcd7bdc16b062da3235813340b7d91` / main / clean 유지. Feedback 코드 변경·commit·push 없음. Android signed source는 `05fbcccac2cd6309b393369be8a41d1e85ff95e1`, 후속 보고서 commit은 별도다.
+Verification branch만 push. Main 변경/force push 없음. 로컬 tool/evidence/.exe/.sig/public verification key는 ignored .toolchain에 있으며 binary source commit 없음.
 
-## Desktop local full regression
+## Local targeted validation
+
+- Real sqld fixture를 explicit MINDCORE_TEST_SQLD로 지정한 Mac harness: **4 PASS / 0 FAIL / 0 SKIP**, 11.057s.
+- AST 비교: 네 test method body 및 assertions 동일; platform-neutral 3cases undecorated.
+- Python syntax compile PASS; diff --check PASS.
+- Windows checkout CRLF 문제: 실제 git clone + core.autocrlf=true checkout에서 기존 pretest heading 검사 실패를 재현했다. Canonical notes LF header가 CRLF로 바뀌었다.
+- .gitattributes를 적용한 동일 checkout에서 notes bytes가 Git blob과 정확히 같음 PASS. 기존 loader/body/heading/version/size checks 및 notes content는 변경하지 않았다.
+- Existing release notes test: 1 PASS / 0 SKIP.
+
+## Windows CI 시도 및 최종 current-source acceptance
+
+기존 Windows Release workflow, repository Luska-catjun/MINDCORE, branch codex/v0.4.0-readiness. 기존 dispatch inputs **build_only=true, signed_build_only=true**. Production signing authority는 기존 GitHub Actions Secrets TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD 및 Repository Variable MINDCORE_UPDATER_PUBKEY다. Private value를 조회/export/출력하지 않았다.
+
+- [37723314402](https://github.com/Luska-catjun/MINDCORE/actions/runs/37723314402), sourcec27d9d0: Python648 tests / skipped9 / 0 failures PASS. Frontend pretest는 CRLF notes heading 검사에서 실패했다. Frontend suite 자체는 시작되지 않았다. TEST_INFRA checkout boundary를 .gitattributes로 고쳤다.
+- [37723781839 attempt1](https://github.com/Luska-catjun/MINDCORE/actions/runs/37723781839/attempts/1), source2027595: Python이 traceback/unittest failure summary 없이 exit1로 종료했다. 마지막 로그는 schema drift case였다. 정확한 종료 원인은 **UNKNOWN**이며 flake/product/환경 중 하나로 근거 없이 단정하지 않는다. 로그를 보존했다. 이 실패를 숨기거나 테스트를 완화하지 않았다.
+- **[37723781839 attempt2](https://github.com/Luska-catjun/MINDCORE/actions/runs/37723781839/attempts/2)**: 동일 workflow/source를 변경 없이 재실행했고 **SUCCESS**. 이 성공만으로 이전 갑작스러운 종료의 원인을 확정했다고 주장하지 않는다. 현재 final complete run에 failures 없음.
+- Actual artifact source: **20275953e96bc438eb9bec38f080903c73dee100**.
+
+### 최종 regression
 
 | Gate | Result |
 |---|---|
-| Final Python full pytest | 657 PASS / 1 SKIP / 380 subtests PASS / 0 FAIL |
-| Python compileall app desktop | PASS |
-| Frontend full | 27 files / 162 PASS / 0 FAIL |
-| Feedback configured/unconfigured / raw labels / proactive relevant | PASS, full regression에 포함 |
-| Lint | PASS / existing 6 no-useless-escape warnings |
-| TypeScript/Vite production build | PASS |
+| Windows Python portable full unittest | 648 discovered / 639 PASS / 9 SKIP / 0 FAIL / 0 ERROR, 201.324s |
+| Windows portable recovery harness | 3 PASS; native sqld case만 platform SKIP |
+| Python compile | PASS |
+| Frontend | 27 files / 162 PASS / 0 FAIL |
 | Updater config tests | 3 PASS |
-| Release notes/link test | 1 PASS |
-| Rust updater enabled tests / cargo check | 64 PASS / PASS |
-| Rust updater disabled tests / cargo check | 64 PASS / PASS |
-| Final macOS package + sidecar rebuild | PASS (updater-disabled) |
-| Final package UI/backend/BOUND_MATCH smoke | PASS |
-| Final local package mail-secret/recipient/PAT scan | 5 bundle files / 0 findings |
+| Lint / frontend production build | PASS (existing warnings 유지) |
+| Windows sidecar build / dependency verification | PASS / PASS |
+| Rust Windows tests | 64 PASS / 0 FAIL / 0 ignored |
+| Windows cargo check | PASS |
+| Production signing configuration | PASS |
+| Signed Windows NSIS / .sig existence/nonempty | PASS |
+| Artifact upload | PASS |
+| Production public key cryptographic verification | PASS (local minisign0.12) |
 
-Final Python handle fix 후 전체 재실행: 140.56s. Frontend/Rust는 Python-only handle change 이전 PASS 실행이며 이후 해당 source 변경 없음. 이전 654 PASS / 3 SKIP 대비: 기존 v0.2.0 released fixture를 실제 Git history에서 복구해 2 SKIP가 PASS가 됐고 handle-close test 1개를 추가해 657 PASS / 1 SKIP다. Assertion 완화나 새 skip 없음.
-
-남은 local SKIP: `tests/database/test_remote_turso_bootstrap.py:29` — `REMOTE_TURSO_TEST_SKIPPED = NO_TEST_CREDENTIALS` (ENVIRONMENT: disposable remote test 전용 credential 미설정). Starlette BlockingPortal deprecation warning 1건.
-
-## Existing production Windows CI
-
-Private Backup repository에는 workflows/secrets/variables가 없으며 기존 production authority는 `Luska-catjun/MINDCORE`의 Windows Release `.github/workflows/release.yml`다. 기존 workflow를 그대로 사용했다. Secret 이름 TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD 및 Variable 이름 MINDCORE_UPDATER_PUBKEY의 존재만 확인했으며 private value를 읽거나 출력하지 않았다.
-
-Verification branch push 전 현재 tracked source 437 files 및 outgoing history 27 commits / 195 blobs secret audit: 0 findings. Push는 `codex/v0.4.0-readiness` branch만 대상으로 했다. main force push, tag/release 생성 없음. Existing workflow_dispatch inputs: `build_only=true`, `signed_build_only=true`. Workflow의 Publish GitHub Release는 push event에서만 실행되므로 이번 dispatch에서는 publish하지 않는다. 새 workflow 생성/수정 없음.
-
-- Run1: [37719434130](https://github.com/Luska-catjun/MINDCORE/actions/runs/37719434130), source 801288e — FAIL, 647 tests / 1 failure / 3 errors / 8 skips.
-- Real defects: failed corrupt SQLite PRAGMA에서 open handle leak 및 테스트의 sqlite context manager가 close하지 않는 읽기 handle. Windows에서 rename/TemporaryDirectory cleanup에 WinError32가 발생했다. Exception cleanup은 실제 connection.close()를 수행하며 새 real corrupt-file regression test와 read-only closing context를 적용했다. Legacy sync 알고리즘/schema를 확장하지 않았다.
-- Run2: [37721096941](https://github.com/Luska-catjun/MINDCORE/actions/runs/37721096941), source 3da63a0 — FAIL, **648 tests / failures=1 / errors=0 / skipped=8**, 214.709s. WinError32 failures는 재발하지 않았다.
-- 남은 failure: `test_sqld_controller_stops_and_restarts_same_storage` — `bundled synthetic sqld executable is required` (TEST_INFRA).
-- Artifact count: 0. Signed installer, .sig, size/SHA-256/signature verification는 NOT_RUN / UNAVAILABLE. 서명 Secret 결함으로 분류하지 않는다.
-
-### Run2 실제 step 상태
+### 최종 workflow 전체 step 상태
 
 | Step | Result |
 |---|---|
@@ -133,25 +87,27 @@ Verification branch push 전 현재 tracked source 437 files 및 outgoing histor
 | Install frontend dependencies | SUCCESS |
 | Resolve and validate source version | SUCCESS |
 | Reject manual release publishing | SKIPPED |
-| Run Python tests | FAILURE |
-| Compile Python sources | SKIPPED |
-| Run frontend tests | SKIPPED |
-| Test updater build configurations | SKIPPED |
-| Lint frontend | SKIPPED |
-| Build frontend | SKIPPED |
-| Build Windows sidecar | SKIPPED |
-| Verify Windows sidecar dependency boundary | SKIPPED |
-| Run Rust tests | SKIPPED |
-| Check Rust for Windows | SKIPPED |
+| Run Python tests | SUCCESS |
+| Compile Python sources | SUCCESS |
+| Run frontend tests | SUCCESS |
+| Test updater build configurations | SUCCESS |
+| Lint frontend | SUCCESS |
+| Build frontend | SUCCESS |
+| Build Windows sidecar | SUCCESS |
+| Verify Windows sidecar dependency boundary | SUCCESS |
+| Run Rust tests | SUCCESS |
+| Check Rust for Windows | SUCCESS |
 | Build unsigned dry-run artifact | SKIPPED |
-| Validate release signing configuration | SKIPPED |
-| Build signed Windows NSIS artifact | SKIPPED |
-| Validate signed build-only artifact | SKIPPED |
-| Create release metadata | SKIPPED |
-| Run actions/upload-artifact@v4 | SKIPPED |
+| Validate release signing configuration | SUCCESS |
+| Build signed Windows NSIS artifact | SUCCESS |
+| Validate signed build-only artifact | SUCCESS |
+| Create release metadata | SUCCESS |
+| Run actions/upload-artifact@v4 | SUCCESS |
 | Publish GitHub Release | SKIPPED |
 
-### Windows CI의 기존 SKIP 8건
+### Windows SKIP 9건 — 전부 명시
+
+기존8skip(credential1, shallow v0.2.0 fixture2, Windows에 적용되지 않는 POSIX permissions5)에 unsupported native sqld integration1의 explicit platform boundary가 추가됐다. 다른 test skip/assertion weakening 없음. SKIP는 PASS로 합산하지 않는다.
 
 - `test_disposable_remote_database_bootstraps_atomically_and_is_idempotent (tests.database.test_remote_turso_bootstrap.RemoteFreshTursoBootstrapTests.test_disposable_remote_database_bootstraps_atomically_and_is_idempotent) ... skipped 'REMOTE_TURSO_TEST_SKIPPED = NO_TEST_CREDENTIALS'`
 - `test_current_backend_startup_upgrades_released_v020_before_runtime_hydration (tests.database.test_turso_schema_contract.TursoSchemaContractTests.test_current_backend_startup_upgrades_released_v020_before_runtime_hydration) ... skipped 'released v0.2.0 fixture is unavailable in this shallow checkout'`
@@ -161,48 +117,44 @@ Verification branch push 전 현재 tracked source 437 files 및 outgoing histor
 - `test_desktop_auth_provisioning_preserves_existing_secret_content_and_mode (tests.test_desktop_backend.DesktopBackendTests.test_desktop_auth_provisioning_preserves_existing_secret_content_and_mode) ... skipped 'POSIX mode bits do not represent Windows ACLs'`
 - `test_desktop_auth_provisioning_restricts_a_group_readable_existing_config (tests.test_desktop_backend.DesktopBackendTests.test_desktop_auth_provisioning_restricts_a_group_readable_existing_config) ... skipped 'POSIX mode bits do not represent Windows ACLs'`
 - `test_desktop_auth_provisioning_restricts_an_existing_secret_config (tests.test_desktop_backend.DesktopBackendTests.test_desktop_auth_provisioning_restricts_an_existing_secret_config) ... skipped 'POSIX mode bits do not represent Windows ACLs'`
+- `test_sqld_controller_stops_and_restarts_same_storage (tests.test_m7333a2125_recovery_harness.RecoveryHarnessPrimitiveTests.test_sqld_controller_stops_and_restarts_same_storage) ... skipped 'Native sqld 0.24.32 supports macOS/Linux only; no supported Windows binary/target.'`
 
-## Local macOS package / actual UI smoke
+## Signed Windows artifact 독립 검증
 
-- Source: `3da63a0d2adc3032ec15acd28951f4e7817bcd69`.
-- Path: `.toolchain/readiness-closure-r2/MindCore.app`.
-- Zip: `.toolchain/readiness-closure-r2/MindCore-macOS-0.4.0-local.zip`.
-- Bytes: 34,440,582.
-- SHA-256: `33edda50ba0a0a74c6fc730460b62efb0b5f3a8157148122658ad63eee3fd1c3`.
-- Canonical `MINDCORE_UPDATER_DISABLED=1 npm run tauri:build -- --bundles app` PASS.
-- Local macOS bundle에 `codesign --force --deep --sign -`를 적용하고 `codesign --verify --deep --strict` PASS. Local ad-hoc, Developer ID/notarization 없음. Production Windows signing을 대체하지 않는다.
+- Run ID: 37723781839 / attempt2.
+- Source commit: `20275953e96bc438eb9bec38f080903c73dee100`.
+- CI artifact: mindcore-windows-signed-build-only, artifact ID11527622907.
+- GitHub artifact archive size: 30,429,933 bytes; GitHub digest sha256:16ff6b9e458452657d14f6653909c790902f12487b5e42eb7f60abcd5db27d9c (installer hash와 구분).
+- Local installer: `.toolchain/windows-platform-gate/artifacts/MindCore_0.4.0_x64-setup.exe`.
+- Installer size: 30,439,335 bytes.
+- **Installer SHA-256: `065f7830f448e6154a64d049a4dbfb5cf8bff619d6c5b052ec48731b7e712874`**.
+- Updater signature: `MindCore_0.4.0_x64-setup.exe.sig`, 420bytes, exists/non-empty PASS.
+- Signature file SHA-256: `e5895e6d3b735a4e541c42b1382f5f07fae8de74c6623bd09349196cc1020209`.
+- Tauri base64 signature envelope를 decode하고 기존 repository public key로 minisign0.12 verify를 실행했다. Result: **Signature and comment signature verified**.
+- Public key source: existing GitHub Repository Variable MINDCORE_UPDATER_PUBKEY. 새 key generation/replacement, private key local export 없음.
+- Windows .exe를 Mac에서 실행하지 않았다. 여기서 signature PASS는 Tauri updater minisign 검증이며 별도 Authenticode 인증을 주장하지 않는다.
 
-실제 사용자 app를 정상 종료한 뒤 MINDCORE_ENV_FILE을 test-owned config로 지정하여 final package를 실행했다. Unique synthetic Persona, real schema24 sqld, identity/registry/user labels 및 두 historical message rows만 사용했다. 첫 HTTP fixture는 create_pool의 shared_database_https_required에 의해 거부되어 TEST_INFRA로 기록했다. 이후 test-owned HTTPS loopback proxy와 임시 local CA를 **test process의 SSL_CERT_FILE**에만 적용했다. OS/global trust, production config, provider key/Persona DB를 변경하지 않았다. HTTPS native libSQL select1 검증 후 package 부팅 PASS. 실제 native ready_success 및 Python lifespan_complete 로그를 확인했다.
+## 기존 accepted cross-platform 상태 보존
 
-CUA로 실제 package UI를 조작하고 다음을 확인했다:
+Desktop local Mac Python657 PASS / 1 SKIP / 380 subtests PASS, frontend162 PASS, Rust updater enabled/disabled 각각64 PASS 및 checks PASS, updater-disabled packaged UI/backend/BOUND_MATCH smoke PASS는 이전 accepted evidence를 유지한다. 이번 product source 변경 없음. Mac test-owned lifecycle 추가 실행은 위4PASS다. Local Mac package source는3da63a0, zip SHA33edda50ba0a0a74c6fc730460b62efb0b5f3a8157148122658ad63eee3fd1c3이다.
 
-- Chat surface load / backend connected / Persona BOUND_MATCH(`Persona 연결됨`) PASS.
-- Chat historical messages: Synthetic Release Persona / Synthetic Release User label PASS.
-- Data Management > Messages: 동일 configured labels PASS; raw role 노출 없음.
-- App Settings / Persona 선택과 관리 / Persona Connection / DB 연결됨 / provider configured UI PASS.
-- Proactive: off 상태, 최소 간격 1800, quiet-time, 설정 저장 및 시스템 알림 control 표시 PASS. 설정 변경/새 scheduler/engine 구현 없음.
-- Update UI: version0.4.0, 업데이트 확인 disabled(빌드 모드와 일치) PASS.
-- What's New: bundled0.4.0 notes 및 공지 링크 표시 PASS.
-- Feedback: 제목/내용/category/preview/diagnostics unchecked UI PASS; 실제 메일 재전송 없음.
+Android accepted: Python121 PASS, JVM37 PASS, full instrumentation107 discovered /68 PASS /39 reasoned SKIP /0 FAIL /0 NOT_RUN, signed APK/permanent cert/install/same-key upgrade PASS. APK SHA7a8d95dc06fe4085a9caba37c9541c53e4330ed82651ee0b320a529f62849957. 이번 Android 변경 없음.
 
-사용자 실제 configuration 5files의 before/after SHA-256 동일. Test-owned package/sidecar/sqld/proxy/AVD는 종료했다. 개인 Android device 및 실제 Persona DB destructive test 없음. 기존 사용자 앱/AVD를 다시 열어 복구한다.
+Feedback direct endpoint 설정 및 Workers Free → Gmail API HTTPS path와 이전 사용자 Gmail activation/Desktop/Android receipt acceptance PASS 유지. 불필요한 메일 재전송/endpoint redesign 없음. CLIENT_MAIL_SECRET=NO / CLIENT_RECIPIENT_EMAIL=NO.
 
-## Feedback / UI product contract
+RAW_ROLE_VISIBLE_IN_PRODUCT_UI=NO / PERSONA_MESSAGE_LABEL=CONFIGURED_PERSONA_DISPLAY_NAME / USER_MESSAGE_LABEL=CONFIGURED_USER_DISPLAY_NAME / DB_ROLE_COMPATIBILITY_PRESERVED=YES. DESKTOP_PROACTIVE_UI=WIRED / ANDROID_PROACTIVE_RUNTIME=NOT_IMPLEMENTED. 기존 architecture/accepted state 보존.
 
-Accepted direct endpoint `https://mindcore-feedback.nibung.workers.dev/feedback` 보존. Workers Free → Gmail API HTTPS / SMTP NOT_USED / monthly required cost0. 기존 Worker regression56 PASS 및 security audit21files0findings 유지. 실제 activation 및 Desktop/Android Gmail receipt는 이전 사용자 수신 확인으로 ACCEPTANCE-PROVEN이며 이번에 불필요한 메일을 추가 발송하지 않았다. Current Desktop frontend 및 Android JVM feedback targeted regression PASS.
+## Distribution / 최종 결론
 
-DIRECT_ENDPOINT_CONFIGURED=TRUE / ACTUAL_GMAIL_E2E=PASS / CLIENT_MAIL_SECRET=NO / CLIENT_RECIPIENT_EMAIL=NO. OAuth values는 Worker Secrets만 담당하며 client contract/error semantics/diagnostics opt-in/GitHub fallback 유지.
+VERIFICATION_BRANCH_PUSH=YES
+REMOTE_TAG=NO
+REMOTE_RELEASE=NO
+PUBLIC_UPDATER_DELIVERY=NOT_RUN
+DESKTOP_VERSION=0.4.0
+ANDROID_VERSION_NAME=0.1.0
+ANDROID_VERSION_CODE=3
+RELEASE_READY=TRUE
 
-RAW_ROLE_VISIBLE_IN_PRODUCT_UI=NO / PERSONA_MESSAGE_LABEL=CONFIGURED_PERSONA_DISPLAY_NAME / USER_MESSAGE_LABEL=CONFIGURED_USER_DISPLAY_NAME / DB_ROLE_COMPATIBILITY_PRESERVED=YES. Persona switch/current configured user after restart regression PASS. Database/API diana/user roles 및 provider/context 의미 유지. Desktop/Android common message renderer presentation만 resolve하며 example names production hardcode 없음.
+남은 것은 실제 public distribution이며 이번 작업 범위에서 수행하지 않았다. IMPLEMENTED != ACCEPTANCE-PROVEN: current Windows build/signature gates는 실제 실행으로 검증됐고 public updater delivery는 아직 NOT_RUN이다.
 
-DESKTOP_PROACTIVE_UI=WIRED / ANDROID_PROACTIVE_RUNTIME=NOT_IMPLEMENTED. Dead Android toggle 없음. Shared Persona는 one shared authoritative DB; 역사적 peer/replica/delta sync는 새 foundation으로 사용하지 않았다. IMPLEMENTED != ACCEPTANCE-PROVEN.
-
-## Android closure / distribution / final blocker
-
-Android Python121 PASS / JVM37 PASS / full instrumentation107 discovered,68 PASS,39 existing opt-in SKIP,0 FAIL,0 NOT_RUN. 모든39skip 이유는 Android 최종 보고서에 기록. Debug/unsigned release/lint/signature/permanent cert match/install/same-key upgrade PASS. APK SHA-256 `7a8d95dc06fe4085a9caba37c9541c53e4330ed82651ee0b320a529f62849957`; certificate `53e1664cf9740078a31b86f46f7511c0827623ae3cab6cfe091d9672c5f50466`.
-
-VERIFICATION_BRANCH_PUSH=YES (Desktop source only) / REMOTE_TAG=NO / REMOTE_RELEASE=NO / PUBLIC_UPDATER_DELIVERY=NOT_RUN / Android public APK upload=NO. Versions Desktop0.4.0 / Android0.1.0 code3 unchanged. Existing v0.2.0 tag는 fetch했으며 새 tag 생성 없음.
-
-RELEASE_READY=FALSE. 남은 필수 gate는 existing Windows CI의 real sqld fixture provisioning과 그 뒤의 signed Windows artifact validation이다. Test skip/assertion 완화로 gate를 억지로 통과시키지 않았다. 이번 결과를 public release approval이나 실제 updater delivery proof로 사용하지 않는다.
-
-Evidence: `.toolchain/readiness-closure-r2/` — start.json, regression-results.json, python-final.log, ci-final.json, ci-final-failed.log, local-package-smoke.json, final-package-privacy.json, user-config-after.json. 이전 report는 previous-report.md에 보존.
+Evidence: `.toolchain/windows-platform-gate/` — start.json, platform-boundary.json, scope-static-audit.json, product-preservation.json, mac-harness.log, crlf-before.json, crlf-after.json, ci-attempt1.log, ci-attempt2-failed.log, python-abrupt-exit.json, ci-final.json/log, run-final-metadata.json, artifact-inventory.json, signed-windows-artifact.json, signature-verification.log, artifacts/. 이전 보고서는 previous-report.md에 보존했다. Final docs-only commit 이후 clean/diff-check state를 별도 final-git-state.json에 기록한다.
