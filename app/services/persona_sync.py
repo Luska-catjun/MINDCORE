@@ -715,15 +715,20 @@ class SyncMetadataStore:
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.path), timeout=5.0, isolation_level=None)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=5000")
-        journal_mode = str(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]).casefold()
-        if journal_mode != "wal":
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA busy_timeout=5000")
+            journal_mode = str(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]).casefold()
+            if journal_mode != "wal":
+                raise sqlite3.DatabaseError("metadata WAL unavailable")
+            connection.execute("PRAGMA synchronous=FULL")
+            return connection
+        except BaseException:
+            # A failed initializer has not returned the handle to _open yet.
+            # Close it before corruption recovery renames the file on Windows.
             connection.close()
-            raise sqlite3.DatabaseError("metadata WAL unavailable")
-        connection.execute("PRAGMA synchronous=FULL")
-        return connection
+            raise
 
     def _archive_corrupt_store(self) -> None:
         suffix = uuid.uuid4().hex

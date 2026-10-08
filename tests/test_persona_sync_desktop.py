@@ -1,5 +1,6 @@
 """Synthetic schema-24 acceptance tests for the Desktop sync counterpart."""
 import copy
+from contextlib import closing
 import json
 from pathlib import Path
 import shutil
@@ -554,6 +555,21 @@ class PersonaSyncTests(unittest.TestCase):
         self.assertEqual(1, len(self.engine_a.scan(PERSONA_A).delta.entries))
         self.assertEqual((), engine_b.scan(PERSONA_B).delta.entries)
 
+    def test_failed_metadata_initialization_closes_handle_before_file_recovery(self):
+        self.meta_a.parent.mkdir(parents=True, exist_ok=True)
+        self.meta_a.write_bytes(b"synthetic damaged sync metadata")
+        connection = sqlite3.connect(self.meta_a)
+        store = SyncMetadataStore.__new__(SyncMetadataStore)
+        store.path = self.meta_a
+        with mock.patch("app.services.persona_sync.sqlite3.connect", return_value=connection):
+            with self.assertRaises(sqlite3.DatabaseError):
+                store._connect()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+        archived = self.meta_a.with_suffix(".closed-fixture")
+        self.meta_a.replace(archived)
+        self.assertTrue(archived.is_file())
+
     def test_metadata_wipe_and_corruption_rebuild_baseline_without_persona_data_loss(self):
         before = self.engine_a.scan(PERSONA_A).manifest
         for suffix in ("", "-wal", "-shm"):
@@ -775,7 +791,7 @@ class PersonaSyncTests(unittest.TestCase):
         crashed = subprocess.run([sys.executable, "-c", child, *arguments],
                                  cwd=ROOT, capture_output=True, timeout=30, check=False)
         self.assertEqual(23, crashed.returncode)
-        with sqlite3.connect(self.db_a) as db:
+        with closing(sqlite3.connect(self.db_a)) as db:
             self.assertEqual(0.9, db.execute(
                 "SELECT trust FROM relationship WHERE id=1").fetchone()[0])
         with SyncMetadataStore(self.meta_a, DEVICE_A) as store:
