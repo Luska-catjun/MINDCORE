@@ -1,5 +1,47 @@
 # MindCore Desktop 0.4.0 Final Release Readiness — BLOCKED
 
+## 2026-10-08 Native Windows SQLD blocker closure audit
+
+이번 요청의 native Windows sqld.exe provisioning은 **BLOCKED**다. 기존 missing fixture의 원인을 upstream platform limitation으로 구체화했다. 해소됐다고 보고하지 않는다.
+
+단일 blocker: `SQLD_UPSTREAM_NATIVE_WINDOWS_UNSUPPORTED` (PLATFORM/TOOLCHAIN ISSUE; 기존 TEST_INFRA missing fixture의 근본 제약). 동일한 0.24.32 공식 release에는 native Windows x86_64 artifact가 없으며 upstream source도 Windows native build를 지원하지 않는다. 이 조건에서 실제 sqld.exe 및 신뢰할 수 있는 Windows artifact checksum을 provision할 수 없다.
+
+### 감사 근거 / pin
+
+- Upstream: `tursodatabase/libsql`.
+- Pinned release: `libsql-server-v0.24.32`.
+- Pinned source commit: `40c272de85ee4e62d722c5ccae5da2e76b4253a1`.
+- Existing Mac fixture version: `sqld sqld 0.24.32 (40c272de 2025-02-14)`.
+- Official release asset list: Darwin arm64/x86_64 및 Linux GNU arm64/x86_64만 존재. Windows/MSVC/MinGW/.exe asset count=0.
+- Source Cargo.toml workspace.metadata.dist.targets는 위 네 target만 선언한다.
+- [Pinned upstream build instructions](https://github.com/tursodatabase/libsql/blob/40c272de85ee4e62d722c5ccae5da2e76b4253a1/docs/BUILD-RUN.md#build-from-source-using-rust)는 macOS/Linux(WSL 포함)만 지원하고 native Windows instructions는 준비 중이라고 명시한다.
+- [Pinned source main.rs](https://github.com/tursodatabase/libsql/blob/40c272de85ee4e62d722c5ccae5da2e76b4253a1/libsql-server/src/main.rs#L610-L622)의 shutdown_signal은 `tokio::signal::unix::{signal, SignalKind}`를 cfg guard 없이 사용한다. Unmodified source를 native Windows로 직접 cargo build하는 경로로 해결됐다고 주장할 수 없다.
+- [Official pinned release](https://github.com/tursodatabase/libsql/releases/tag/libsql-server-v0.24.32).
+
+Existing Mac archive `libsql-server-aarch64-apple-darwin.tar.xz` SHA-256:
+`ced2a9d65a5d4b6bd72c67e98ad6c63139e2a139d91769f07fdd15be935381dd`.
+로컬 archive를 다시 hash하여 이전 검증된 official checksum과 일치함을 확인했다. Mac executable SHA-256은 `cc075b5bf145e5e750afd2941f390b46dbfe9ae47158d95ab637a00559681054`다. 이것을 Windows checksum이나 Windows fixture로 사용하지 않았다.
+
+### Exact harness requirement / 실행 결과
+
+`tests/test_m7333a2125_recovery_harness.py` 및 `tests/m7333a2125_recovery_harness.py`를 먼저 읽었다. MINDCORE_TEST_SQLD explicit executable이 authoritative하고 env가 없으면 기존 sibling Android Mac fixture가 fallback이다. Required CLI flags는 `-d <persistent storage directory>`, `--http-listen-addr <loopback host:port>`, `--http-self-url <loopback HTTP URL>`다. Real daemon의 Hrana endpoint, stop 시 실제 unavailable, 동일 sqld directory에서 restart 후 ready를 검사한다. 다른 storage engine이나 daemon behavior를 대체하지 않았다.
+
+기존 Mac native executable을 explicit MINDCORE_TEST_SQLD로 지정해 **기존 recovery harness 테스트 4 PASS / 0 FAIL / 0 SKIP**, 11.025s로 완료했다. Windows executable은 얻지 못했으므로 Windows harness PASS를 주장하지 않는다. Test assertions/meaning/source 변경=NO; harness skip=NO; fake daemon/mock/renamed Mac binary 사용=NO.
+
+### 변경 및 CI 상태
+
+Initial HEAD: `7a3cd6856f7be6d597dd77a85663fd3d60d8da49`; branch `codex/v0.4.0-readiness`; clean; git diff --check PASS. 기존 commits를 보존했다. Reset/clean/stash/restore/rebase/amend 미사용.
+
+이번 tracked 변경은 이 Desktop 보고서뿐이다. Workflow/provisioning helper/product/updater/signing/test/Android source는 변경하지 않았다. 존재하지 않는 download URL/hash를 pin하는 helper를 추가하지 않았다. 최신 버전을 임의 선택하거나 unofficial binary, WSL launcher, fake sqld.exe로 요구사항을 대체하지 않았다. Upstream Windows porting은 이번 최소 CI provisioning 범위 밖이며 수행하지 않았다.
+
+New Windows workflow dispatch=NOT_RUN. 입력 fixture가 없는 동일 source를 재실행해 signing acceptance를 주장하지 않았다. 최근 actual Windows Release run은 `37721096941`, source `3da63a0d2adc3032ec15acd28951f4e7817bcd69`; Python648 tests / failures1 / skipped8이며 missing sqld test에서 실패했다. 기존 updater production signing authority=GitHub Actions, key/secret/publickey/runtime architecture unchanged. Windows installer/SHA/signature/upload acceptance는 여전히 NOT_RUN / UNAVAILABLE다.
+
+보고서만 logical local commit 및 기존 verification branch에 push한다. Main 변경/force push/tag/GitHub Release/public updater manifest/Android APK upload 없음. Android RELEASE_READINESS=PASS 및 Feedback production path=PASS는 이전 accepted result를 유지하며 Android를 변경하거나 다시 테스트하지 않았다.
+
+DESKTOP_RELEASE_READINESS=BLOCKED / ANDROID_RELEASE_READINESS=PASS / FEEDBACK_PRODUCTION_PATH=PASS / CROSS_PLATFORM_RELEASE_READINESS=BLOCKED / RELEASE_READY=FALSE.
+
+Evidence: `.toolchain/windows-sqld-closure/`의 start.json, upstream-release.json, upstream-source/, mac-fixture.json, mac-recovery-harness.log, blocker-audit.json. 기존 최종 보고서 사본은 previous-report.md에 보존. 아래는 앞선 전체 regression/signing audit 기록이다.
+
 ## 이전 blocker 정정 / 최종 판정
 
 local production private key absence was not a product blocker. Production signing is intentionally owned by existing GitHub Actions.
