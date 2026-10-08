@@ -1,0 +1,2 @@
+# Release-note heading validation and bundled notes require canonical LF on Windows too.
+release-notes/*.md text eol=lf
