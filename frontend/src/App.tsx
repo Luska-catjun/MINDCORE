@@ -626,7 +626,7 @@ function MindCoreWorkspace({ onProductState, onFeedback, onUpdateSurface }: { on
           <ChatWindow
             draft={chatDraft}
             onDraftChange={setChatDraft}
-            personaDisplayName={personaDisplayName}
+            personaDisplayName={activePersona?.display_name ?? personaDisplayName}
             userDisplayName={userDisplayName}
             personaAvatarExtension={activePersona?.avatar_extension}
             personaAvatarRevision={avatarRevision}
@@ -649,7 +649,7 @@ function MindCoreWorkspace({ onProductState, onFeedback, onUpdateSurface }: { on
         )}
         {dataVisited && <div className="product-surface" hidden={activeSection !== "data"}>
           <DataNavigation view={dataView} onChange={view => { setDataView(view); setActiveView(view); }} />
-          <WorkspacePanel key={activePersonaId ?? "web"} view={dataView} backendStatus={backendStatus} onToggleSidebar={() => setSidebarOpen(open => !open)} onMessageDeleted={handleMessageDeleted} />
+          <WorkspacePanel personaDisplayName={activePersona?.display_name ?? personaDisplayName} userDisplayName={userDisplayName} key={activePersonaId ?? "web"} view={dataView} backendStatus={backendStatus} onToggleSidebar={() => setSidebarOpen(open => !open)} onMessageDeleted={handleMessageDeleted} />
         </div>}
         <div className="product-surface" hidden={activeSection !== "settings"}>
           <AppSettings onUpdateSurface={onUpdateSurface} selectedTab={settingsTab} onTabChange={setSettingsTab} onConfigure={configurePersona} onOpenConfiguration={() => void invoke("open_configuration_folder")}

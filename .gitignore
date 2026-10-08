@@ -29,3 +29,6 @@ logs/
 .DS_Store
 
 /frontend/src/generated/
+
+# Local toolchains, isolated acceptance data, and credential prompts
+.toolchain/

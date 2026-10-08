@@ -1,9 +1,11 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { feedbackPayload, feedbackComposeUrl, safePublicUrl, submitFeedback, feedbackEndpoint } from "./productSupport";
 import { validFeedbackEndpoint } from "./feedbackContract";
+vi.mock("../product-support.json", () => ({ default: { feedbackEndpoint: null, feedbackIssueUrl: "https://github.com/example/mindcore/issues/new" } }));
 const payload = () => feedbackPayload("버그","제목","내용",false,{});
 const response = (body: string, status=200, type="application/json") => new Response(body,{status,headers:{"Content-Type":type}});
 describe("Feedback transport and privacy", () => {
+ beforeEach(() => vi.stubEnv("VITE_MINDCORE_FEEDBACK_ENDPOINT", ""));
  afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
  it("uses the shared schema and current product version", () => { expect(payload()).toEqual({schemaVersion:1,category:"bug",title:"제목",message:"내용",platform:"desktop",appVersion:"0.4.0"}); for (const [label,value] of [["기능 제안","feature"],["사용성/UI","usability"],["기타","other"]]) expect(feedbackPayload(label,"x","y",false,{}).category).toBe(value); });
  it("includes no diagnostics by default; allowlists names AND values", () => {
@@ -13,7 +15,7 @@ describe("Feedback transport and privacy", () => {
   expect(JSON.stringify(feedbackPayload("기타","x","y",true,{provider:"synthetic-secret",os_version:"https://private?token=x",persona_connection:"private",update_state:"private"}))).not.toMatch(/private|secret|token/);
  });
  it("falls back only when unset and reports browser rather than sent", async () => {
-  const open=vi.fn().mockResolvedValue(undefined); expect(await submitFeedback(payload(),null,open)).toBe("browser"); expect(new URL(feedbackComposeUrl(payload())).searchParams.get("body")).toContain("내용"); expect(open).toHaveBeenCalledOnce();
+  const open=vi.fn().mockResolvedValue(undefined); const fetch=vi.fn(); vi.stubGlobal("fetch",fetch); expect(feedbackEndpoint()).toBeNull(); expect(await submitFeedback(payload(),null,open)).toBe("browser"); expect(new URL(feedbackComposeUrl(payload())).searchParams.get("body")).toContain("내용"); expect(open).toHaveBeenCalledOnce(); expect(fetch).not.toHaveBeenCalled();
   open.mockRejectedValue(new Error("unavailable")); await expect(submitFeedback(payload(),null,open)).rejects.toThrow();
  });
  it("configures the endpoint through a public build variable", () => { expect(feedbackEndpoint()).toBeNull(); vi.stubEnv("VITE_MINDCORE_FEEDBACK_ENDPOINT","https://example.com/feedback"); expect(feedbackEndpoint()).toBe("https://example.com/feedback"); });

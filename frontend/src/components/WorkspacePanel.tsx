@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { messageRoleLabel } from "../messageLabels";
 import { api, ApiError } from "../api/client";
 import type { ObserveDebug, ObserveEmotion, ObserveGoalsNeeds, ObservePreferences, ObserveRelationship, ObserveStats, ObserveWorldModel, ObservationList, ObservedDecision, ObservedEpisode, ObservedIntention, ObservedKnowledge, ObservedMemory, ObservedMessage, ObservedNarrative, ObservedSelfModel } from "../types/api";
 import { DATA_GROUPS } from "./DataNavigation";
@@ -10,6 +11,8 @@ interface WorkspacePanelProps {
   view: Exclude<WorkspaceView, "chat" | "sync" | "persona-connection">;
   backendStatus: "checking" | "connected" | "error";
   onToggleSidebar: () => void;
+  personaDisplayName?: string;
+  userDisplayName?: string;
   onMessageDeleted?: (conversationId: string, messageId: string) => void;
 }
 type ObservationData = ObservationList<ObservedMemory> | ObservationList<ObservedMessage> | ObserveEmotion | ObservePreferences | ObservationList<ObservedEpisode> | ObservationList<ObservedDecision> | ObservationList<ObservedIntention> | ObservationList<ObservedNarrative> | ObservationList<ObservedSelfModel> | ObservationList<ObservedKnowledge> | ObserveRelationship | ObserveStats | ObserveDebug | ObserveWorldModel | ObserveGoalsNeeds;
@@ -35,12 +38,16 @@ function MemoryWorkspace({ data, refresh }: { data: ObservationList<ObservedMemo
 }
 function MessageDeleteDialog({
   message,
+  personaDisplayName,
+  userDisplayName,
   deleting,
   error,
   onCancel,
   onConfirm,
 }: {
   message: ObservedMessage;
+  personaDisplayName?: string;
+  userDisplayName?: string;
   deleting: boolean;
   error: string | null;
   onCancel: () => void;
@@ -71,7 +78,7 @@ function MessageDeleteDialog({
       >
         <h2 id="message-delete-title">Delete this message?</h2>
         <p id="message-delete-description">Long-term cognition records will follow their existing provenance policy.</p>
-        <p className="card-meta">{message.role} · Message {shortId(message.id)} · {date(message.created_at)}</p>
+        <p className="card-meta">{messageRoleLabel(message.role, personaDisplayName, userDisplayName)} · Message {shortId(message.id)} · {date(message.created_at)}</p>
         {error ? <p className="message-delete-error" role="alert">{error}</p> : null}
         <div className="message-delete-actions">
           <button ref={cancelRef} type="button" disabled={deleting} onClick={onCancel}>Cancel</button>
@@ -83,7 +90,7 @@ function MessageDeleteDialog({
   );
 }
 
-function MessagesWorkspace({ data, onDeleted }: { data: ObservationList<ObservedMessage>; onDeleted?: (conversationId: string, messageId: string) => void }) {
+function MessagesWorkspace({ data, onDeleted, personaDisplayName, userDisplayName }: { data: ObservationList<ObservedMessage>; personaDisplayName?: string; userDisplayName?: string; onDeleted?: (conversationId: string, messageId: string) => void }) {
   const [items, setItems] = useState(data.items);
   const [pending, setPending] = useState<ObservedMessage | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -117,7 +124,7 @@ function MessagesWorkspace({ data, onDeleted }: { data: ObservationList<Observed
     }
   };
 
-  return <section className="workspace-content"><Heading title="메시지" latency={data.query_latency_ms}/><div className="observation-list">{items.map(item=><article className="observation-card" key={item.id}><div className="card-title"><b>{item.role}</b><button type="button" disabled={deleting || pending !== null} onClick={()=>{setPending(item);setError(null);}}>Delete</button></div><p className="card-content">{item.content}</p><p className="card-meta">Conversation {shortId(item.conversation_id)} · Message {shortId(item.id)} · {date(item.created_at)}</p></article>)}</div>{pending ? <MessageDeleteDialog message={pending} deleting={deleting} error={error} onCancel={()=>{setPending(null);setError(null);}} onConfirm={()=>void remove(pending)} /> : null}</section>;
+  return <section className="workspace-content"><Heading title="메시지" latency={data.query_latency_ms}/><div className="observation-list">{items.map(item=><article className="observation-card" key={item.id}><div className="card-title"><b>{messageRoleLabel(item.role, personaDisplayName, userDisplayName)}</b><button type="button" disabled={deleting || pending !== null} onClick={()=>{setPending(item);setError(null);}}>Delete</button></div><p className="card-content">{item.content}</p><p className="card-meta">Conversation {shortId(item.conversation_id)} · Message {shortId(item.id)} · {date(item.created_at)}</p></article>)}</div>{pending ? <MessageDeleteDialog message={pending} personaDisplayName={personaDisplayName} userDisplayName={userDisplayName} deleting={deleting} error={error} onCancel={()=>{setPending(null);setError(null);}} onConfirm={()=>void remove(pending)} /> : null}</section>;
 }
 
 function EmotionWorkspace({ data }: { data: ObserveEmotion }) {
@@ -143,7 +150,7 @@ function DebugWorkspace({ data }: { data: ObserveDebug }) { return <section clas
 
 function fetchObservation(view: ObservationView): Promise<ObservationData> { switch (view) { case "messages": return api.observeMessages(); case "memory": return api.observeMemory(); case "emotion": return api.observeEmotion(); case "knowledge": return api.observeKnowledge(); case "preferences": return api.observePreferences(); case "episodes": return api.observeEpisodes(); case "decisions": return api.observeDecisions(); case "intentions": return api.observeIntentions(); case "narratives": return api.observeNarratives(); case "self-model": return api.observeSelfModel(); case "world-model": return api.observeWorldModel(); case "relationship": return api.observeRelationship(); case "goals-needs": return api.observeGoalsNeeds(); case "stats": return api.observeStats(); case "debug": return api.observeDebug(); } }
 
-export function WorkspacePanel({ view, onMessageDeleted }: WorkspacePanelProps) {
+export function WorkspacePanel({ view, onMessageDeleted, personaDisplayName, userDisplayName }: WorkspacePanelProps) {
   const [resource, setResource] = useState<ObservationResource | null>(null);
   const [error, setError] = useState<ObservationError | null>(null);
   const refresh = useCallback(async () => { setError(null); const data = await fetchObservation(view); setResource({ view, data }); }, [view]);
@@ -161,6 +168,6 @@ export function WorkspacePanel({ view, onMessageDeleted }: WorkspacePanelProps) 
   let content: ReactNode;
   if (currentError) content = <EmptyWorkspace title={DATA_GROUPS.flatMap(group => group.items).find(item => item.id === view)!.label} detail={currentError} />;
   else if (!data) content = <EmptyWorkspace title={DATA_GROUPS.flatMap(group => group.items).find(item => item.id === view)!.label} detail="데이터를 불러오는 중…" />;
-  else { switch (view) { case "messages": content = <MessagesWorkspace data={data as ObservationList<ObservedMessage>} onDeleted={onMessageDeleted} />; break; case "memory": content = <MemoryWorkspace data={data as ObservationList<ObservedMemory>} refresh={refresh} />; break; case "emotion": content = <EmotionWorkspace data={data as ObserveEmotion} />; break; case "knowledge": content = <KnowledgeWorkspace data={data as ObservationList<ObservedKnowledge>} refresh={refresh} />; break; case "preferences": content = <PreferencesWorkspace data={data as ObservePreferences} refresh={refresh} />; break; case "episodes": content = <EpisodesWorkspace data={data as ObservationList<ObservedEpisode>} />; break; case "decisions": content = <DecisionsWorkspace data={data as ObservationList<ObservedDecision>} />; break; case "intentions": content = <IntentionsWorkspace data={data as ObservationList<ObservedIntention>} />; break; case "narratives": content = <NarrativesWorkspace data={data as ObservationList<ObservedNarrative>} refresh={refresh} />; break; case "self-model": content = <SelfModelWorkspace data={data as ObservationList<ObservedSelfModel>} refresh={refresh} />; break; case "world-model": content = <WorldModelWorkspace data={data as ObserveWorldModel} />; break; case "relationship": content = <RelationshipWorkspace data={data as ObserveRelationship} />; break; case "goals-needs": content = <GoalsNeedsWorkspace data={data as ObserveGoalsNeeds} />; break; case "stats": content = <StatsWorkspace data={data as ObserveStats} />; break; case "debug": content = <DebugWorkspace data={data as ObserveDebug} />; break; } }
+  else { switch (view) { case "messages": content = <MessagesWorkspace data={data as ObservationList<ObservedMessage>} onDeleted={onMessageDeleted} personaDisplayName={personaDisplayName} userDisplayName={userDisplayName} />; break; case "memory": content = <MemoryWorkspace data={data as ObservationList<ObservedMemory>} refresh={refresh} />; break; case "emotion": content = <EmotionWorkspace data={data as ObserveEmotion} />; break; case "knowledge": content = <KnowledgeWorkspace data={data as ObservationList<ObservedKnowledge>} refresh={refresh} />; break; case "preferences": content = <PreferencesWorkspace data={data as ObservePreferences} refresh={refresh} />; break; case "episodes": content = <EpisodesWorkspace data={data as ObservationList<ObservedEpisode>} />; break; case "decisions": content = <DecisionsWorkspace data={data as ObservationList<ObservedDecision>} />; break; case "intentions": content = <IntentionsWorkspace data={data as ObservationList<ObservedIntention>} />; break; case "narratives": content = <NarrativesWorkspace data={data as ObservationList<ObservedNarrative>} refresh={refresh} />; break; case "self-model": content = <SelfModelWorkspace data={data as ObservationList<ObservedSelfModel>} refresh={refresh} />; break; case "world-model": content = <WorldModelWorkspace data={data as ObserveWorldModel} />; break; case "relationship": content = <RelationshipWorkspace data={data as ObserveRelationship} />; break; case "goals-needs": content = <GoalsNeedsWorkspace data={data as ObserveGoalsNeeds} />; break; case "stats": content = <StatsWorkspace data={data as ObserveStats} />; break; case "debug": content = <DebugWorkspace data={data as ObserveDebug} />; break; } }
   return <div className="workspace-panel">{content}</div>;
 }

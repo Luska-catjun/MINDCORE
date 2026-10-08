@@ -78,4 +78,23 @@ describe("MessageBubble Persona avatars", () => {
     expect(screen.getByLabelText("Tool").className).toContain("message-avatar-neutral");
     expect(invoke).not.toHaveBeenCalled();
   });
+  it("resolves historical compatibility roles without changing rows and updates on switch", () => {
+    const personaRow = Object.freeze(message("diana"));
+    const userRow = Object.freeze(message("user"));
+    const labels = { personaId: "persona-a", personaDisplayName: "신데렐라", userDisplayName: "Synthetic Configured User" };
+    const { rerender, container } = render(<><MessageBubble message={personaRow} {...labels} /><MessageBubble message={userRow} {...labels} /></>);
+    expect(Array.from(container.querySelectorAll(".message-role"), node => node.textContent)).toEqual(["신데렐라", "Synthetic Configured User"]);
+    expect(screen.queryByText("diana")).toBeNull();
+    expect(screen.queryByText("user")).toBeNull();
+    rerender(<MessageBubble message={personaRow} {...labels} personaId="persona-b" personaDisplayName="Synthetic Second Persona" />);
+    expect(container.querySelector(".message-role")?.textContent).toBe("Synthetic Second Persona");
+    expect(personaRow.role).toBe("diana");
+    expect(userRow.role).toBe("user");
+  });
+
+  it("falls back to safe labels only when names are unavailable", () => {
+    const { container } = render(<><MessageBubble message={message("diana")} personaId={null} personaDisplayName=" " userDisplayName="" /><MessageBubble message={message("user")} personaId={null} personaDisplayName="" userDisplayName=" " /></>);
+    expect(Array.from(container.querySelectorAll(".message-role"), node => node.textContent)).toEqual(["Persona", "User"]);
+  });
+
 });

@@ -8,14 +8,16 @@ const personas = [
 ];
 const invoke = vi.hoisted(() => vi.fn());
 const apiMock = vi.hoisted(() => ({ health: vi.fn(), me: vi.fn(), listConversations: vi.fn(), createConversation: vi.fn(), listMessages: vi.fn(), login: vi.fn(), logout: vi.fn() }));
+const workspaceHarness = vi.hoisted(() => ({ props: null as null | Record<string, any> }));
+let configuredUserName = "Luska";
 const chatHarness = vi.hoisted(() => ({ props: null as null | Record<string, any>, send: null as any }));
 let active = personas[0];
 let rejectSwitch = false;
 
 vi.mock("./api/client", () => ({ api: apiMock, ApiError: class ApiError extends Error {}, setAuthFailureHandler: vi.fn(), storeDesktopSession: vi.fn(), isDesktopRuntime: () => true }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
-vi.mock("./components/Sidebar", () => ({ Sidebar: () => <div>Sidebar</div> }));
-vi.mock("./components/WorkspacePanel", () => ({ WorkspacePanel: () => <div>Observation</div> }));
+vi.mock("./components/Sidebar", () => ({ Sidebar: ({ onSectionChange }: any) => <button onClick={() => onSectionChange("data")}>Open data</button> }));
+vi.mock("./components/WorkspacePanel", () => ({ WorkspacePanel: (props: Record<string, any>) => { workspaceHarness.props = props; return <div>Observation</div>; } }));
 vi.mock("./components/DesktopUpdater", () => ({ DesktopUpdater: () => null }));
 vi.mock("./components/PersonaManager", () => ({ PersonaManager: () => null }));
 vi.mock("./components/ChatWindow", () => ({
@@ -41,6 +43,9 @@ describe("multi-Persona desktop isolation", () => {
     vi.clearAllMocks();
     chatHarness.props = null;
     chatHarness.send = null;
+    personas[0].display_name = "Jarvis";
+    configuredUserName = "Luska";
+    workspaceHarness.props = null;
     active = personas[0];
     rejectSwitch = false;
     invoke.mockImplementation((command: string, args?: { personaId?: string }) => {
@@ -55,7 +60,7 @@ describe("multi-Persona desktop isolation", () => {
       return Promise.resolve();
     });
     apiMock.health.mockResolvedValue({ status: "ok" });
-    apiMock.me.mockImplementation(() => Promise.resolve({ authenticated: true, persona_id: active.persona_id, persona_display_name: active.display_name, user_display_name: "Luska" }));
+    apiMock.me.mockImplementation(() => Promise.resolve({ authenticated: true, persona_id: active.persona_id, persona_display_name: active.display_name, user_display_name: configuredUserName }));
     apiMock.listConversations.mockResolvedValue([]);
     apiMock.createConversation.mockImplementation(() => Promise.resolve({ id: `conversation-${active.persona_id}` }));
   });
@@ -132,4 +137,28 @@ describe("multi-Persona desktop isolation", () => {
 
     expect(chatHarness.props?.conversationId).toBe("conversation-persona-b");
   });
+  it("shares configured labels with Data Management and reloads USER_DISPLAY_NAME on restart", async () => {
+    personas[0].display_name = "신데렐라";
+    configuredUserName = "Synthetic Configured User";
+    const app = render(<App />);
+    await waitFor(() => expect(chatHarness.props?.personaDisplayName).toBe("신데렐라"));
+    await waitFor(() => expect(chatHarness.props?.userDisplayName).toBe(configuredUserName));
+    await userEvent.click(screen.getByRole("button", { name: "Open data" }));
+    expect(workspaceHarness.props?.personaDisplayName).toBe("신데렐라");
+    expect(workspaceHarness.props?.userDisplayName).toBe(configuredUserName);
+
+    await userEvent.selectOptions(screen.getByLabelText("Current Persona"), "persona-b");
+    await waitFor(() => expect(chatHarness.props?.personaDisplayName).toBe("Nova"));
+    await waitFor(() => expect(workspaceHarness.props?.personaDisplayName).toBe("Nova"));
+    expect(workspaceHarness.props?.userDisplayName).toBe(configuredUserName);
+
+    app.unmount();
+    configuredUserName = "Synthetic User After Restart";
+    render(<App />);
+    await waitFor(() => expect(chatHarness.props?.userDisplayName).toBe(configuredUserName));
+    await userEvent.click(screen.getByRole("button", { name: "Open data" }));
+    expect(workspaceHarness.props?.userDisplayName).toBe(configuredUserName);
+    expect(workspaceHarness.props?.personaDisplayName).toBe("Nova");
+  });
+
 });

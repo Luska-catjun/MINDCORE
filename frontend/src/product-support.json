@@ -1,4 +1,4 @@
 {
-  "feedbackEndpoint": null,
+  "feedbackEndpoint": "https://mindcore-feedback.nibung.workers.dev/feedback",
   "feedbackIssueUrl": "https://github.com/Luska-catjun/MINDCORE/issues/new"
 }

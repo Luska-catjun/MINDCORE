@@ -1,22 +1,9 @@
 // src/components/MessageBubble.tsx
 
-import type { MessageRead, MessageRole } from "../types/api";
+import type { MessageRead } from "../types/api";
+import { messageRoleLabel } from "../messageLabels";
 import { formatKstDateTime, formatKstTime } from "../utils/datetime";
 import { PersonaAvatar } from "./PersonaAvatar";
-
-// role별 표시 이름. user/diana 외에 system/tool도 스펙에 있으므로 표시는 해준다.
-function roleLabel(role: MessageRole, personaDisplayName: string, userDisplayName: string): string {
-  switch (role) {
-    case "diana":
-      return personaDisplayName;
-    case "user":
-      return userDisplayName;
-    case "system":
-      return "System";
-    case "tool":
-      return "Tool";
-  }
-}
 
 interface MessageBubbleProps {
   message: MessageRead;
@@ -45,13 +32,13 @@ export function MessageBubble({
   return (
     <div className={`message-row ${isUser ? "message-row-user" : ""}`}>
       {isPersonaMessage && <PersonaAvatar personaId={personaId} displayName={personaDisplayName} avatarExtension={personaAvatarExtension} revision={personaAvatarRevision} className="message-avatar" />}
-      {!isUser && !isPersonaMessage && <span className="message-avatar message-avatar-neutral" aria-label={roleLabel(message.role, personaDisplayName, userDisplayName)}>●</span>}
+      {!isUser && !isPersonaMessage && <span className="message-avatar message-avatar-neutral" aria-label={messageRoleLabel(message.role, personaDisplayName, userDisplayName)}>●</span>}
       <div
         className={`message-bubble ${
           isUser ? "message-bubble-user" : "message-bubble-diana"
         } ${failed ? "message-bubble-failed" : ""}`}
       >
-        <div className="message-role">{roleLabel(message.role, personaDisplayName, userDisplayName)}</div>
+        <div className="message-role">{messageRoleLabel(message.role, personaDisplayName, userDisplayName)}</div>
         <div className="message-content">{message.content}</div>
         <div className="message-meta">
           {pending
